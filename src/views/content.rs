@@ -5,6 +5,7 @@
 use crate::assets::CustomIconName;
 use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credentials};
 use crate::constants::DEFAULT_PULSAR_TOKEN;
+use crate::helpers::DeviceAction;
 use crate::states::{
     DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
     i18n_settings, i18n_sidebar, update_app_state_and_save,
@@ -734,5 +735,11 @@ impl Render for DfcContent {
             .h_full()
             .bg(cx.theme().background)
             .child(content)
+            .on_action(cx.listener(|this, _: &DeviceAction, window, cx| {
+                // Focus the search input when Cmd+F / Ctrl+F is pressed
+                this.keyword_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            }))
     }
 }
