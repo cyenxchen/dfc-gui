@@ -4,6 +4,7 @@
 
 use crate::assets::CustomIconName;
 use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credentials};
+use crate::constants::DEFAULT_PULSAR_TOKEN;
 use crate::states::{
     DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
     i18n_settings, i18n_sidebar, update_app_state_and_save,
@@ -278,7 +279,7 @@ impl DfcContent {
             state.set_value(String::new(), window, cx);
         });
         self.pulsar_token_state.update(cx, |state, cx| {
-            state.set_value(String::new(), window, cx);
+            state.set_value(DEFAULT_PULSAR_TOKEN.to_string(), window, cx);
         });
     }
 

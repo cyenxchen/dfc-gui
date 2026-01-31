@@ -40,3 +40,6 @@ pub const RETRY_JITTER: f64 = 0.1;
 
 /// Command timeout
 pub const COMMAND_TIMEOUT_SECS: u64 = 30;
+
+/// Default Pulsar token for new server configurations
+pub const DEFAULT_PULSAR_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdXBlci1hZG1pbiJ9.vdYkdFsngS8w9eNTwZs_r1W9uIj8Vnj7WcB9iYn-EX8";
