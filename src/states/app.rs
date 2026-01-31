@@ -2,7 +2,10 @@
 //!
 //! Global application state including routing, theme, locale, and window bounds.
 
-use crate::connection::{DfcServerConfig, get_servers, save_servers};
+use crate::connection::{
+    DfcServerConfig, EncryptedPresetCredential, PresetCredential, get_servers, save_servers,
+};
+use crate::helpers::{decrypt, encrypt};
 use crate::error::{Error, Result};
 use crate::helpers::get_or_create_config_dir;
 use crate::services::ServiceHub;
@@ -108,6 +111,9 @@ pub struct DfcAppState {
     font_size: Option<FontSize>,
     /// Selected device ID
     selected_device: Option<String>,
+    /// Preset credentials (encrypted)
+    #[serde(default)]
+    preset_credentials: Vec<EncryptedPresetCredential>,
     /// Server configurations (loaded separately, not serialized here)
     #[serde(skip)]
     servers: Vec<DfcServerConfig>,
@@ -180,6 +186,20 @@ impl DfcAppState {
         self.selected_device.as_deref()
     }
 
+    /// Get preset credentials (decrypted)
+    pub fn preset_credentials(&self) -> Vec<PresetCredential> {
+        self.preset_credentials
+            .iter()
+            .map(|enc| {
+                let password = decrypt(&enc.password).unwrap_or_else(|_| enc.password.clone());
+                PresetCredential {
+                    username: enc.username.clone(),
+                    password,
+                }
+            })
+            .collect()
+    }
+
     // ==================== Setters ====================
 
     pub fn go_to(&mut self, route: Route, cx: &mut Context<Self>) {
@@ -211,6 +231,20 @@ impl DfcAppState {
 
     pub fn set_selected_device(&mut self, device_id: Option<String>) {
         self.selected_device = device_id;
+    }
+
+    /// Set preset credentials (will be encrypted)
+    pub fn set_preset_credentials(&mut self, credentials: Vec<PresetCredential>) {
+        self.preset_credentials = credentials
+            .into_iter()
+            .filter_map(|cred| {
+                let password = encrypt(&cred.password).ok()?;
+                Some(EncryptedPresetCredential {
+                    username: cred.username,
+                    password,
+                })
+            })
+            .collect();
     }
 
     // ==================== Server Management ====================

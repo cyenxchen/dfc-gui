@@ -3,8 +3,11 @@
 //! Routes to different views based on the current application route.
 
 use crate::assets::CustomIconName;
-use crate::connection::DfcServerConfig;
-use crate::states::{DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers, i18n_sidebar};
+use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credentials};
+use crate::states::{
+    DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
+    i18n_settings, i18n_sidebar, update_app_state_and_save,
+};
 use gpui::{App, Context, Entity, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme, Colorize, Icon, IconName, Sizable, StyledExt, WindowExt,
@@ -57,6 +60,9 @@ pub struct DfcContent {
     pulsar_token_state: Entity<InputState>,
     /// Current server ID being edited (empty for new)
     editing_server_id: String,
+
+    // Settings form input states
+    preset_credentials_state: Entity<InputState>,
 
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
@@ -143,6 +149,29 @@ impl DfcContent {
                 .auto_grow(2, 10)
         });
 
+        // Initialize preset credentials input with existing data
+        let existing_credentials = app_state.read(cx).preset_credentials();
+        let preset_credentials_state = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .placeholder(i18n_settings(cx, "preset_credentials_placeholder"))
+                .auto_grow(3, 10);
+            if !existing_credentials.is_empty() {
+                state.set_value(credentials_to_text(&existing_credentials), window, cx);
+            }
+            state
+        });
+
+        // Subscribe to preset credentials input for auto-save on blur
+        subscriptions.push(cx.subscribe(&preset_credentials_state, |this, state, event, cx| {
+            if matches!(event, InputEvent::Blur) {
+                let text = state.read(cx).value();
+                let credentials = text_to_credentials(&text);
+                update_app_state_and_save(cx, "set_preset_credentials", move |state, _| {
+                    state.set_preset_credentials(credentials.clone());
+                });
+            }
+        }));
+
         // Subscribe to port input for stepping
         subscriptions.push(cx.subscribe_in(&port_state, window, |_this, state, event, window, cx| {
             let NumberInputEvent::Step(action) = event;
@@ -174,6 +203,7 @@ impl DfcContent {
             device_filter_state,
             pulsar_token_state,
             editing_server_id: String::new(),
+            preset_credentials_state,
             _subscriptions: subscriptions,
         }
     }
@@ -670,15 +700,19 @@ impl DfcContent {
 
     /// Render the settings view
     fn render_settings(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let preset_credentials_label = i18n_settings(cx, "preset_credentials");
+
         v_flex()
             .size_full()
             .p_4()
+            .gap_4()
             .child(Label::new(i18n_common(cx, "settings")).text_xl())
             .child(
-                div()
-                    .flex_1()
-                    .p_4()
-                    .child(Label::new(i18n_common(cx, "settings_placeholder")).text_color(cx.theme().muted_foreground)),
+                v_form().child(
+                    field()
+                        .label(preset_credentials_label)
+                        .child(Input::new(&self.preset_credentials_state)),
+                ),
             )
     }
 }

@@ -110,6 +110,8 @@ pulsar_url = "Pulsar URL"
 pulsar_url_placeholder = "pulsar://localhost:6650"
 save_settings = "Save Settings"
 reset_defaults = "Reset to Defaults"
+preset_credentials = "Preset Credentials"
+preset_credentials_placeholder = "One password per line, or username:password"
 
 [alarms]
 title = "Alarms"

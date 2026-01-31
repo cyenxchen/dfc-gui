@@ -110,6 +110,8 @@ pulsar_url = "Pulsar 地址"
 pulsar_url_placeholder = "pulsar://localhost:6650"
 save_settings = "保存设置"
 reset_defaults = "恢复默认"
+preset_credentials = "预设凭证"
+preset_credentials_placeholder = "每行一个密码，或 用户名:密码"
 
 [alarms]
 title = "告警"
