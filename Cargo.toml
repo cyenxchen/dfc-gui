@@ -1,0 +1,76 @@
+[package]
+name = "dfc-gui"
+version = "0.1.0"
+edition = "2024"
+authors = ["Goldwind DFC Team"]
+description = "DFC GUI - A native GUI client for device fleet control"
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+# GPUI Framework
+gpui = "0.2.2"
+gpui-component = "0.5.0"
+gpui-component-assets = "0.5.0"
+gpui-macros = "0.2.2"
+
+# Async Runtime
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+smol = "2.0"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+
+# i18n
+rust-i18n = "3.1"
+locale_config = "0.3"
+
+# Error handling
+snafu = "0.8"
+anyhow = "1.0"
+schemars = "1.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["local-time"] }
+
+# Utilities
+ahash = "0.8"
+crossbeam-channel = "0.5"
+directories = "6.0"
+home = "0.5"
+time = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+# Embedded assets
+rust-embed = { version = "8.9", default-features = false }
+
+# Redis client (commented out until needed)
+# fred = "10"
+
+# Pulsar client (commented out until needed)
+# pulsar = "6"
+
+[build-dependencies]
+winres = "0.1"
+
+[lints.clippy]
+unwrap_used = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+panic = "abort"
+
+[package.metadata.bundle]
+name = "DFC-GUI"
+identifier = "com.goldwind.dfc-gui"
+icon = ["icons/dfc-gui.icns"]
+copyright = "Copyright 2026 Goldwind DFC Team. All rights reserved."
+category = "public.app-category.developer-tools"
+osx_minimum_system_version = "12.0"
+short_description = "A native GUI client for device fleet control"
