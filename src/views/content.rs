@@ -256,8 +256,7 @@ impl DfcContent {
         });
     }
 
-    /// Clear all input fields (for adding new server)
-    /// Auto-fills Pulsar token from first preset credential if available
+    /// Clear all input fields
     fn clear_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_server_id = String::new();
         self.name_state.update(cx, |state, cx| {
@@ -278,17 +277,8 @@ impl DfcContent {
         self.device_filter_state.update(cx, |state, cx| {
             state.set_value(String::new(), window, cx);
         });
-
-        // Auto-fill Pulsar token from first preset credential
-        let default_token = self
-            .app_state
-            .read(cx)
-            .preset_credentials()
-            .first()
-            .map(|c| c.password.clone())
-            .unwrap_or_default();
         self.pulsar_token_state.update(cx, |state, cx| {
-            state.set_value(default_token, window, cx);
+            state.set_value(String::new(), window, cx);
         });
     }
 
