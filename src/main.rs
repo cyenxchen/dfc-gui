@@ -5,7 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crate::constants::SIDEBAR_WIDTH;
-use crate::helpers::{MenuAction, is_development, new_key_bindings};
+use crate::helpers::{DeviceAction, MenuAction, is_development, new_key_bindings};
 use crate::services::ServiceHub;
 use crate::states::{
     DfcAppState, DfcGlobalStore, FleetState, FontSize, FontSizeAction, LocaleAction,
@@ -208,6 +208,13 @@ impl Render for DfcApp {
                         state.go_to(Route::Settings, cx);
                     });
                 });
+            }))
+            .on_action(cx.listener(|this, e: &DeviceAction, window, cx| {
+                if matches!(e, DeviceAction::Filter) {
+                    this.content.update(cx, |content, cx| {
+                        content.focus_search(window, cx);
+                    });
+                }
             }))
     }
 }

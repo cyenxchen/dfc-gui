@@ -10,7 +10,7 @@ use crate::states::{
     DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
     i18n_settings, i18n_sidebar, update_app_state_and_save,
 };
-use gpui::{App, Context, Entity, SharedString, Subscription, Window, div, prelude::*, px};
+use gpui::{App, Context, Entity, FocusHandle, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme, Colorize, Icon, IconName, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
@@ -66,6 +66,9 @@ pub struct DfcContent {
     // Settings form input states
     preset_credentials_state: Entity<InputState>,
 
+    /// Focus handle for keyboard shortcuts
+    focus_handle: FocusHandle,
+
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
 }
@@ -77,6 +80,10 @@ impl DfcContent {
         let current_route = store.read(cx).route();
         let fleet_state = store.fleet_state();
         let app_state = store.app_state();
+
+        // Create and focus the handle for keyboard shortcuts
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
 
         let mut subscriptions = Vec::new();
 
@@ -206,8 +213,16 @@ impl DfcContent {
             pulsar_token_state,
             editing_server_id: String::new(),
             preset_credentials_state,
+            focus_handle,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Focus the search input (for Cmd+F / Ctrl+F shortcut)
+    pub fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.keyword_state.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
     }
 
     /// Check if a server matches the current filter keyword
@@ -733,13 +748,12 @@ impl Render for DfcContent {
             .id("content")
             .flex_1()
             .h_full()
+            .track_focus(&self.focus_handle)
             .bg(cx.theme().background)
             .child(content)
             .on_action(cx.listener(|this, _: &DeviceAction, window, cx| {
                 // Focus the search input when Cmd+F / Ctrl+F is pressed
-                this.keyword_state.update(cx, |state, cx| {
-                    state.focus(window, cx);
-                });
+                this.focus_search(window, cx);
             }))
     }
 }
