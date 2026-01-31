@@ -25,6 +25,7 @@ use tracing_subscriber::FmtSubscriber;
 rust_i18n::i18n!("locales", fallback = "en");
 
 mod assets;
+mod connection;
 mod constants;
 mod error;
 mod helpers;
@@ -243,10 +244,13 @@ fn main() {
     let app = Application::new().with_assets(assets::Assets);
 
     // Load or create app state
-    let app_state = DfcAppState::try_load().unwrap_or_else(|e| {
+    let mut app_state = DfcAppState::try_load().unwrap_or_else(|e| {
         error!(error = %e, "Failed to load app state, using default");
         DfcAppState::new()
     });
+
+    // Load server configurations
+    app_state.load_servers();
 
     // Create service hub
     let services = ServiceHub::with_defaults().unwrap_or_else(|e| {

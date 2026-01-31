@@ -54,6 +54,12 @@ pub fn i18n_connection(cx: &App, key: &str) -> SharedString {
     t!(format!("connection.{key}"), locale = locale).into()
 }
 
+/// Get translated string from "servers" namespace
+pub fn i18n_servers(cx: &App, key: &str) -> SharedString {
+    let locale = cx.global::<DfcGlobalStore>().read(cx).locale();
+    t!(format!("servers.{key}"), locale = locale).into()
+}
+
 /// Format a translated string with arguments
 ///
 /// # Example

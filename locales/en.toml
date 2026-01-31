@@ -128,3 +128,36 @@ connection_lost = "Connection lost"
 connection_restored = "Connection restored"
 settings_saved = "Settings saved"
 error_occurred = "An error occurred"
+
+[servers]
+# Labels
+name = "Name"
+host = "Host"
+port = "Port"
+password = "Password"
+cfgid = "Config ID"
+device_filter = "Device Filter"
+pulsar_token = "Pulsar Token"
+
+# Placeholders
+name_placeholder = "Server name"
+host_placeholder = "IP address (e.g., 10.15.64.53)"
+port_placeholder = "6379"
+password_placeholder = "Password"
+cfgid_placeholder = "e.g., {DCC0006}"
+device_filter_placeholder = "Filter devices"
+pulsar_token_placeholder = "Pulsar authentication token"
+
+# Dialog titles
+add_title = "Add Server"
+edit_title = "Edit Server"
+remove_title = "Remove Server"
+
+# Buttons and tooltips
+add_tooltip = "Add new server"
+edit_tooltip = "Edit server"
+delete_tooltip = "Delete server"
+save_config = "Save Configuration"
+
+# Messages
+remove_prompt = "Are you sure you want to remove server \"{server}\"?"

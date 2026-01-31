@@ -43,7 +43,12 @@ crossbeam-channel = "0.5"
 directories = "6.0"
 home = "0.5"
 time = "0.3"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Cryptography
+aes-gcm = "0.10"
+base64 = "0.22"
 
 # Embedded assets
 rust-embed = { version = "8.9", default-features = false }

@@ -2,10 +2,12 @@
 //!
 //! Global application state including routing, theme, locale, and window bounds.
 
+use crate::connection::{DfcServerConfig, get_servers, save_servers};
 use crate::error::{Error, Result};
 use crate::helpers::get_or_create_config_dir;
 use crate::services::ServiceHub;
 use crate::states::FleetState;
+use chrono::Local;
 use gpui::{Action, App, AppContext, Bounds, Context, Entity, Global, Pixels};
 use gpui_component::ThemeMode;
 use locale_config::Locale;
@@ -13,6 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::{error, info};
+use uuid::Uuid;
 
 /// Application routes
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +108,12 @@ pub struct DfcAppState {
     font_size: Option<FontSize>,
     /// Selected device ID
     selected_device: Option<String>,
+    /// Server configurations (loaded separately, not serialized here)
+    #[serde(skip)]
+    servers: Vec<DfcServerConfig>,
+    /// Currently selected server ID
+    #[serde(skip)]
+    selected_server_id: Option<String>,
 }
 
 impl DfcAppState {
@@ -202,6 +211,104 @@ impl DfcAppState {
 
     pub fn set_selected_device(&mut self, device_id: Option<String>) {
         self.selected_device = device_id;
+    }
+
+    // ==================== Server Management ====================
+
+    /// Load server configurations from file
+    pub fn load_servers(&mut self) {
+        match get_servers() {
+            Ok(servers) => {
+                info!(count = servers.len(), "Loaded server configurations");
+                self.servers = servers;
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to load server configurations");
+                self.servers = vec![];
+            }
+        }
+    }
+
+    /// Get server list
+    pub fn servers(&self) -> &[DfcServerConfig] {
+        &self.servers
+    }
+
+    /// Get server by ID
+    pub fn server(&self, id: &str) -> Option<&DfcServerConfig> {
+        self.servers.iter().find(|s| s.id == id)
+    }
+
+    /// Get currently selected server
+    pub fn selected_server(&self) -> Option<&DfcServerConfig> {
+        self.selected_server_id
+            .as_ref()
+            .and_then(|id| self.servers.iter().find(|s| &s.id == id))
+    }
+
+    /// Get selected server ID
+    pub fn selected_server_id(&self) -> Option<&str> {
+        self.selected_server_id.as_deref()
+    }
+
+    /// Add or update a server configuration
+    pub fn upsert_server(&mut self, mut server: DfcServerConfig, cx: &mut Context<Self>) {
+        // Generate ID if empty (new server)
+        if server.id.is_empty() {
+            server.id = Uuid::now_v7().to_string();
+        }
+
+        // Update timestamp
+        server.updated_at = Some(Local::now().to_rfc3339());
+
+        // Find existing or insert new
+        if let Some(existing) = self.servers.iter_mut().find(|s| s.id == server.id) {
+            *existing = server;
+        } else {
+            self.servers.push(server);
+        }
+
+        // Save asynchronously
+        let servers = self.servers.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(e) = save_servers(servers).await {
+                error!(error = %e, "Failed to save servers");
+            } else {
+                info!("Servers saved successfully");
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    /// Remove a server by ID
+    pub fn remove_server(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.servers.retain(|s| s.id != id);
+
+        // Clear selection if removed server was selected
+        if self.selected_server_id.as_deref() == Some(id) {
+            self.selected_server_id = None;
+        }
+
+        // Save asynchronously
+        let servers = self.servers.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(e) = save_servers(servers).await {
+                error!(error = %e, "Failed to save servers after removal");
+            } else {
+                info!("Server removed and saved");
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    /// Select a server
+    pub fn select_server(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.selected_server_id = id;
+        cx.notify();
     }
 }
 

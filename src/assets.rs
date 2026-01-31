@@ -66,6 +66,12 @@ pub enum CustomIconName {
     Connection,
     /// File plus corner icon (for add button)
     FilePlusCorner,
+    /// File pen line icon (for edit button)
+    FilePenLine,
+    /// File X corner icon (for delete button)
+    FileXCorner,
+    /// Database zap icon (for server)
+    DatabaseZap,
 }
 
 impl CustomIconName {
@@ -82,6 +88,9 @@ impl CustomIconName {
             CustomIconName::Languages => "icons/languages.svg",
             CustomIconName::Connection => "icons/connection.svg",
             CustomIconName::FilePlusCorner => "icons/file-plus-corner.svg",
+            CustomIconName::FilePenLine => "icons/file-pen-line.svg",
+            CustomIconName::FileXCorner => "icons/file-x-corner.svg",
+            CustomIconName::DatabaseZap => "icons/database-zap.svg",
         }
         .into()
     }

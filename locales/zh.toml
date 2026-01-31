@@ -128,3 +128,36 @@ connection_lost = "连接已断开"
 connection_restored = "连接已恢复"
 settings_saved = "设置已保存"
 error_occurred = "发生错误"
+
+[servers]
+# 标签
+name = "名称"
+host = "IP地址"
+port = "端口号"
+password = "密码"
+cfgid = "限定cfgid"
+device_filter = "限定记录设备"
+pulsar_token = "Pulsar Token"
+
+# 占位符
+name_placeholder = "服务器名称"
+host_placeholder = "IP地址 (如 10.15.64.53)"
+port_placeholder = "6379"
+password_placeholder = "密码"
+cfgid_placeholder = "如 {DCC0006}"
+device_filter_placeholder = "设备过滤"
+pulsar_token_placeholder = "Pulsar 认证令牌"
+
+# 对话框标题
+add_title = "添加服务器"
+edit_title = "编辑服务器"
+remove_title = "删除服务器"
+
+# 按钮和提示
+add_tooltip = "添加新服务器"
+edit_tooltip = "编辑服务器"
+delete_tooltip = "删除服务器"
+save_config = "收藏配置"
+
+# 消息
+remove_prompt = "确定要删除服务器 \"{server}\" 吗？"
