@@ -1,8 +1,8 @@
 //! Select Component
 
 use gpui::{
-    div, prelude::*, px, App, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::*, px, App, ElementId, IntoElement, ParentElement, RenderOnce,
+    SharedString, Styled, Window,
 };
 
 use crate::theme::colors::DfcColors;

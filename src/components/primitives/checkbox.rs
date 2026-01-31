@@ -1,7 +1,7 @@
 //! Checkbox Component
 
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement,
+    div, px, App, ElementId, InteractiveElement, IntoElement, ParentElement,
     RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 

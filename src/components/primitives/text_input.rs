@@ -1,8 +1,8 @@
 //! TextInput Component
 
 use gpui::{
-    div, prelude::*, px, App, Context, ElementId, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, VisualContext, Window,
+    div, prelude::*, px, Context, ElementId, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, Styled, Window,
 };
 
 use crate::theme::colors::DfcColors;
@@ -56,6 +56,7 @@ impl TextInput {
     }
 
     /// Handle text input
+    #[allow(dead_code)]
     fn handle_input(&mut self, text: &str, cx: &mut Context<Self>) {
         self.value.push_str(text);
         if let Some(ref handler) = self.on_change {
@@ -65,6 +66,7 @@ impl TextInput {
     }
 
     /// Handle backspace
+    #[allow(dead_code)]
     fn handle_backspace(&mut self, cx: &mut Context<Self>) {
         self.value.pop();
         if let Some(ref handler) = self.on_change {

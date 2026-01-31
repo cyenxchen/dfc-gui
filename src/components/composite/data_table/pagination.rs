@@ -3,8 +3,8 @@
 //! Page navigation for the DataTable.
 
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    div, App, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, Styled, Window,
 };
 
 use crate::theme::colors::DfcColors;
@@ -75,7 +75,7 @@ impl RenderOnce for Pagination {
                     .gap_2()
                     // Previous button
                     .child({
-                        let on_change = self.on_page_change.as_ref().map(|h| {
+                        let _on_change = self.on_page_change.as_ref().map(|h| {
                             let handler = unsafe {
                                 std::mem::transmute::<
                                     &Box<dyn Fn(usize, &mut App) + 'static>,

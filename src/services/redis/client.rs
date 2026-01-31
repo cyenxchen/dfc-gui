@@ -23,7 +23,7 @@ impl RedisClient {
 
     /// Connect to Redis
     pub async fn connect(&mut self) -> Result<()> {
-        let url = if let Some(ref password) = self.config.password {
+        let _url = if let Some(ref password) = self.config.password {
             format!(
                 "redis://:{}@{}:{}/",
                 password, self.config.ip, self.config.port

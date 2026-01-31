@@ -3,12 +3,11 @@
 //! A data table with virtual scrolling support.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    VisualContext, Window,
+    div, prelude::*, px, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
+    Window,
 };
 
 use super::column::{Column, ColumnWidth};
-use super::data_provider::DataProvider;
 use crate::theme::colors::DfcColors;
 
 /// DataTable component
@@ -23,7 +22,7 @@ pub struct DataTable<R: Clone + Send + Sync + 'static> {
 
 impl<R: Clone + Send + Sync + 'static> DataTable<R> {
     /// Create a new data table
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             columns: Vec::new(),
             rows: Vec::new(),

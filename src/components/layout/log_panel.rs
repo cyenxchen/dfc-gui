@@ -3,13 +3,12 @@
 //! Displays application logs at the bottom of the screen.
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, VisualContext, Window,
+    div, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::app::entities::AppEntities;
-use crate::i18n::{t, Locale};
-use crate::state::log_state::LogLevel;
+use crate::i18n::t;
 use crate::theme::colors::DfcColors;
 use crate::utils::format::format_time_ms;
 

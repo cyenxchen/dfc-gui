@@ -3,13 +3,14 @@
 //! Navigation sidebar with page links.
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, VisualContext, Window,
+    div, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::app::entities::AppEntities;
 use crate::app::navigation::ActivePage;
-use crate::i18n::{t, Locale};
+use crate::i18n::t;
+use crate::i18n::Locale;
 use crate::theme::colors::DfcColors;
 
 /// Sidebar component
@@ -39,7 +40,7 @@ impl Sidebar {
         page: ActivePage,
         locale: Locale,
         active_page: ActivePage,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> impl IntoElement {
         let is_active = page == active_page;
         let label = t(locale, page.title_key());

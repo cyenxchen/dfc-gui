@@ -3,17 +3,16 @@
 //! Main configuration page with device settings, Redis/Pulsar config, and filters.
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, VisualContext, Window,
+    div, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::app::entities::AppEntities;
-use crate::components::primitives::button::{Button, ButtonVariant};
+use crate::components::primitives::button::Button;
 use crate::components::primitives::checkbox::Checkbox;
 use crate::domain::config::{AppConfig, DeviceConfig, FilterConfig, PulsarConfig, RedisConfig};
 use crate::features::home::controller::HomeController;
-use crate::i18n::{t, Locale};
-use crate::services::service_hub::ServiceHub;
+use crate::i18n::t;
 use crate::theme::colors::DfcColors;
 
 /// Home page component
@@ -181,7 +180,7 @@ impl HomePage {
 impl Render for HomePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let locale = self.entities.i18n.read(cx).locale;
-        let entities = self.entities.clone();
+        let _entities = self.entities.clone();
 
         div()
             .id("home-page")
@@ -232,7 +231,7 @@ impl Render for HomePage {
                                     )
                                     .child({
                                         let running = self.running;
-                                        let entities = self.entities.clone();
+                                        let _entities = self.entities.clone();
                                         Checkbox::new("running-checkbox")
                                             .checked(running)
                                             .on_change(move |_checked, _window, _cx| {

@@ -2,7 +2,7 @@
 //!
 //! The main application shell that wraps the entire layout.
 
-use gpui::{div, prelude::*, px, App, IntoElement, ParentElement, RenderOnce, Styled, Window};
+use gpui::{div, App, IntoElement, ParentElement, RenderOnce, Styled, Window};
 
 use crate::theme::colors::DfcColors;
 

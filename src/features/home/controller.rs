@@ -2,7 +2,7 @@
 //!
 //! Handles configuration loading, saving, and service management.
 
-use gpui::{App, Context, Entity};
+use gpui::App;
 
 use crate::app::entities::AppEntities;
 use crate::domain::config::AppConfig;

@@ -1,7 +1,5 @@
 //! Typography - Font Sizes and Weights
 
-use gpui::px;
-
 /// Typography constants
 pub struct Typography;
 

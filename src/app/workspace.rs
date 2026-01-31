@@ -4,7 +4,7 @@
 //! It also manages the event pump that bridges service events to UI updates.
 
 use gpui::{
-    div, prelude::*, App, Context, Entity, IntoElement, ParentElement, Render,
+    div, prelude::*, px, App, Context, Entity, IntoElement, ParentElement, Render,
     Styled, Window,
 };
 
@@ -51,7 +51,7 @@ impl Workspace {
         Self::start_event_pump(event_rx, entities.clone(), cx);
 
         // Observe tabs state for page changes
-        cx.observe(&entities.tabs, |this, _, cx| {
+        cx.observe(&entities.tabs, |_this, _, cx| {
             cx.notify();
         })
         .detach();
@@ -129,11 +129,21 @@ impl Render for Workspace {
         let active_page = self.entities.tabs.read(cx).active_page;
         let content = self.get_or_create_page(active_page, cx);
 
+        // macOS titlebar height for traffic light buttons
+        let titlebar_height = px(38.0);
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(DfcColors::background())
+            .child(
+                // Titlebar spacer for macOS window controls
+                div()
+                    .h(titlebar_height)
+                    .w_full()
+                    .bg(DfcColors::header_bg()),
+            )
             .child(
                 // Header
                 self.header.clone(),

@@ -1,7 +1,7 @@
 //! Button Component
 
 use gpui::{
-    div, prelude::*, px, App, AnyElement, ClickEvent, ElementId, InteractiveElement, IntoElement,
+    div, px, App, ClickEvent, ElementId, InteractiveElement, IntoElement,
     ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 

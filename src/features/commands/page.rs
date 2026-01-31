@@ -11,7 +11,7 @@ use crate::app::entities::AppEntities;
 use crate::components::primitives::button::Button;
 use crate::domain::command::CommandRequest;
 use crate::features::commands::controller::CommandsController;
-use crate::i18n::{t, Locale};
+use crate::i18n::t;
 use crate::theme::colors::DfcColors;
 use crate::utils::format::format_datetime;
 

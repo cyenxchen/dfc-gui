@@ -4,7 +4,7 @@
 
 use gpui::{
     div, prelude::*, ClickEvent, Context, Entity, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window,
+    Render, Styled, Window,
 };
 
 use crate::app::entities::AppEntities;

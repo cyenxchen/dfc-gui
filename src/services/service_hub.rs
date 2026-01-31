@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use gpui::Global;
 use parking_lot::RwLock;
-use tokio::sync::oneshot;
 
 use crate::domain::command::CommandRequest;
 use crate::domain::config::AppConfig;

@@ -3,12 +3,12 @@
 //! The application header with logo, title, and language switcher.
 
 use gpui::{
-    div, prelude::*, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, VisualContext, Window,
+    div, px, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::app::entities::AppEntities;
-use crate::i18n::{t, Locale};
+use crate::i18n::t;
 use crate::state::connection_state::ConnectionTarget;
 use crate::theme::colors::DfcColors;
 
