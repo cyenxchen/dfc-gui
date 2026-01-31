@@ -64,6 +64,8 @@ pub enum CustomIconName {
     Languages,
     /// Connection icon
     Connection,
+    /// File plus corner icon (for add button)
+    FilePlusCorner,
 }
 
 impl CustomIconName {
@@ -79,6 +81,7 @@ impl CustomIconName {
             CustomIconName::Events => "icons/events.svg",
             CustomIconName::Languages => "icons/languages.svg",
             CustomIconName::Connection => "icons/connection.svg",
+            CustomIconName::FilePlusCorner => "icons/file-plus-corner.svg",
         }
         .into()
     }
