@@ -344,8 +344,8 @@ fn main() {
                 |window, cx| {
                     #[cfg(target_os = "macos")]
                     window.on_window_should_close(cx, move |_window, cx| {
-                        cx.hide();
-                        false
+                        cx.quit();
+                        true
                     });
 
                     let app_view = cx.new(|cx| DfcApp::new(window, cx));
