@@ -2,8 +2,8 @@
 //!
 //! Routes to different views based on the current application route.
 
-use crate::states::{DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_devices};
-use gpui::{Context, Entity, Subscription, Window, div, prelude::*, px};
+use crate::states::{DfcGlobalStore, FleetState, Route, UIEvent, i18n_common};
+use gpui::{Context, Entity, Subscription, Window, div, prelude::*};
 use gpui_component::{
     ActiveTheme,
     label::Label,
@@ -66,59 +66,9 @@ impl DfcContent {
         }
     }
 
-    /// Render the home/devices view
-    fn render_home(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let fleet = self.fleet_state.read(cx);
-        let device_count = fleet.device_count();
-        let online_count = fleet.online_count();
-
-        v_flex()
-            .size_full()
-            .p_4()
-            .gap_4()
-            // Header
-            .child(
-                div()
-                    .child(Label::new(i18n_devices(cx, "title")).text_xl()),
-            )
-            // Stats
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .child(
-                        div()
-                            .p_4()
-                            .rounded_lg()
-                            .bg(cx.theme().secondary)
-                            .child(
-                                v_flex()
-                                    .child(Label::new(format!("{}", device_count)).text_2xl())
-                                    .child(Label::new(i18n_devices(cx, "total")).text_sm().text_color(cx.theme().muted_foreground)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .p_4()
-                            .rounded_lg()
-                            .bg(cx.theme().secondary)
-                            .child(
-                                v_flex()
-                                    .child(Label::new(format!("{}", online_count)).text_2xl().text_color(cx.theme().success))
-                                    .child(Label::new(i18n_devices(cx, "online")).text_sm().text_color(cx.theme().muted_foreground)),
-                            ),
-                    ),
-            )
-            // Device list placeholder
-            .child(
-                div()
-                    .flex_1()
-                    .p_4()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .child(Label::new(i18n_devices(cx, "list_placeholder")).text_color(cx.theme().muted_foreground)),
-            )
+    /// Render the home view
+    fn render_home(&self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full()
     }
 
     /// Render the properties view

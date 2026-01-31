@@ -149,10 +149,7 @@ impl Render for DfcSidebar {
                 v_flex()
                     .flex_1()
                     .pt_2()
-                    .child(self.render_nav_button("home", Route::Home, IconName::LayoutDashboard, "home", cx))
-                    .child(self.render_nav_button("properties", Route::Properties, IconName::File, "properties", cx))
-                    .child(self.render_nav_button("events", Route::Events, IconName::Bell, "events", cx))
-                    .child(self.render_nav_button("commands", Route::Commands, IconName::SquareTerminal, "commands", cx)),
+                    .child(self.render_nav_button("home", Route::Home, IconName::LayoutDashboard, "home", cx)),
             )
             // Settings button at bottom
             .child(self.render_settings_button(cx))
