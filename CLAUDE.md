@@ -101,3 +101,37 @@ Translations in `locales/` (en.toml, zh.toml). Use `rust_i18n::t!()` macro with 
 ### Clippy
 
 `unwrap_used = "deny"` - Use `?` operator or proper error handling instead of `.unwrap()`.
+
+### Logging & Debugging
+
+**Log Levels**: Use `tracing::debug!` for diagnostic logs, `tracing::info!` for important events only.
+
+**Enable Debug Logs**:
+```bash
+# All modules at debug level
+RUST_LOG=debug cargo run
+
+# Specific module only
+RUST_LOG=dfc_gui::services::redis_repo=debug cargo run
+
+# Multiple modules
+RUST_LOG=dfc_gui::services=debug,dfc_gui::views=info cargo run
+
+# With trace level (very verbose)
+RUST_LOG=trace cargo run
+```
+
+**Log File Location**:
+- macOS: `~/Library/Logs/com.goldwind.dfc-gui/dfc-gui.log.YYYY-MM-DD`
+- Windows: `%LOCALAPPDATA%\goldwind\dfc-gui\logs\`
+- Linux: `~/.local/share/dfc-gui/logs/`
+
+**View Logs in Real-time**:
+```bash
+tail -f ~/Library/Logs/com.goldwind.dfc-gui/dfc-gui.log.$(date +%Y-%m-%d)
+```
+
+**Best Practices**:
+- Use `tracing::debug!` for temporary debugging (not committed as `info!`)
+- Use `tracing::info!` only for significant events (startup, connections, errors)
+- Include context in log messages: `tracing::debug!("Processing key: {}", key)`
