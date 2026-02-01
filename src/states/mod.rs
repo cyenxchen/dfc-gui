@@ -11,10 +11,12 @@ mod app;
 mod config;
 mod fleet;
 mod i18n;
+mod keys;
 mod ui_event;
 
 pub use app::*;
 pub use config::*;
 pub use fleet::*;
 pub use i18n::*;
+pub use keys::*;
 pub use ui_event::*;

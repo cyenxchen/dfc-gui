@@ -42,6 +42,10 @@ pub enum Error {
     /// Timeout error
     #[snafu(display("Timeout: {message}"))]
     Timeout { message: String },
+
+    /// Parse error
+    #[snafu(display("Parse error: {message}"))]
+    Parse { message: String },
 }
 
 impl From<std::io::Error> for Error {

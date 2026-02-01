@@ -7,13 +7,13 @@ use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credential
 use crate::constants::DEFAULT_PULSAR_TOKEN;
 use crate::helpers::DeviceAction;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
+    ConfigState, DfcAppState, DfcGlobalStore, FleetState, KeysState, Route, UIEvent, i18n_common, i18n_servers,
     i18n_settings, i18n_sidebar, update_app_state_and_save,
 };
-use crate::views::ConfigView;
+use crate::views::{ConfigView, KeysBrowserView};
 use gpui::{App, Context, Entity, FocusHandle, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Colorize, Icon, IconName, Sizable, StyledExt, WindowExt,
+    ActiveTheme, Colorize, Icon, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     form::{field, v_form},
     h_flex,
@@ -50,8 +50,12 @@ pub struct DfcContent {
     app_state: Entity<DfcAppState>,
     /// Config state entity
     config_state: Entity<ConfigState>,
+    /// Keys state entity
+    keys_state: Entity<KeysState>,
     /// Config view component
     config_view: Entity<ConfigView>,
+    /// Keys browser view component
+    keys_browser_view: Entity<KeysBrowserView>,
     /// Keyword search input state
     keyword_state: Entity<InputState>,
     /// Filter keyword for servers
@@ -86,10 +90,16 @@ impl DfcContent {
         let fleet_state = store.fleet_state();
         let app_state = store.app_state();
         let config_state = store.config_state();
+        let keys_state = store.keys_state();
 
         // Create ConfigView
         let config_view = cx.new(|cx| {
-            ConfigView::new(app_state.clone(), config_state.clone(), window, cx)
+            ConfigView::new(app_state.clone(), config_state.clone(), keys_state.clone(), window, cx)
+        });
+
+        // Create KeysBrowserView
+        let keys_browser_view = cx.new(|cx| {
+            KeysBrowserView::new(keys_state.clone(), window, cx)
         });
 
         // Create and focus the handle for keyboard shortcuts
@@ -109,6 +119,11 @@ impl DfcContent {
 
         // Subscribe to config state changes
         subscriptions.push(cx.observe(&config_state, |_this, _model, cx| {
+            cx.notify();
+        }));
+
+        // Subscribe to keys state changes
+        subscriptions.push(cx.observe(&keys_state, |_this, _model, cx| {
             cx.notify();
         }));
 
@@ -219,7 +234,9 @@ impl DfcContent {
             fleet_state,
             app_state,
             config_state,
+            keys_state,
             config_view,
+            keys_browser_view,
             keyword_state,
             filter_keyword: SharedString::default(),
             name_state,
@@ -634,7 +651,7 @@ impl DfcContent {
                 let server = this.app_state.read(cx).server(&server_id).cloned();
 
                 if let Some(server) = server {
-                    // Set loading state
+                    // Set loading state in ConfigState and select the server
                     this.config_state.update(cx, |state, cx| {
                         state.set_loading(cx);
                         state.set_connected_server(Some(server_id.clone()), cx);
@@ -662,7 +679,7 @@ impl DfcContent {
                             return;
                         }
 
-                        // Fetch configs
+                        // Fetch configs (uses REDIS_KEY_PATTERNS)
                         match redis.fetch_configs(cfgid).await {
                             Ok(configs) => {
                                 tracing::info!("Fetched {} configs", configs.len());
@@ -683,9 +700,15 @@ impl DfcContent {
             }))
     }
 
-    /// Render the home view with server cards or config view
+    /// Render the home view with server cards, config view, or keys browser
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Check if a server is selected - if so, show ConfigView
+        // Priority 1: If we have connected servers with keys loaded - show KeysBrowserView
+        let keys_state = self.keys_state.read(cx);
+        if !keys_state.connected_servers().is_empty() && !keys_state.keys().is_empty() {
+            return self.keys_browser_view.clone().into_any_element();
+        }
+
+        // Priority 2: If a server is selected - show ConfigView (config list)
         if self.app_state.read(cx).selected_server_id().is_some() {
             return self.config_view.clone().into_any_element();
         }

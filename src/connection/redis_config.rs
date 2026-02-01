@@ -76,3 +76,102 @@ pub const REDIS_KEY_PATTERNS: &[&str] = &[
     "CMC_*_sg.io.iothub",
     "CMC_*_sg.bus",
 ];
+
+// ==================== Redis Key Types ====================
+
+/// Redis key type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RedisKeyType {
+    String,
+    Hash,
+    List,
+    Set,
+    ZSet,
+    Stream,
+    #[default]
+    Unknown,
+}
+
+impl RedisKeyType {
+    /// Get short display name for the type
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            RedisKeyType::String => "STR",
+            RedisKeyType::Hash => "HASH",
+            RedisKeyType::List => "LIST",
+            RedisKeyType::Set => "SET",
+            RedisKeyType::ZSet => "ZSET",
+            RedisKeyType::Stream => "STREAM",
+            RedisKeyType::Unknown => "?",
+        }
+    }
+
+    /// Parse from Redis TYPE command response
+    pub fn from_type_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "string" => RedisKeyType::String,
+            "hash" => RedisKeyType::Hash,
+            "list" => RedisKeyType::List,
+            "set" => RedisKeyType::Set,
+            "zset" => RedisKeyType::ZSet,
+            "stream" => RedisKeyType::Stream,
+            _ => RedisKeyType::Unknown,
+        }
+    }
+}
+
+/// Redis key item with metadata
+#[derive(Debug, Clone)]
+pub struct RedisKeyItem {
+    /// The key name
+    pub key: String,
+    /// The key type
+    pub key_type: RedisKeyType,
+    /// TTL in seconds (-1 means no expiry, -2 means key doesn't exist)
+    pub ttl: i64,
+}
+
+impl RedisKeyItem {
+    /// Create a new key item
+    pub fn new(key: String, key_type: RedisKeyType, ttl: i64) -> Self {
+        Self { key, key_type, ttl }
+    }
+}
+
+/// Redis key value representation
+#[derive(Debug, Clone)]
+pub enum RedisKeyValue {
+    /// String value
+    String(String),
+    /// Hash value (field-value pairs)
+    Hash(Vec<(String, String)>),
+    /// List value (ordered elements)
+    List(Vec<String>),
+    /// Set value (unordered unique elements)
+    Set(Vec<String>),
+    /// Sorted set value (elements with scores)
+    ZSet(Vec<(String, f64)>),
+    /// Loading state
+    Loading,
+    /// Error state
+    Error(String),
+    /// Empty/not loaded
+    Empty,
+}
+
+impl Default for RedisKeyValue {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
+/// Connected server information for sidebar display
+#[derive(Debug, Clone)]
+pub struct ConnectedServerInfo {
+    /// Server ID (matches DfcServerConfig.id)
+    pub server_id: String,
+    /// Server display name
+    pub server_name: String,
+    /// Selected config source (Redis key)
+    pub config_source: Option<String>,
+}

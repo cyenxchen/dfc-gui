@@ -3,7 +3,10 @@
 //! Provides access to device metadata, configuration, and dictionary tables
 //! stored in Redis. Handles one-time queries and caching.
 
-use crate::connection::{ConfigItem, DetailItem, DfcServerConfig, REDIS_KEY_PATTERNS};
+use crate::connection::{
+    ConfigItem, DetailItem, DfcServerConfig, RedisKeyItem, RedisKeyType, RedisKeyValue,
+    REDIS_KEY_PATTERNS,
+};
 use crate::error::{Error, Result};
 use crate::services::events::{DeviceId, DeviceMeta};
 use crossbeam_channel::Sender;
@@ -155,8 +158,14 @@ impl RedisRepo {
         // Scan for matching keys using each pattern
         for pattern in REDIS_KEY_PATTERNS {
             let scan_pattern = if let Some(cfg) = cfgid {
-                // Replace * with the specific cfgid
-                pattern.replace('*', cfg)
+                // Check if cfgid already has braces, add them if not
+                // Redis keys use format: CMC_{DCC0001}_sg.og.output.iothub
+                let wrapped_cfgid = if cfg.starts_with('{') && cfg.ends_with('}') {
+                    cfg.to_string()
+                } else {
+                    format!("{{{}}}", cfg) // Add braces: DCC0001 -> {DCC0001}
+                };
+                pattern.replace('*', &wrapped_cfgid)
             } else {
                 pattern.to_string()
             };
@@ -209,6 +218,29 @@ impl RedisRepo {
                                 }
                             }
                             Some(serde_json::to_string(&map).unwrap_or_default())
+                        } else {
+                            None
+                        }
+                    }
+                    "list" => {
+                        // Get list value and convert to JSON array
+                        let cmd = CustomCommand::new_static("LRANGE", None, false);
+                        let result: Value = client.custom(cmd, vec![
+                            Value::from(key.clone()),
+                            Value::from("0"),
+                            Value::from("-1"),  // Get all elements
+                        ]).await.unwrap_or(Value::Null);
+                        if let Value::Array(arr) = result {
+                            let items: Vec<serde_json::Value> = arr
+                                .into_iter()
+                                .filter_map(|v| v.into_string())
+                                .map(|s| {
+                                    // Try to parse each item as JSON, otherwise use as string
+                                    serde_json::from_str(&s)
+                                        .unwrap_or(serde_json::Value::String(s))
+                                })
+                                .collect();
+                            Some(serde_json::to_string(&items).unwrap_or_default())
                         } else {
                             None
                         }
@@ -409,6 +441,296 @@ impl RedisRepo {
     pub async fn is_connected_async(&self) -> bool {
         let guard = self.client.read().await;
         guard.is_some()
+    }
+
+    // ==================== Key Operations ====================
+
+    /// Scan keys using SCAN command with optional pattern
+    ///
+    /// Returns a tuple of (keys, next_cursor). A cursor of 0 means scan is complete.
+    pub async fn scan_keys(
+        &self,
+        pattern: &str,
+        cursor: u64,
+        count: usize,
+    ) -> Result<(Vec<RedisKeyItem>, u64)> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        tracing::debug!("Scanning keys with pattern: {}, cursor: {}", pattern, cursor);
+
+        // Build SCAN command: SCAN cursor [MATCH pattern] [COUNT count]
+        let cmd = CustomCommand::new_static("SCAN", None, false);
+        let mut args = vec![Value::from(cursor.to_string())];
+
+        if !pattern.is_empty() && pattern != "*" {
+            args.push(Value::from("MATCH"));
+            args.push(Value::from(pattern.to_string()));
+        }
+
+        args.push(Value::from("COUNT"));
+        args.push(Value::from(count.to_string()));
+
+        let result: Value = client.custom(cmd, args).await.map_err(|e| {
+            tracing::error!("Redis SCAN failed: {}", e);
+            Error::Connection { message: e.to_string() }
+        })?;
+
+        // Parse SCAN result: [cursor, [key1, key2, ...]]
+        let (next_cursor, keys_raw) = match result {
+            Value::Array(mut arr) if arr.len() >= 2 => {
+                let cursor_val = arr.remove(0);
+                let keys_val = arr.remove(0);
+
+                let next_cursor = cursor_val
+                    .into_string()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let keys: Vec<String> = match keys_val {
+                    Value::Array(arr) => arr.into_iter().filter_map(|v| v.into_string()).collect(),
+                    _ => vec![],
+                };
+
+                (next_cursor, keys)
+            }
+            _ => (0, vec![]),
+        };
+
+        // Get type and TTL for each key
+        let mut key_items = Vec::with_capacity(keys_raw.len());
+        for key in keys_raw {
+            let key_type = self.get_key_type_internal(client, &key).await;
+            let ttl = self.get_key_ttl_internal(client, &key).await;
+            key_items.push(RedisKeyItem::new(key, key_type, ttl));
+        }
+
+        tracing::debug!(
+            "Scan returned {} keys, next cursor: {}",
+            key_items.len(),
+            next_cursor
+        );
+
+        Ok((key_items, next_cursor))
+    }
+
+    /// Get the type of a key
+    async fn get_key_type_internal(&self, client: &FredClient, key: &str) -> RedisKeyType {
+        let cmd = CustomCommand::new_static("TYPE", None, false);
+        let result: Value = client
+            .custom(cmd, vec![Value::from(key.to_string())])
+            .await
+            .unwrap_or(Value::Null);
+
+        result
+            .into_string()
+            .map(|s| RedisKeyType::from_type_str(&s))
+            .unwrap_or(RedisKeyType::Unknown)
+    }
+
+    /// Get the TTL of a key
+    async fn get_key_ttl_internal(&self, client: &FredClient, key: &str) -> i64 {
+        let cmd = CustomCommand::new_static("TTL", None, false);
+        let result: Value = client
+            .custom(cmd, vec![Value::from(key.to_string())])
+            .await
+            .unwrap_or(Value::Null);
+
+        match result {
+            Value::Integer(ttl) => ttl,
+            _ => -1,
+        }
+    }
+
+    /// Get the type of a key (public API)
+    pub async fn get_key_type(&self, key: &str) -> Result<RedisKeyType> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        Ok(self.get_key_type_internal(client, key).await)
+    }
+
+    /// Get a string value
+    pub async fn get_string(&self, key: &str) -> Result<String> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        let cmd = CustomCommand::new_static("GET", None, false);
+        let result: Value = client
+            .custom(cmd, vec![Value::from(key.to_string())])
+            .await
+            .map_err(|e| Error::Connection { message: e.to_string() })?;
+
+        result.into_string().ok_or_else(|| Error::Parse {
+            message: "Failed to parse string value".to_string(),
+        })
+    }
+
+    /// Get a hash value (all fields)
+    pub async fn get_hash(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        let cmd = CustomCommand::new_static("HGETALL", None, false);
+        let result: Value = client
+            .custom(cmd, vec![Value::from(key.to_string())])
+            .await
+            .map_err(|e| Error::Connection { message: e.to_string() })?;
+
+        match result {
+            Value::Array(arr) => {
+                let mut pairs = Vec::new();
+                let mut iter = arr.into_iter();
+                while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                    if let (Some(key_str), Some(val_str)) = (k.into_string(), v.into_string()) {
+                        pairs.push((key_str, val_str));
+                    }
+                }
+                Ok(pairs)
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Get a list value (with range)
+    pub async fn get_list(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        let cmd = CustomCommand::new_static("LRANGE", None, false);
+        let result: Value = client
+            .custom(
+                cmd,
+                vec![
+                    Value::from(key.to_string()),
+                    Value::from(start.to_string()),
+                    Value::from(stop.to_string()),
+                ],
+            )
+            .await
+            .map_err(|e| Error::Connection { message: e.to_string() })?;
+
+        match result {
+            Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Get a set value (all members)
+    pub async fn get_set(&self, key: &str) -> Result<Vec<String>> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        let cmd = CustomCommand::new_static("SMEMBERS", None, false);
+        let result: Value = client
+            .custom(cmd, vec![Value::from(key.to_string())])
+            .await
+            .map_err(|e| Error::Connection { message: e.to_string() })?;
+
+        match result {
+            Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Get a sorted set value (with scores, range)
+    pub async fn get_zset(&self, key: &str, start: i64, stop: i64) -> Result<Vec<(String, f64)>> {
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        let cmd = CustomCommand::new_static("ZRANGE", None, false);
+        let result: Value = client
+            .custom(
+                cmd,
+                vec![
+                    Value::from(key.to_string()),
+                    Value::from(start.to_string()),
+                    Value::from(stop.to_string()),
+                    Value::from("WITHSCORES"),
+                ],
+            )
+            .await
+            .map_err(|e| Error::Connection { message: e.to_string() })?;
+
+        match result {
+            Value::Array(arr) => {
+                let mut pairs = Vec::new();
+                let mut iter = arr.into_iter();
+                while let (Some(member), Some(score)) = (iter.next(), iter.next()) {
+                    if let Some(member_str) = member.into_string() {
+                        let score_val = score
+                            .into_string()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        pairs.push((member_str, score_val));
+                    }
+                }
+                Ok(pairs)
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Get key value based on its type
+    pub async fn get_key_value(&self, key: &str) -> Result<RedisKeyValue> {
+        let key_type = self.get_key_type(key).await?;
+
+        match key_type {
+            RedisKeyType::String => {
+                let value = self.get_string(key).await?;
+                Ok(RedisKeyValue::String(value))
+            }
+            RedisKeyType::Hash => {
+                let value = self.get_hash(key).await?;
+                Ok(RedisKeyValue::Hash(value))
+            }
+            RedisKeyType::List => {
+                // Get first 100 elements
+                let value = self.get_list(key, 0, 99).await?;
+                Ok(RedisKeyValue::List(value))
+            }
+            RedisKeyType::Set => {
+                let value = self.get_set(key).await?;
+                Ok(RedisKeyValue::Set(value))
+            }
+            RedisKeyType::ZSet => {
+                // Get first 100 elements with scores
+                let value = self.get_zset(key, 0, 99).await?;
+                Ok(RedisKeyValue::ZSet(value))
+            }
+            _ => Ok(RedisKeyValue::Error(format!(
+                "Unsupported key type: {:?}",
+                key_type
+            ))),
+        }
     }
 }
 

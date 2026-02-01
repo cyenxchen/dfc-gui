@@ -2,11 +2,12 @@
 //!
 //! Displays Redis configuration list and Topic tabs.
 
-use crate::connection::{ConfigItem, ConfigLoadState};
-use crate::states::{ConfigState, DfcAppState, DfcGlobalStore};
+use crate::assets::CustomIconName;
+use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
+use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState};
 use gpui::{App, Context, Entity, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Colorize, Icon, IconName,
+    ActiveTheme, Colorize, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
@@ -22,6 +23,8 @@ pub struct ConfigView {
     app_state: Entity<DfcAppState>,
     /// Config state entity
     config_state: Entity<ConfigState>,
+    /// Keys state entity
+    keys_state: Entity<KeysState>,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
 }
@@ -31,6 +34,7 @@ impl ConfigView {
     pub fn new(
         app_state: Entity<DfcAppState>,
         config_state: Entity<ConfigState>,
+        keys_state: Entity<KeysState>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -44,6 +48,7 @@ impl ConfigView {
         Self {
             app_state,
             config_state,
+            keys_state,
             _subscriptions: subscriptions,
         }
     }
@@ -164,6 +169,68 @@ impl ConfigView {
     ) -> gpui::Stateful<gpui::Div> {
         let group_id = config.group_id;
         let topic_count = config.details.len();
+        let locale = self.locale(cx);
+        let browse_keys_label = t!("keys.browse_keys", locale = &locale).to_string();
+        let config_source = config.source.clone();
+
+        // Browse Keys button
+        let keys_state = self.keys_state.clone();
+        let app_state = self.app_state.clone();
+        let config_source_for_click = config_source.clone();
+
+        let browse_btn = Button::new(("browse-keys", index))
+            .ghost()
+            .small()
+            .icon(Icon::from(CustomIconName::DatabaseZap))
+            .tooltip(browse_keys_label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Stop propagation to prevent row click
+                cx.stop_propagation();
+
+                // Get server info
+                let server = this.app_state.read(cx).selected_server().cloned();
+                let config_source = config_source_for_click.clone();
+
+                if let Some(server) = server {
+                    // Add to connected servers
+                    let server_info = ConnectedServerInfo {
+                        server_id: server.id.clone(),
+                        server_name: server.name.clone(),
+                        config_source: Some(config_source.clone()),
+                    };
+
+                    this.keys_state.update(cx, |state, cx| {
+                        state.add_connected_server(server_info, cx);
+                        state.set_loading(cx);
+                    });
+
+                    // Load keys for this config pattern
+                    let keys_state = this.keys_state.clone();
+                    let store = cx.global::<DfcGlobalStore>().clone();
+
+                    cx.spawn(async move |_, cx| {
+                        let redis = store.services().redis();
+
+                        // Use the config source as pattern or scan all keys
+                        // For now, scan all keys with pattern *
+                        match redis.scan_keys("*", 0, 100).await {
+                            Ok((keys, cursor)) => {
+                                tracing::info!("Loaded {} keys, cursor: {}", keys.len(), cursor);
+                                let _ = keys_state.update(cx, |state, cx| {
+                                    state.set_keys(keys, cursor, cx);
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to scan keys: {}", e);
+                                let _ = keys_state.update(cx, |state, cx| {
+                                    state.set_error(e.to_string(), cx);
+                                });
+                            }
+                        }
+                    })
+                    .detach();
+                }
+            }));
 
         div()
             .id(("config-row", index))
@@ -219,6 +286,8 @@ impl ConfigView {
                                     .text_color(cx.theme().muted_foreground),
                             ),
                     )
+                    // Browse keys button
+                    .child(browse_btn)
                     // Arrow icon
                     .child(Icon::new(IconName::ChevronRight).size_4().text_color(cx.theme().muted_foreground)),
             )
