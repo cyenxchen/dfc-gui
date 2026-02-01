@@ -5,7 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crate::constants::SIDEBAR_WIDTH;
-use crate::helpers::{DeviceAction, MenuAction, is_development, new_key_bindings};
+use crate::helpers::{DeviceAction, MenuAction, get_or_create_log_dir, is_development, new_key_bindings};
 use crate::services::ServiceHub;
 use crate::states::{
     ConfigState, DfcAppState, DfcGlobalStore, FleetState, FontSize, FontSizeAction, LocaleAction,
@@ -19,7 +19,8 @@ use gpui::{
 use gpui_component::{ActiveTheme, Root, Theme, ThemeMode, WindowExt, h_flex, v_flex};
 use std::env;
 use tracing::{Level, error, info};
-use tracing_subscriber::FmtSubscriber;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 // Initialize i18n
 rust_i18n::i18n!("locales", fallback = "en");
@@ -219,7 +220,7 @@ impl Render for DfcApp {
     }
 }
 
-/// Initialize logging
+/// Initialize logging with console and file output
 fn init_logger() {
     let mut level = Level::INFO;
     if let Ok(log_level) = env::var("RUST_LOG") {
@@ -235,18 +236,51 @@ fn init_logger() {
         )
     });
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
-        .with_timer(timer)
+    // Console layer - with ANSI colors in development
+    let console_layer = fmt::layer()
+        .with_timer(timer.clone())
         .with_ansi(is_development())
-        .finish();
+        .with_target(true);
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // File layer - daily rotating logs
+    let file_layer = if let Ok(log_dir) = get_or_create_log_dir() {
+        let file_appender = RollingFileAppender::new(
+            Rotation::DAILY,
+            &log_dir,
+            "dfc-gui.log",
+        );
+
+        Some(
+            fmt::layer()
+                .with_timer(timer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_writer(file_appender)
+        )
+    } else {
+        eprintln!("Warning: Could not create log directory, file logging disabled");
+        None
+    };
+
+    // Build subscriber with both layers
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::filter::LevelFilter::from_level(level)
+        )
+        .with(console_layer)
+        .with(file_layer);
+
+    subscriber.init();
 }
 
 fn main() {
     init_logger();
     info!("Starting {} v{}", PKG_NAME, PKG_VERSION);
+
+    // Log the log directory location for user reference
+    if let Ok(log_dir) = get_or_create_log_dir() {
+        info!("Log directory: {}", log_dir.display());
+    }
 
     let app = Application::new().with_assets(assets::Assets);
 

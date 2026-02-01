@@ -35,7 +35,8 @@ schemars = "1.1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["local-time"] }
+tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
+tracing-appender = "0.2"
 
 # Utilities
 ahash = "0.8"

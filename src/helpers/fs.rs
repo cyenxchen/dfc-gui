@@ -147,3 +147,53 @@ pub fn get_or_create_cache_dir() -> Result<PathBuf> {
 
     Ok(cache_dir.to_path_buf())
 }
+
+/// Get the log directory for application logs
+///
+/// Platform-specific locations:
+/// - **Linux**: `~/.local/share/dfc-gui/logs/`
+/// - **macOS**: `~/Library/Logs/com.goldwind.dfc-gui/`
+/// - **Windows**: `C:\Users\<User>\AppData\Local\goldwind\dfc-gui\logs\`
+pub fn get_or_create_log_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: Use ~/Library/Logs/ which is the standard location for app logs
+        if let Some(home) = home_dir() {
+            let log_dir = home.join("Library/Logs/com.goldwind.dfc-gui");
+            if !log_dir.exists() {
+                fs::create_dir_all(&log_dir)?;
+            }
+            return Ok(log_dir);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: Use LocalAppData\<app>\logs
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let log_dir = PathBuf::from(local_app_data)
+                .join("goldwind")
+                .join("dfc-gui")
+                .join("logs");
+            if !log_dir.exists() {
+                fs::create_dir_all(&log_dir)?;
+            }
+            return Ok(log_dir);
+        }
+    }
+
+    // Fallback: Use data_dir/logs
+    let Some(project_dirs) = ProjectDirs::from("com", "goldwind", "dfc-gui") else {
+        return Err(Error::Invalid {
+            message: "Could not determine project directories".to_string(),
+        });
+    };
+
+    let log_dir = project_dirs.data_dir().join("logs");
+
+    if !log_dir.exists() {
+        fs::create_dir_all(&log_dir)?;
+    }
+
+    Ok(log_dir)
+}
