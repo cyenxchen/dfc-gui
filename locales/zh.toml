@@ -163,3 +163,15 @@ save_config = "收藏配置"
 
 # 消息
 remove_prompt = "确定要删除服务器 \"{server}\" 吗？"
+
+[config]
+loading = "正在加载配置..."
+error = "加载失败"
+back = "返回"
+group_id = "序号"
+service_url = "服务地址"
+source = "配置来源"
+topics = "Topics"
+topic = "Topic"
+no_config = "暂无配置"
+no_topic = "暂无 Topic"

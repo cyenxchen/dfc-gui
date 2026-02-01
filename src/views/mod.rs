@@ -20,10 +20,12 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+mod config_view;
 mod content;
 mod sidebar;
 mod title_bar;
 
+pub use config_view::*;
 pub use content::*;
 pub use sidebar::*;
 pub use title_bar::*;

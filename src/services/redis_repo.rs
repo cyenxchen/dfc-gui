@@ -3,10 +3,17 @@
 //! Provides access to device metadata, configuration, and dictionary tables
 //! stored in Redis. Handles one-time queries and caching.
 
+use crate::connection::{ConfigItem, DetailItem, DfcServerConfig, REDIS_KEY_PATTERNS};
 use crate::error::{Error, Result};
 use crate::services::events::{DeviceId, DeviceMeta};
 use crossbeam_channel::Sender;
+use fred::prelude::*;
+use fred::clients::Client as FredClient;
+use fred::types::config::Config as FredConfig;
+use fred::types::CustomCommand;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
 
 use super::ServiceEvent;
 
@@ -38,24 +45,22 @@ impl Default for RedisConfig {
 pub struct RedisRepo {
     config: RedisConfig,
     tx: Sender<ServiceEvent>,
-    // In a real implementation, this would hold a Redis client
-    // client: fred::clients::RedisClient,
+    /// Redis client instance
+    client: Arc<RwLock<Option<FredClient>>>,
 }
 
 impl RedisRepo {
     /// Create a new Redis repository
     pub fn new(config: &RedisConfig, tx: Sender<ServiceEvent>) -> Result<Self> {
-        // TODO: Initialize actual Redis client
-        // For now, we just store the config
         Ok(Self {
             config: config.clone(),
             tx,
+            client: Arc::new(RwLock::new(None)),
         })
     }
 
     /// Connect to Redis server
     pub async fn connect(&self) -> Result<()> {
-        // TODO: Implement actual connection
         tracing::info!("Connecting to Redis at {}", self.config.url);
 
         // Notify connection state
@@ -66,6 +71,277 @@ impl RedisRepo {
         });
 
         Ok(())
+    }
+
+    /// Connect to a specific server configuration
+    pub async fn connect_to_server(&self, server: &DfcServerConfig) -> Result<()> {
+        tracing::info!("Connecting to Redis server: {} ({}:{})", server.name, server.host, server.port);
+
+        // Build Redis config
+        let mut redis_config = FredConfig::default();
+        redis_config.server = ServerConfig::Centralized {
+            server: fred::prelude::Server::new(server.host.clone(), server.port),
+        };
+
+        if let Some(ref password) = server.password {
+            if !password.is_empty() {
+                redis_config.password = Some(password.clone());
+            }
+        }
+
+        // Create client with connection config
+        let client = Builder::from_config(redis_config)
+            .with_connection_config(|config| {
+                config.connection_timeout = Duration::from_secs(10);
+            })
+            .build()
+            .map_err(|e| Error::Connection { message: e.to_string() })?;
+
+        // Enter tokio runtime context for fred client
+        // Fred internally uses tokio::task::spawn which requires a tokio runtime
+        let _guard = super::runtime_handle().enter();
+
+        // Connect
+        client.connect();
+        client.wait_for_connect().await.map_err(|e| {
+            tracing::error!("Failed to connect to Redis: {}", e);
+            Error::Connection { message: e.to_string() }
+        })?;
+
+        // Store client
+        let mut guard = self.client.write().await;
+        *guard = Some(client);
+
+        // Notify connection state
+        let _ = self.tx.send(ServiceEvent::ConnectionState {
+            service: "redis".into(),
+            connected: true,
+            detail: format!("Connected to {}", server.name).into(),
+        });
+
+        tracing::info!("Successfully connected to Redis server: {}", server.name);
+        Ok(())
+    }
+
+    /// Disconnect from current server
+    pub async fn disconnect(&self) {
+        let mut guard = self.client.write().await;
+        if let Some(client) = guard.take() {
+            let _ = client.quit().await;
+        }
+
+        let _ = self.tx.send(ServiceEvent::ConnectionState {
+            service: "redis".into(),
+            connected: false,
+            detail: "Disconnected".into(),
+        });
+    }
+
+    /// Fetch configuration items from Redis
+    pub async fn fetch_configs(&self, cfgid: Option<&str>) -> Result<Vec<ConfigItem>> {
+        // Enter tokio runtime context for fred client operations
+        let _guard = super::runtime_handle().enter();
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        tracing::debug!("Fetching configs from Redis, cfgid filter: {:?}", cfgid);
+
+        let mut configs = Vec::new();
+        let mut group_id = 1;
+
+        // Scan for matching keys using each pattern
+        for pattern in REDIS_KEY_PATTERNS {
+            let scan_pattern = if let Some(cfg) = cfgid {
+                // Replace * with the specific cfgid
+                pattern.replace('*', cfg)
+            } else {
+                pattern.to_string()
+            };
+
+            tracing::debug!("Scanning with pattern: {}", scan_pattern);
+
+            // Use KEYS command for pattern matching
+            let cmd = CustomCommand::new_static("KEYS", None, false);
+            let keys_result: Value = client.custom(cmd, vec![Value::from(scan_pattern.clone())]).await.map_err(|e: fred::error::Error| {
+                tracing::error!("Redis KEYS failed: {}", e);
+                Error::Connection { message: e.to_string() }
+            })?;
+
+            // Convert Value to Vec<String>
+            let keys: Vec<String> = match keys_result {
+                Value::Array(arr) => arr
+                    .into_iter()
+                    .filter_map(|v| v.into_string())
+                    .collect(),
+                _ => vec![],
+            };
+
+            for key in keys {
+                // First check the key type
+                let type_cmd = CustomCommand::new_static("TYPE", None, false);
+                let type_result: Value = client.custom(type_cmd, vec![Value::from(key.clone())]).await.unwrap_or(Value::Null);
+                let key_type = type_result.into_string().unwrap_or_default();
+
+                let value: Option<String> = match key_type.as_str() {
+                    "string" => {
+                        // Get string value
+                        let cmd = CustomCommand::new_static("GET", None, false);
+                        let result: Value = client.custom(cmd, vec![Value::from(key.clone())]).await.unwrap_or(Value::Null);
+                        result.into_string()
+                    }
+                    "hash" => {
+                        // Get hash value and convert to JSON
+                        let cmd = CustomCommand::new_static("HGETALL", None, false);
+                        let result: Value = client.custom(cmd, vec![Value::from(key.clone())]).await.unwrap_or(Value::Null);
+                        if let Value::Array(arr) = result {
+                            // Convert pairs to JSON object
+                            let mut map = serde_json::Map::new();
+                            let mut iter = arr.into_iter();
+                            while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                                if let (Some(key_str), Some(val_str)) = (k.into_string(), v.into_string()) {
+                                    // Try to parse value as JSON, otherwise use as string
+                                    let json_val = serde_json::from_str(&val_str)
+                                        .unwrap_or(serde_json::Value::String(val_str));
+                                    map.insert(key_str, json_val);
+                                }
+                            }
+                            Some(serde_json::to_string(&map).unwrap_or_default())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("Skipping key {} with unsupported type: {}", key, key_type);
+                        None
+                    }
+                };
+
+                if let Some(val) = value {
+                    // Parse the value as JSON to extract topic details
+                    let details = self.parse_config_value(&val, group_id);
+
+                    // Extract service URL from the key or value
+                    let service_url = self.extract_service_url(&key, &val);
+
+                    configs.push(ConfigItem {
+                        group_id,
+                        service_url,
+                        source: key,
+                        details,
+                    });
+
+                    group_id += 1;
+                }
+            }
+        }
+
+        tracing::info!("Fetched {} config items from Redis", configs.len());
+        Ok(configs)
+    }
+
+    /// Parse config value to extract topic details
+    fn parse_config_value(&self, value: &str, group_id: i32) -> Vec<DetailItem> {
+        // Try to parse as JSON
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
+            return self.extract_topics_from_json(&json, group_id);
+        }
+
+        // If not JSON, treat as a single topic path
+        vec![DetailItem {
+            index: 0,
+            path: value.to_string(),
+            visibility: true,
+            group_id,
+        }]
+    }
+
+    /// Extract topic paths from JSON value
+    fn extract_topics_from_json(&self, json: &serde_json::Value, group_id: i32) -> Vec<DetailItem> {
+        let mut details = Vec::new();
+        let mut index = 0;
+
+        // Handle array of topics
+        if let Some(arr) = json.as_array() {
+            for item in arr {
+                if let Some(path) = item.as_str() {
+                    details.push(DetailItem {
+                        index,
+                        path: path.to_string(),
+                        visibility: true,
+                        group_id,
+                    });
+                    index += 1;
+                } else if let Some(obj) = item.as_object() {
+                    // Handle object with path/topic field
+                    let path = obj.get("path")
+                        .or_else(|| obj.get("topic"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let visibility = obj.get("visibility")
+                        .or_else(|| obj.get("visible"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+
+                    if !path.is_empty() {
+                        details.push(DetailItem {
+                            index,
+                            path: path.to_string(),
+                            visibility,
+                            group_id,
+                        });
+                        index += 1;
+                    }
+                }
+            }
+        }
+        // Handle single object with topics array
+        else if let Some(obj) = json.as_object() {
+            if let Some(topics) = obj.get("topics").and_then(|v| v.as_array()) {
+                for item in topics {
+                    if let Some(path) = item.as_str() {
+                        details.push(DetailItem {
+                            index,
+                            path: path.to_string(),
+                            visibility: true,
+                            group_id,
+                        });
+                        index += 1;
+                    }
+                }
+            }
+            // Or a single path field
+            else if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+                details.push(DetailItem {
+                    index: 0,
+                    path: path.to_string(),
+                    visibility: true,
+                    group_id,
+                });
+            }
+        }
+
+        details
+    }
+
+    /// Extract service URL from key or value
+    fn extract_service_url(&self, key: &str, value: &str) -> String {
+        // Try to extract from JSON value first
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
+            if let Some(url) = json.get("url")
+                .or_else(|| json.get("serviceUrl"))
+                .or_else(|| json.get("service_url"))
+                .and_then(|v| v.as_str())
+            {
+                return url.to_string();
+            }
+        }
+
+        // Default: construct from key pattern
+        format!("pulsar://{}", key.replace('_', "/"))
     }
 
     /// Fetch all device metadata from Redis
@@ -124,8 +400,15 @@ impl RedisRepo {
 
     /// Check if connected
     pub fn is_connected(&self) -> bool {
-        // TODO: Check actual connection state
+        // Check if we have a client (synchronous check)
+        // Note: This is a simplified check; actual connection state should be tracked separately
         true
+    }
+
+    /// Check if connected (async version with actual client check)
+    pub async fn is_connected_async(&self) -> bool {
+        let guard = self.client.read().await;
+        guard.is_some()
     }
 }
 

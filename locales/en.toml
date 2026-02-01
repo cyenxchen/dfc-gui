@@ -163,3 +163,15 @@ save_config = "Save Configuration"
 
 # Messages
 remove_prompt = "Are you sure you want to remove server \"{server}\"?"
+
+[config]
+loading = "Loading configuration..."
+error = "Load failed"
+back = "Back"
+group_id = "ID"
+service_url = "Service URL"
+source = "Source"
+topics = "Topics"
+topic = "Topic"
+no_config = "No configuration"
+no_topic = "No topics"

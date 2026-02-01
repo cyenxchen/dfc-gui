@@ -150,6 +150,11 @@ impl ServiceHub {
         self.pulsar_supervisor.state()
     }
 
+    /// Get Redis repository reference
+    pub fn redis(&self) -> &Arc<RedisRepo> {
+        &self.redis
+    }
+
     // ==================== Event Emission (for testing) ====================
 
     /// Emit a service event (mainly for testing)

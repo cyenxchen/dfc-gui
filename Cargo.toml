@@ -53,8 +53,8 @@ base64 = "0.22"
 # Embedded assets
 rust-embed = { version = "8.9", default-features = false }
 
-# Redis client (commented out until needed)
-# fred = "10"
+# Redis client
+fred = "10"
 
 # Pulsar client (commented out until needed)
 # pulsar = "6"

@@ -8,7 +8,7 @@ use crate::constants::SIDEBAR_WIDTH;
 use crate::helpers::{DeviceAction, MenuAction, is_development, new_key_bindings};
 use crate::services::ServiceHub;
 use crate::states::{
-    DfcAppState, DfcGlobalStore, FleetState, FontSize, FontSizeAction, LocaleAction,
+    ConfigState, DfcAppState, DfcGlobalStore, FleetState, FontSize, FontSizeAction, LocaleAction,
     Route, SettingsAction, ThemeAction, UIEvent, update_app_state_and_save,
 };
 use crate::views::{DfcContent, DfcSidebar, DfcTitleBar};
@@ -291,6 +291,7 @@ fn main() {
         // Create state entities
         let app_state_entity = cx.new(|_| app_state);
         let fleet_state_entity = cx.new(|_| FleetState::new());
+        let config_state_entity = cx.new(|_| ConfigState::new());
 
         // Start event ingestion
         let event_rx = services.events();
@@ -302,6 +303,7 @@ fn main() {
         let global_store = DfcGlobalStore::new(
             app_state_entity.clone(),
             fleet_state_entity.clone(),
+            config_state_entity.clone(),
             services.clone(),
         );
 

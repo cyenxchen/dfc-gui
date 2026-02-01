@@ -9,7 +9,7 @@ use crate::helpers::{decrypt, encrypt};
 use crate::error::{Error, Result};
 use crate::helpers::get_or_create_config_dir;
 use crate::services::ServiceHub;
-use crate::states::FleetState;
+use crate::states::{ConfigState, FleetState};
 use chrono::Local;
 use gpui::{Action, App, AppContext, Bounds, Context, Entity, Global, Pixels};
 use gpui_component::ThemeMode;
@@ -353,6 +353,7 @@ impl DfcAppState {
 pub struct DfcGlobalStore {
     app_state: Entity<DfcAppState>,
     fleet_state: Entity<FleetState>,
+    config_state: Entity<ConfigState>,
     services: ServiceHub,
 }
 
@@ -361,11 +362,13 @@ impl DfcGlobalStore {
     pub fn new(
         app_state: Entity<DfcAppState>,
         fleet_state: Entity<FleetState>,
+        config_state: Entity<ConfigState>,
         services: ServiceHub,
     ) -> Self {
         Self {
             app_state,
             fleet_state,
+            config_state,
             services,
         }
     }
@@ -378,6 +381,11 @@ impl DfcGlobalStore {
     /// Get the fleet state entity
     pub fn fleet_state(&self) -> Entity<FleetState> {
         self.fleet_state.clone()
+    }
+
+    /// Get the config state entity
+    pub fn config_state(&self) -> Entity<ConfigState> {
+        self.config_state.clone()
     }
 
     /// Get the service hub

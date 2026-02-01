@@ -7,9 +7,10 @@ use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credential
 use crate::constants::DEFAULT_PULSAR_TOKEN;
 use crate::helpers::DeviceAction;
 use crate::states::{
-    DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
+    ConfigState, DfcAppState, DfcGlobalStore, FleetState, Route, UIEvent, i18n_common, i18n_servers,
     i18n_settings, i18n_sidebar, update_app_state_and_save,
 };
+use crate::views::ConfigView;
 use gpui::{App, Context, Entity, FocusHandle, SharedString, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme, Colorize, Icon, IconName, Sizable, StyledExt, WindowExt,
@@ -47,6 +48,10 @@ pub struct DfcContent {
     fleet_state: Entity<FleetState>,
     /// App state entity
     app_state: Entity<DfcAppState>,
+    /// Config state entity
+    config_state: Entity<ConfigState>,
+    /// Config view component
+    config_view: Entity<ConfigView>,
     /// Keyword search input state
     keyword_state: Entity<InputState>,
     /// Filter keyword for servers
@@ -80,6 +85,12 @@ impl DfcContent {
         let current_route = store.read(cx).route();
         let fleet_state = store.fleet_state();
         let app_state = store.app_state();
+        let config_state = store.config_state();
+
+        // Create ConfigView
+        let config_view = cx.new(|cx| {
+            ConfigView::new(app_state.clone(), config_state.clone(), window, cx)
+        });
 
         // Create and focus the handle for keyboard shortcuts
         let focus_handle = cx.focus_handle();
@@ -94,6 +105,11 @@ impl DfcContent {
                 this.current_route = route;
                 cx.notify();
             }
+        }));
+
+        // Subscribe to config state changes
+        subscriptions.push(cx.observe(&config_state, |_this, _model, cx| {
+            cx.notify();
         }));
 
         // Subscribe to UI events from fleet state
@@ -202,6 +218,8 @@ impl DfcContent {
             current_route,
             fleet_state,
             app_state,
+            config_state,
+            config_view,
             keyword_state,
             filter_keyword: SharedString::default(),
             name_state,
@@ -611,14 +629,68 @@ impl DfcContent {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 tracing::info!("Server card clicked: {}", server_id);
-                this.app_state.update(cx, |state, cx| {
-                    state.select_server(Some(server_id.clone()), cx);
-                });
+
+                // Get server config
+                let server = this.app_state.read(cx).server(&server_id).cloned();
+
+                if let Some(server) = server {
+                    // Set loading state
+                    this.config_state.update(cx, |state, cx| {
+                        state.set_loading(cx);
+                        state.set_connected_server(Some(server_id.clone()), cx);
+                    });
+
+                    // Select server in app state
+                    this.app_state.update(cx, |state, cx| {
+                        state.select_server(Some(server_id.clone()), cx);
+                    });
+
+                    // Start async task to connect and fetch configs
+                    let config_state = this.config_state.clone();
+                    let store = cx.global::<DfcGlobalStore>().clone();
+
+                    cx.spawn(async move |_, cx| {
+                        let redis = store.services().redis();
+                        let cfgid = server.cfgid.as_deref();
+
+                        // Connect to Redis
+                        if let Err(e) = redis.connect_to_server(&server).await {
+                            tracing::error!("Failed to connect to Redis: {}", e);
+                            let _ = config_state.update(cx, |state, cx| {
+                                state.set_error(e.to_string(), cx);
+                            });
+                            return;
+                        }
+
+                        // Fetch configs
+                        match redis.fetch_configs(cfgid).await {
+                            Ok(configs) => {
+                                tracing::info!("Fetched {} configs", configs.len());
+                                let _ = config_state.update(cx, |state, cx| {
+                                    state.set_configs(configs, cx);
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to fetch configs: {}", e);
+                                let _ = config_state.update(cx, |state, cx| {
+                                    state.set_error(e.to_string(), cx);
+                                });
+                            }
+                        }
+                    })
+                    .detach();
+                }
             }))
     }
 
-    /// Render the home view with server cards
+    /// Render the home view with server cards or config view
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Check if a server is selected - if so, show ConfigView
+        if self.app_state.read(cx).selected_server_id().is_some() {
+            return self.config_view.clone().into_any_element();
+        }
+
+        // Otherwise, show server cards grid
         let width = window.viewport_size().width;
 
         // Responsive grid columns
@@ -668,6 +740,7 @@ impl DfcContent {
                     .child(grid),
             )
             .child(self.render_toolbar(cx))
+            .into_any_element()
     }
 
     /// Render the properties view
