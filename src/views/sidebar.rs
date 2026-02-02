@@ -55,6 +55,11 @@ impl DfcSidebar {
             cx.notify();
         }));
 
+        // Subscribe to config state changes (for connected config tab)
+        subscriptions.push(cx.observe(&config_state, |_this, _model, cx| {
+            cx.notify();
+        }));
+
         Self {
             current_route,
             app_state,
@@ -80,7 +85,7 @@ impl DfcSidebar {
         let list_active_border = cx.theme().list_active_border;
         let is_home = route == Route::Home;
         let app_state = self.app_state.clone();
-        let config_state = self.config_state.clone();
+        let keys_state = self.keys_state.clone();
 
         let btn = Button::new(id)
             .ghost()
@@ -97,11 +102,12 @@ impl DfcSidebar {
             .on_click(move |_, _, cx| {
                 if is_home {
                     // Always reset selection to show server list, even if we are already on Home.
-                    config_state.update(cx, |state, cx| {
-                        state.clear(cx);
-                    });
                     app_state.update(cx, |state, cx| {
                         state.select_server(None, cx);
+                    });
+                    // Hide keys browser on Home (keep connected servers)
+                    keys_state.update(cx, |state, cx| {
+                        state.clear_keys(cx);
                     });
                 }
                 cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
@@ -123,20 +129,31 @@ impl DfcSidebar {
     }
 
     fn render_connected_config_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let app_state = self.app_state.read(cx);
-        let server = app_state.selected_server();
+        let connected_server_id = self.config_state.read(cx).connected_server_id();
+        let selected_server_id = self.app_state.read(cx).selected_server_id();
+        let server_id = connected_server_id.or(selected_server_id).map(|id| id.to_string());
 
-        let Some(server) = server else {
+        let Some(server_id) = server_id else {
             return div().into_any_element();
         };
 
-        let server_id = server.id.clone();
-        let server_name = server.name.clone();
+        let server = self.app_state.read(cx).server(&server_id).cloned();
+        let server_name = server
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| server_id.clone());
+
+        let is_active = self
+            .app_state
+            .read(cx)
+            .selected_server_id()
+            .is_some_and(|id| id == server_id);
+
         let tooltip_label = server_name.clone();
         let list_active = cx.theme().list_active;
         let list_active_border = cx.theme().list_active_border;
-        let config_state = self.config_state.clone();
         let app_state = self.app_state.clone();
+        let server_id_for_click = server_id.clone();
 
         let btn = Button::new("connected-config-tab")
             .ghost()
@@ -156,11 +173,8 @@ impl DfcSidebar {
                     ),
             )
             .on_click(move |_, _, cx| {
-                config_state.update(cx, |state, cx| {
-                    state.set_connected_server(Some(server_id.clone()), cx);
-                });
                 app_state.update(cx, |state, cx| {
-                    state.select_server(Some(server_id.clone()), cx);
+                    state.select_server(Some(server_id_for_click.clone()), cx);
                 });
                 cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
                     store.update(cx, |state, cx| {
@@ -172,9 +186,11 @@ impl DfcSidebar {
         div()
             .id("connected-config-tab-wrapper")
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
-            .bg(list_active)
-            .border_r_2()
-            .border_color(list_active_border)
+            .when(is_active, |this| {
+                this.bg(list_active)
+                    .border_r_2()
+                    .border_color(list_active_border)
+            })
             .child(btn)
             .into_any_element()
     }
