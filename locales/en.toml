@@ -177,6 +177,11 @@ no_config = "No configuration"
 no_topic = "No topics"
 topic_agent_id = "Topic Agent ID"
 no_agent_selected = "Select an agent to view topics"
+no_topic_agents = "No TopicAgentId found"
+search_agent_placeholder = "Search TopicAgentId"
+query_mode_all = "All"
+query_mode_prefix = "Prefix"
+query_mode_exact = "Exact"
 
 [keys]
 title = "Keys Browser"

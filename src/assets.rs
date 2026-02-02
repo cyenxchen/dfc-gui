@@ -72,6 +72,10 @@ pub enum CustomIconName {
     FileXCorner,
     /// Database zap icon (for server)
     DatabaseZap,
+    /// Chevron up icon (for query mode)
+    ChevronUp,
+    /// Equal icon (for query mode)
+    Equal,
 }
 
 impl CustomIconName {
@@ -91,6 +95,8 @@ impl CustomIconName {
             CustomIconName::FilePenLine => "icons/file-pen-line.svg",
             CustomIconName::FileXCorner => "icons/file-x-corner.svg",
             CustomIconName::DatabaseZap => "icons/database-zap.svg",
+            CustomIconName::ChevronUp => "icons/chevron-up.svg",
+            CustomIconName::Equal => "icons/equal.svg",
         }
         .into()
     }
