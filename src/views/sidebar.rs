@@ -4,7 +4,7 @@
 
 use crate::assets::CustomIconName;
 use crate::constants::SIDEBAR_WIDTH;
-use crate::states::{DfcGlobalStore, KeysState, Route, i18n_sidebar};
+use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState, Route, i18n_sidebar};
 use gpui::{Context, Entity, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme, Icon, IconName,
@@ -18,6 +18,10 @@ use gpui_component::{
 pub struct DfcSidebar {
     /// Current route for highlighting
     current_route: Route,
+    /// App state entity for server selection
+    app_state: Entity<DfcAppState>,
+    /// Config state entity for clearing selection
+    config_state: Entity<ConfigState>,
     /// Keys state entity for connected servers
     keys_state: Entity<KeysState>,
     /// Subscriptions
@@ -31,6 +35,7 @@ impl DfcSidebar {
 
         let store = cx.global::<DfcGlobalStore>();
         let app_state = store.app_state();
+        let config_state = store.config_state();
         let keys_state = store.keys_state();
         let current_route = store.read(cx).route();
 
@@ -41,6 +46,8 @@ impl DfcSidebar {
                 this.current_route = route;
                 cx.notify();
             }
+            // Also re-render when selected server changes (for connected config tab)
+            cx.notify();
         }));
 
         // Subscribe to keys state changes (for connected servers)
@@ -50,6 +57,8 @@ impl DfcSidebar {
 
         Self {
             current_route,
+            app_state,
+            config_state,
             keys_state,
             _subscriptions: subscriptions,
         }
@@ -69,6 +78,9 @@ impl DfcSidebar {
         let tooltip_label = label.clone();
         let list_active = cx.theme().list_active;
         let list_active_border = cx.theme().list_active_border;
+        let is_home = route == Route::Home;
+        let app_state = self.app_state.clone();
+        let config_state = self.config_state.clone();
 
         let btn = Button::new(id)
             .ghost()
@@ -83,6 +95,15 @@ impl DfcSidebar {
                     .child(Label::new(label).text_xs()),
             )
             .on_click(move |_, _, cx| {
+                if is_home {
+                    // Always reset selection to show server list, even if we are already on Home.
+                    config_state.update(cx, |state, cx| {
+                        state.clear(cx);
+                    });
+                    app_state.update(cx, |state, cx| {
+                        state.select_server(None, cx);
+                    });
+                }
                 cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
                     store.update(cx, |state, cx| {
                         state.go_to(route, cx);
@@ -99,6 +120,63 @@ impl DfcSidebar {
                     .border_color(list_active_border)
             })
             .child(btn)
+    }
+
+    fn render_connected_config_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let app_state = self.app_state.read(cx);
+        let server = app_state.selected_server();
+
+        let Some(server) = server else {
+            return div().into_any_element();
+        };
+
+        let server_id = server.id.clone();
+        let server_name = server.name.clone();
+        let tooltip_label = server_name.clone();
+        let list_active = cx.theme().list_active;
+        let list_active_border = cx.theme().list_active_border;
+        let config_state = self.config_state.clone();
+        let app_state = self.app_state.clone();
+
+        let btn = Button::new("connected-config-tab")
+            .ghost()
+            .w_full()
+            .h(px(56.0))
+            .child(
+                v_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .child(Icon::from(CustomIconName::DatabaseZap))
+                    .child(
+                        Label::new(server_name)
+                            .text_xs()
+                            .text_ellipsis()
+                            .max_w(px(70.0)),
+                    ),
+            )
+            .on_click(move |_, _, cx| {
+                config_state.update(cx, |state, cx| {
+                    state.set_connected_server(Some(server_id.clone()), cx);
+                });
+                app_state.update(cx, |state, cx| {
+                    state.select_server(Some(server_id.clone()), cx);
+                });
+                cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
+                    store.update(cx, |state, cx| {
+                        state.go_to(Route::Home, cx);
+                    });
+                });
+            });
+
+        div()
+            .id("connected-config-tab-wrapper")
+            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .bg(list_active)
+            .border_r_2()
+            .border_color(list_active_border)
+            .child(btn)
+            .into_any_element()
     }
 
     /// Render a connected server item
@@ -254,6 +332,7 @@ impl Render for DfcSidebar {
                     .flex_1()
                     .pt_2()
                     .child(self.render_nav_button("home", Route::Home, IconName::LayoutDashboard, "home", cx))
+                    .child(self.render_connected_config_tab(cx))
                     // Connected servers
                     .child(self.render_connected_servers(cx)),
             )
