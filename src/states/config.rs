@@ -103,7 +103,14 @@ impl ConfigState {
     }
 
     fn rebuild_topic_agents_merged(&mut self) {
-        let mut merged: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        #[derive(Clone, Debug)]
+        struct MergedTopicMeta {
+            index: i32,
+            visibility: bool,
+            topic_type: String,
+        }
+
+        let mut merged: BTreeMap<String, BTreeMap<String, MergedTopicMeta>> = BTreeMap::new();
 
         for config in &self.configs {
             for agent in &config.topic_agents {
@@ -112,13 +119,24 @@ impl ConfigState {
                 for topic in &agent.topics {
                     match topics_by_path.entry(topic.path.clone()) {
                         Entry::Vacant(vacant) => {
-                            vacant.insert(topic.topic_type.clone());
+                            vacant.insert(MergedTopicMeta {
+                                index: topic.index,
+                                visibility: topic.visibility,
+                                topic_type: topic.topic_type.clone(),
+                            });
                         }
                         Entry::Occupied(mut occupied) => {
-                            let existing = occupied.get();
-                            if existing == "unknown" && topic.topic_type != "unknown" {
-                                occupied.insert(topic.topic_type.clone());
+                            let existing = occupied.get_mut();
+
+                            if existing.topic_type == "unknown" && topic.topic_type != "unknown" {
+                                existing.topic_type = topic.topic_type.clone();
                             }
+
+                            if !existing.visibility && topic.visibility {
+                                existing.visibility = true;
+                            }
+
+                            existing.index = existing.index.min(topic.index);
                         }
                     }
                 }
@@ -127,13 +145,24 @@ impl ConfigState {
 
         self.topic_agents_merged = merged
             .into_iter()
-            .map(|(agent_id, topics_by_path)| TopicAgentItem {
-                agent_id,
-                group_id: 0,
-                topics: topics_by_path
+            .map(|(agent_id, topics_by_path)| {
+                let mut topics: Vec<TopicDetail> = topics_by_path
                     .into_iter()
-                    .map(|(path, topic_type)| TopicDetail { path, topic_type })
-                    .collect(),
+                    .map(|(path, meta)| TopicDetail {
+                        index: meta.index,
+                        path,
+                        visibility: meta.visibility,
+                        topic_type: meta.topic_type,
+                    })
+                    .collect();
+
+                topics.sort_by(|a, b| a.index.cmp(&b.index).then_with(|| a.path.cmp(&b.path)));
+
+                TopicAgentItem {
+                    agent_id,
+                    group_id: 0,
+                    topics,
+                }
             })
             .collect();
     }
@@ -148,7 +177,7 @@ impl ConfigState {
         // Initialize selection to first agent/topic when available
         if let Some(first_agent) = self.topic_agents_merged.first() {
             self.selected_agent_id = Some(first_agent.agent_id.clone());
-            self.selected_topic_index = Some(0);
+            self.selected_topic_index = None;
         } else {
             self.selected_agent_id = None;
             self.selected_topic_index = None;
@@ -196,8 +225,8 @@ impl ConfigState {
     /// Select a TopicAgentId
     pub fn select_agent(&mut self, agent_id: Option<String>, cx: &mut Context<Self>) {
         self.selected_agent_id = agent_id;
-        // Reset topic selection when changing agent
-        self.selected_topic_index = if self.selected_agent_id.is_some() { Some(0) } else { None };
+        // No topic selected by default
+        self.selected_topic_index = None;
         cx.notify();
     }
 
@@ -238,14 +267,20 @@ impl Default for ConfigState {
 mod tests {
     use super::*;
 
-    fn make_agent(agent_id: &str, topics: Vec<(&str, &str)>, group_id: i32) -> TopicAgentItem {
+    fn make_agent(
+        agent_id: &str,
+        topics: Vec<(i32, &str, bool, &str)>,
+        group_id: i32,
+    ) -> TopicAgentItem {
         TopicAgentItem {
             agent_id: agent_id.to_string(),
             group_id,
             topics: topics
                 .into_iter()
-                .map(|(path, topic_type)| TopicDetail {
+                .map(|(index, path, visibility, topic_type)| TopicDetail {
+                    index,
                     path: path.to_string(),
+                    visibility,
                     topic_type: topic_type.to_string(),
                 })
                 .collect(),
@@ -269,12 +304,12 @@ mod tests {
         let configs = vec![
             make_config(1, vec![make_agent(
                 "A",
-                vec![("/a/prop/x", "prop"), ("/a/event/y", "event")],
+                vec![(20, "/a/ccc", true, "prop"), (10, "/a/bbb", true, "event")],
                 1,
             )]),
             make_config(2, vec![make_agent(
                 "A",
-                vec![("/a/event/y", "event"), ("/a/cmd/z", "cmd")],
+                vec![(10, "/a/bbb", true, "event"), (30, "/a/aaa", true, "cmd")],
                 2,
             )]),
         ];
@@ -287,7 +322,7 @@ mod tests {
         assert_eq!(agents[0].agent_id, "A");
 
         let paths: Vec<_> = agents[0].topics.iter().map(|t| t.path.as_str()).collect();
-        assert_eq!(paths, vec!["/a/cmd/z", "/a/event/y", "/a/prop/x"]);
+        assert_eq!(paths, vec!["/a/bbb", "/a/ccc", "/a/aaa"]);
     }
 
     #[test]
@@ -295,8 +330,8 @@ mod tests {
         let mut state = ConfigState::new();
 
         let configs = vec![
-            make_config(1, vec![make_agent("A", vec![("/a/x", "unknown")], 1)]),
-            make_config(2, vec![make_agent("A", vec![("/a/x", "event")], 2)]),
+            make_config(1, vec![make_agent("A", vec![(2, "/a/x", false, "unknown")], 1)]),
+            make_config(2, vec![make_agent("A", vec![(1, "/a/x", true, "event")], 2)]),
         ];
 
         state.configs = configs;
@@ -306,6 +341,8 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].topics.len(), 1);
         assert_eq!(agents[0].topics[0].topic_type, "event");
+        assert_eq!(agents[0].topics[0].visibility, true);
+        assert_eq!(agents[0].topics[0].index, 1);
     }
 
     #[test]
@@ -313,8 +350,8 @@ mod tests {
         let mut state = ConfigState::new();
 
         let configs = vec![
-            make_config(1, vec![make_agent("B", vec![("/b/x", "event")], 1)]),
-            make_config(2, vec![make_agent("A", vec![("/a/x", "event")], 2)]),
+            make_config(1, vec![make_agent("B", vec![(0, "/b/x", true, "event")], 1)]),
+            make_config(2, vec![make_agent("A", vec![(0, "/a/x", true, "event")], 2)]),
         ];
 
         state.apply_configs(configs);
@@ -322,7 +359,7 @@ mod tests {
         assert!(matches!(state.load_state(), ConfigLoadState::Loaded));
         // Agents are sorted by agent_id, so "A" should be first and selected.
         assert_eq!(state.selected_agent_id(), Some("A"));
-        assert_eq!(state.selected_topic_index(), Some(0));
+        assert_eq!(state.selected_topic_index(), None);
     }
 
     #[test]

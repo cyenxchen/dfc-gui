@@ -324,6 +324,13 @@ impl RedisRepo {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
+                    let item_index = obj
+                        .get("index")
+                        .or_else(|| obj.get("idx"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32)
+                        .unwrap_or(index);
+
                     let visibility = obj.get("visibility")
                         .or_else(|| obj.get("visible"))
                         .and_then(|v| v.as_bool())
@@ -331,7 +338,7 @@ impl RedisRepo {
 
                     if !path.is_empty() {
                         details.push(DetailItem {
-                            index,
+                            index: item_index,
                             path: path.to_string(),
                             visibility,
                             group_id,
@@ -509,7 +516,9 @@ impl RedisRepo {
                     .iter()
                     .filter(|d| d.path.contains(&agent_id))
                     .map(|d| TopicDetail {
+                        index: d.index,
                         path: d.path.clone(),
+                        visibility: d.visibility,
                         topic_type: self.extract_topic_type(&d.path),
                     })
                     .collect();
@@ -529,7 +538,9 @@ impl RedisRepo {
             let all_topics: Vec<TopicDetail> = details
                 .iter()
                 .map(|d| TopicDetail {
+                    index: d.index,
                     path: d.path.clone(),
+                    visibility: d.visibility,
                     topic_type: self.extract_topic_type(&d.path),
                 })
                 .collect();

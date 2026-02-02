@@ -18,8 +18,12 @@ pub struct TopicAgentItem {
 /// Topic detail for TopicAgentItem
 #[derive(Debug, Clone)]
 pub struct TopicDetail {
+    /// Index within the topic list (as provided by config, if any)
+    pub index: i32,
     /// Topic path
     pub path: String,
+    /// Visibility flag
+    pub visibility: bool,
     /// Topic type (prop, event, cmd, etc.)
     pub topic_type: String,
 }

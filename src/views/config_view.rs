@@ -15,6 +15,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     label::Label,
     scroll::ScrollableElement,
+    tooltip::Tooltip,
     v_flex,
 };
 use rust_i18n::t;
@@ -675,27 +676,22 @@ impl ConfigView {
         let locale = self.locale(cx);
 
         // Collect data first to avoid borrow conflicts
-        let (agent_info, topics_data, selected_topic_index): (
+        let (agent_info, topic_paths, selected_topic_index): (
             Option<(String, usize)>,
-            Vec<(i32, String, String)>,
-            i32,
+            Vec<String>,
+            Option<i32>,
         ) = {
             let config_state = self.config_state.read(cx);
-            let selected_topic_idx = config_state.selected_topic_index().unwrap_or(0);
+            let selected_topic_idx = config_state.selected_topic_index();
             let selected_agent = config_state.selected_agent();
 
             match selected_agent {
                 Some(agent) => {
                     let info = (agent.agent_id.clone(), agent.topics.len());
-                    let topics: Vec<_> = agent
-                        .topics
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, t)| (idx as i32, t.path.clone(), t.topic_type.clone()))
-                        .collect();
+                    let topics: Vec<_> = agent.topics.iter().map(|t| t.path.clone()).collect();
                     (Some(info), topics, selected_topic_idx)
                 }
-                None => (None, Vec::new(), 0),
+                None => (None, Vec::new(), None),
             }
         };
 
@@ -718,46 +714,67 @@ impl ConfigView {
 
         let (agent_id, topic_count) = agent_info.expect("checked above");
 
+        let muted_fg = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let secondary_bg = cx.theme().secondary;
+        let no_topic_selected = t!("config.no_topic_selected", locale = &locale).to_string();
+
+        let selected_topic_index = selected_topic_index.filter(|idx| (*idx as usize) < topic_paths.len());
+
         // Build tab buttons
         let mut tabs = Vec::new();
-        for (idx, path, topic_type) in &topics_data {
-            let is_selected = *idx == selected_topic_index;
-            tabs.push(self.render_agent_topic_tab(*idx, path, topic_type, is_selected, cx));
+        for (pos, path) in topic_paths.iter().enumerate() {
+            let label = format!("topic{}", pos + 1);
+            let is_selected = selected_topic_index == Some(pos as i32);
+            tabs.push(self.render_agent_topic_tab(pos as i32, label, path, is_selected, cx));
         }
-
-        // Get selected topic for content
-        let selected_topic_data = topics_data.get(selected_topic_index as usize).cloned();
-
-        let muted_fg = cx.theme().muted_foreground;
 
         v_flex()
             .flex_1()
             .h_full()
-            .p_4()
-            .gap_2()
-            // Agent info header
             .child(
                 v_flex()
-                    .gap_1()
+                    .flex_1()
+                    .p_4()
+                    .gap_2()
                     .child(
-                        Label::new(format!("Agent: {}", agent_id))
-                            .text_lg(),
+                        h_flex()
+                            .w_full()
+                            .items_start()
+                            .gap_4()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .flex_none()
+                                    .child(Label::new(format!("Agent: {}", agent_id)).text_lg())
+                                    .child(
+                                        Label::new(format!("{} topics", topic_count))
+                                            .text_sm()
+                                            .text_color(muted_fg),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .gap_2()
+                                    .overflow_x_scrollbar()
+                                    .children(tabs),
+                            ),
                     )
-                    .child(
-                        Label::new(format!("{} topics", topic_count))
-                            .text_sm()
-                            .text_color(muted_fg),
-                    ),
+                    // Placeholder content area (intentionally blank for now)
+                    .child(div().flex_1()),
             )
-            // Tab bar
+            // Bottom status bar
             .child(
                 h_flex()
-                    .gap_1()
-                    .overflow_x_scrollbar()
-                    .children(tabs),
+                    .h(px(48.0))
+                    .items_center()
+                    .px_4()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(secondary_bg)
+                    .child(Label::new(no_topic_selected).text_color(muted_fg)),
             )
-            // Tab content
-            .child(self.render_agent_topic_content_from_data(selected_topic_data, cx))
             .into_any_element()
     }
 
@@ -765,72 +782,31 @@ impl ConfigView {
     fn render_agent_topic_tab(
         &self,
         index: i32,
-        path: &str,
-        topic_type: &str,
+        label: String,
+        topic_path: &str,
         is_selected: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let tab_bg = if is_selected {
-            cx.theme().accent
-        } else {
-            cx.theme().secondary
-        };
-
-        let text_color = if is_selected {
-            cx.theme().accent_foreground
-        } else {
-            cx.theme().muted_foreground
-        };
-
-        // Extract short name from path
-        let short_name = path
-            .rsplit('/')
-            .next()
-            .unwrap_or(path)
-            .chars()
-            .take(15)
-            .collect::<String>();
-
-        // Add topic type badge
-        let type_color = match topic_type {
-            "prop" => cx.theme().success,
-            "event" => cx.theme().warning,
-            "cmd" => cx.theme().info,
-            "alarm" => cx.theme().danger,
-            _ => cx.theme().muted_foreground,
-        };
+        let tab_bg = if is_selected { cx.theme().secondary } else { cx.theme().background };
+        let border_color = if is_selected { cx.theme().accent } else { cx.theme().border };
+        let text_color = if is_selected { cx.theme().foreground } else { cx.theme().muted_foreground };
+        let tooltip_label = topic_path.to_string();
 
         div()
             .id(("agent-topic-tab", index as usize))
-            .px_3()
-            .py_1()
+            .px_4()
+            .py_2()
             .bg(tab_bg)
             .cursor_pointer()
-            .rounded_t_md()
+            .rounded_md()
             .border_1()
-            .border_color(cx.theme().border)
-            .when(!is_selected, |this| this.border_b_0())
+            .border_color(border_color)
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Label::new(short_name)
-                            .text_sm()
-                            .text_color(text_color),
-                    )
-                    .child(
-                        div()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(type_color.opacity(0.2))
-                            .child(
-                                Label::new(topic_type.to_string())
-                                    .text_xs()
-                                    .text_color(type_color),
-                            ),
-                    ),
+                Label::new(label)
+                    .text_sm()
+                    .text_color(text_color),
             )
+            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.config_state.update(cx, |state, cx| {
                     state.select_topic(Some(index), cx);
