@@ -152,6 +152,7 @@ impl DfcSidebar {
         let tooltip_label = server_name.clone();
         let list_active = cx.theme().list_active;
         let list_active_border = cx.theme().list_active_border;
+        let config_state = self.config_state.clone();
         let app_state = self.app_state.clone();
         let server_id_for_click = server_id.clone();
 
@@ -173,6 +174,9 @@ impl DfcSidebar {
                     ),
             )
             .on_click(move |_, _, cx| {
+                config_state.update(cx, |state, cx| {
+                    state.set_connected_server(Some(server_id_for_click.clone()), cx);
+                });
                 app_state.update(cx, |state, cx| {
                     state.select_server(Some(server_id_for_click.clone()), cx);
                 });
