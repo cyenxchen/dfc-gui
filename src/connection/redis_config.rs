@@ -4,6 +4,26 @@
 
 use std::sync::Arc;
 
+/// TopicAgentId item with associated topics
+#[derive(Debug, Clone)]
+pub struct TopicAgentItem {
+    /// The TopicAgentId value
+    pub agent_id: String,
+    /// Associated topics
+    pub topics: Vec<TopicDetail>,
+    /// Parent config group ID
+    pub group_id: i32,
+}
+
+/// Topic detail for TopicAgentItem
+#[derive(Debug, Clone)]
+pub struct TopicDetail {
+    /// Topic path
+    pub path: String,
+    /// Topic type (prop, event, cmd, etc.)
+    pub topic_type: String,
+}
+
 /// Configuration item loaded from Redis
 #[derive(Debug, Clone)]
 pub struct ConfigItem {
@@ -15,6 +35,8 @@ pub struct ConfigItem {
     pub source: String,
     /// Topic details list
     pub details: Vec<DetailItem>,
+    /// TopicAgentId items with their topics
+    pub topic_agents: Vec<TopicAgentItem>,
 }
 
 /// Topic detail item

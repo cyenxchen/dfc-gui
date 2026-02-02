@@ -5,7 +5,7 @@
 
 use crate::connection::{
     ConfigItem, DetailItem, DfcServerConfig, RedisKeyItem, RedisKeyType, RedisKeyValue,
-    REDIS_KEY_PATTERNS,
+    TopicAgentItem, TopicDetail, REDIS_KEY_PATTERNS,
 };
 use crate::error::{Error, Result};
 use crate::services::events::{DeviceId, DeviceMeta};
@@ -258,11 +258,22 @@ impl RedisRepo {
                     // Extract service URL from the key or value
                     let service_url = self.extract_service_url(&key, &val);
 
+                    // Extract cfgid from the key (e.g., CMC_{DCC0001}_sg.og.output.iothub -> DCC0001)
+                    let cfgid = self.extract_cfgid_from_key(&key);
+
+                    // Fetch TopicAgentIds for this config
+                    let topic_agents = if let Some(ref cfg) = cfgid {
+                        self.fetch_topic_agent_ids_internal(client, cfg, group_id, &details).await
+                    } else {
+                        Vec::new()
+                    };
+
                     configs.push(ConfigItem {
                         group_id,
                         service_url,
                         source: key,
                         details,
+                        topic_agents,
                     });
 
                     group_id += 1;
@@ -374,6 +385,182 @@ impl RedisRepo {
 
         // Default: construct from key pattern
         format!("pulsar://{}", key.replace('_', "/"))
+    }
+
+    /// Extract cfgid from Redis key
+    /// e.g., CMC_{DCC0001}_sg.og.output.iothub -> DCC0001
+    fn extract_cfgid_from_key(&self, key: &str) -> Option<String> {
+        // Pattern: CMC_{cfgid}_sg.*
+        if key.starts_with("CMC_") {
+            // Find the content between { and }
+            if let Some(start) = key.find('{') {
+                if let Some(end) = key.find('}') {
+                    if start < end {
+                        return Some(key[start + 1..end].to_string());
+                    }
+                }
+            }
+            // Fallback: extract between CMC_ and _sg
+            if let Some(sg_pos) = key.find("_sg") {
+                let cfgid = &key[4..sg_pos]; // Skip "CMC_"
+                // Remove braces if present
+                let cfgid = cfgid.trim_start_matches('{').trim_end_matches('}');
+                if !cfgid.is_empty() {
+                    return Some(cfgid.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Fetch TopicAgentIds from CMC_{cfgid}_sg.device key
+    async fn fetch_topic_agent_ids_internal(
+        &self,
+        client: &FredClient,
+        cfgid: &str,
+        group_id: i32,
+        details: &[DetailItem],
+    ) -> Vec<TopicAgentItem> {
+        // Build the device key: CMC_{cfgid}_sg.device
+        let device_key = format!("CMC_{{{}}}_sg.device", cfgid);
+        tracing::debug!("Fetching TopicAgentIds from key: {}", device_key);
+
+        // First check the key type
+        let type_cmd = CustomCommand::new_static("TYPE", None, false);
+        let type_result: Value = client
+            .custom(type_cmd, vec![Value::from(device_key.clone())])
+            .await
+            .unwrap_or(Value::Null);
+        let key_type = type_result.into_string().unwrap_or_default();
+
+        let value: Option<String> = match key_type.as_str() {
+            "string" => {
+                let cmd = CustomCommand::new_static("GET", None, false);
+                let result: Value = client
+                    .custom(cmd, vec![Value::from(device_key.clone())])
+                    .await
+                    .unwrap_or(Value::Null);
+                result.into_string()
+            }
+            "list" => {
+                // Handle list type
+                let cmd = CustomCommand::new_static("LRANGE", None, false);
+                let result: Value = client
+                    .custom(cmd, vec![
+                        Value::from(device_key.clone()),
+                        Value::from("0"),
+                        Value::from("-1"),
+                    ])
+                    .await
+                    .unwrap_or(Value::Null);
+                if let Value::Array(arr) = result {
+                    let items: Vec<serde_json::Value> = arr
+                        .into_iter()
+                        .filter_map(|v| v.into_string())
+                        .filter_map(|s| serde_json::from_str(&s).ok())
+                        .collect();
+                    Some(serde_json::to_string(&items).unwrap_or_default())
+                } else {
+                    None
+                }
+            }
+            _ => {
+                tracing::debug!("Device key {} has unsupported type: {}", device_key, key_type);
+                None
+            }
+        };
+
+        // Parse the JSON array to extract topicAgentIds
+        let Some(value) = value else {
+            tracing::debug!("No value found for device key: {}", device_key);
+            return Vec::new();
+        };
+
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&value) else {
+            tracing::debug!("Failed to parse device JSON: {}", value);
+            return Vec::new();
+        };
+
+        let Some(devices_arr) = json.as_array() else {
+            tracing::debug!("Device value is not an array");
+            return Vec::new();
+        };
+
+        // Collect unique TopicAgentIds
+        let mut agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for device in devices_arr {
+            if let Some(agent_id) = device.get("topicAgentId").and_then(|v| v.as_str()) {
+                if !agent_id.is_empty() {
+                    agent_ids.insert(agent_id.to_string());
+                }
+            }
+        }
+
+        tracing::debug!("Found {} unique TopicAgentIds", agent_ids.len());
+
+        // Create TopicAgentItem for each unique agent_id
+        // Associate topics based on the agent_id pattern in the topic path
+        let mut topic_agents: Vec<TopicAgentItem> = agent_ids
+            .into_iter()
+            .map(|agent_id| {
+                // Filter topics that contain this agent_id in their path
+                let topics: Vec<TopicDetail> = details
+                    .iter()
+                    .filter(|d| d.path.contains(&agent_id))
+                    .map(|d| TopicDetail {
+                        path: d.path.clone(),
+                        topic_type: self.extract_topic_type(&d.path),
+                    })
+                    .collect();
+
+                TopicAgentItem {
+                    agent_id,
+                    topics,
+                    group_id,
+                }
+            })
+            .collect();
+
+        // If no topics matched by agent_id, create one TopicAgentItem with all topics
+        // This handles the case where topics don't contain agent_id in their path
+        if topic_agents.iter().all(|ta| ta.topics.is_empty()) && !topic_agents.is_empty() {
+            // Assign all topics to the first agent
+            let all_topics: Vec<TopicDetail> = details
+                .iter()
+                .map(|d| TopicDetail {
+                    path: d.path.clone(),
+                    topic_type: self.extract_topic_type(&d.path),
+                })
+                .collect();
+
+            if let Some(first) = topic_agents.first_mut() {
+                first.topics = all_topics;
+            }
+        }
+
+        // Sort by agent_id for consistent ordering
+        topic_agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+
+        topic_agents
+    }
+
+    /// Extract topic type from path
+    fn extract_topic_type(&self, path: &str) -> String {
+        // Common topic type patterns
+        if path.contains("/prop/") || path.contains("/properties/") {
+            "prop".to_string()
+        } else if path.contains("/event/") || path.contains("/events/") {
+            "event".to_string()
+        } else if path.contains("/cmd/") || path.contains("/command/") || path.contains("/commands/") {
+            "cmd".to_string()
+        } else if path.contains("/telemetry/") || path.contains("/tele/") {
+            "telemetry".to_string()
+        } else if path.contains("/alarm/") || path.contains("/alarms/") {
+            "alarm".to_string()
+        } else {
+            "unknown".to_string()
+        }
     }
 
     /// Fetch all device metadata from Redis

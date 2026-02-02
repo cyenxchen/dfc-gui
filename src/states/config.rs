@@ -2,7 +2,7 @@
 //!
 //! Manages the state of Redis configuration items and their loading status.
 
-use crate::connection::{ConfigItem, ConfigLoadState, DetailItem};
+use crate::connection::{ConfigItem, ConfigLoadState, DetailItem, TopicAgentItem};
 use gpui::Context;
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ pub struct ConfigState {
     selected_topic_index: Option<i32>,
     /// ID of the connected server
     connected_server_id: Option<String>,
+    /// Currently selected TopicAgentId
+    selected_agent_id: Option<String>,
 }
 
 impl ConfigState {
@@ -29,6 +31,7 @@ impl ConfigState {
             selected_config_id: None,
             selected_topic_index: None,
             connected_server_id: None,
+            selected_agent_id: None,
         }
     }
 
@@ -78,6 +81,27 @@ impl ConfigState {
         })
     }
 
+    /// Get the selected agent ID
+    pub fn selected_agent_id(&self) -> Option<&str> {
+        self.selected_agent_id.as_deref()
+    }
+
+    /// Get all TopicAgentItems from the selected config
+    pub fn topic_agents(&self) -> Vec<&TopicAgentItem> {
+        self.selected_config()
+            .map(|c| c.topic_agents.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get the currently selected TopicAgentItem
+    pub fn selected_agent(&self) -> Option<&TopicAgentItem> {
+        self.selected_config().and_then(|config| {
+            self.selected_agent_id.as_ref().and_then(|aid| {
+                config.topic_agents.iter().find(|ta| &ta.agent_id == aid)
+            })
+        })
+    }
+
     // ==================== Setters ====================
 
     /// Set configuration items
@@ -117,6 +141,14 @@ impl ConfigState {
         cx.notify();
     }
 
+    /// Select a TopicAgentId
+    pub fn select_agent(&mut self, agent_id: Option<String>, cx: &mut Context<Self>) {
+        self.selected_agent_id = agent_id;
+        // Reset topic selection when changing agent
+        self.selected_topic_index = Some(0);
+        cx.notify();
+    }
+
     /// Set the connected server ID
     pub fn set_connected_server(&mut self, server_id: Option<String>, cx: &mut Context<Self>) {
         self.connected_server_id = server_id;
@@ -130,6 +162,7 @@ impl ConfigState {
         self.selected_config_id = None;
         self.selected_topic_index = None;
         self.connected_server_id = None;
+        self.selected_agent_id = None;
         cx.notify();
     }
 
@@ -137,6 +170,7 @@ impl ConfigState {
     pub fn back_to_list(&mut self, cx: &mut Context<Self>) {
         self.selected_config_id = None;
         self.selected_topic_index = None;
+        self.selected_agent_id = None;
         cx.notify();
     }
 }

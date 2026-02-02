@@ -175,6 +175,8 @@ topics = "Topics"
 topic = "Topic"
 no_config = "暂无配置"
 no_topic = "暂无 Topic"
+topic_agent_id = "Topic Agent ID"
+no_agent_selected = "选择一个 Agent 查看其 Topics"
 
 [keys]
 title = "Keys 浏览器"

@@ -1,6 +1,8 @@
 //! Configuration View
 //!
-//! Displays Redis configuration list and Topic tabs.
+//! Displays Redis configuration with left-right split layout:
+//! - Left panel: TopicAgentId list
+//! - Right panel: Topic tabs for selected TopicAgentId
 
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
@@ -15,6 +17,9 @@ use gpui_component::{
     v_flex,
 };
 use rust_i18n::t;
+
+/// Width of the left agent list panel
+const AGENT_LIST_WIDTH: f32 = 200.0;
 
 
 /// Configuration view component
@@ -474,6 +479,346 @@ impl ConfigView {
             .child(content)
     }
 
+    /// Render a single agent item in the left list
+    fn render_agent_item(
+        &self,
+        index: usize,
+        agent_id: String,
+        topic_count: usize,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let bg = if is_selected {
+            cx.theme().accent
+        } else {
+            cx.theme().background
+        };
+
+        let text_color = if is_selected {
+            cx.theme().accent_foreground
+        } else {
+            cx.theme().foreground
+        };
+
+        let hover_color = cx.theme().accent.opacity(0.5);
+        let muted_color = cx.theme().muted_foreground;
+        let border_color = cx.theme().border;
+        let agent_id_for_click = agent_id.clone();
+
+        div()
+            .id(("agent-item", index))
+            .w_full()
+            .px_3()
+            .py_2()
+            .bg(bg)
+            .cursor_pointer()
+            .border_b_1()
+            .border_color(border_color)
+            .hover(|this| this.bg(hover_color))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(agent_id.clone())
+                            .text_sm()
+                            .text_color(text_color),
+                    )
+                    .child(
+                        Label::new(format!("{} topics", topic_count))
+                            .text_xs()
+                            .text_color(if is_selected {
+                                text_color.opacity(0.7)
+                            } else {
+                                muted_color
+                            }),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.config_state.update(cx, |state, cx| {
+                    state.select_agent(Some(agent_id_for_click.clone()), cx);
+                });
+            }))
+    }
+
+    /// Render the left panel with TopicAgentId list
+    fn render_agent_list(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locale = self.locale(cx);
+        let title = t!("config.topic_agent_id", locale = &locale).to_string();
+
+        // Collect agent data first to avoid borrow conflicts
+        let agents_data: Vec<(usize, String, usize, bool)> = {
+            let config_state = self.config_state.read(cx);
+            let topic_agents = config_state.topic_agents();
+            let selected_agent_id = config_state.selected_agent_id();
+
+            topic_agents
+                .iter()
+                .enumerate()
+                .map(|(idx, agent)| {
+                    let is_selected = selected_agent_id == Some(&agent.agent_id);
+                    (idx, agent.agent_id.clone(), agent.topics.len(), is_selected)
+                })
+                .collect()
+        };
+
+        let mut agent_items: Vec<gpui::Stateful<gpui::Div>> = Vec::new();
+        for (index, agent_id, topic_count, is_selected) in agents_data {
+            agent_items.push(self.render_agent_item(index, agent_id, topic_count, is_selected, cx));
+        }
+
+        let border_color = cx.theme().border;
+        let secondary_bg = cx.theme().secondary;
+        let muted_fg = cx.theme().muted_foreground;
+
+        v_flex()
+            .w(px(AGENT_LIST_WIDTH))
+            .h_full()
+            .border_r_1()
+            .border_color(border_color)
+            .bg(secondary_bg)
+            // Header
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border_color)
+                    .child(
+                        Label::new(title)
+                            .text_sm()
+                            .text_color(muted_fg),
+                    ),
+            )
+            // Agent list
+            .child(
+                div()
+                    .id("agent-list-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children(agent_items),
+            )
+    }
+
+    /// Render the right panel with topic tabs for selected agent
+    fn render_agent_topics(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let locale = self.locale(cx);
+
+        // Collect data first to avoid borrow conflicts
+        let (agent_info, topics_data, selected_topic_index): (
+            Option<(String, usize)>,
+            Vec<(i32, String, String)>,
+            i32,
+        ) = {
+            let config_state = self.config_state.read(cx);
+            let selected_topic_idx = config_state.selected_topic_index().unwrap_or(0);
+            let selected_agent = config_state.selected_agent();
+
+            match selected_agent {
+                Some(agent) => {
+                    let info = (agent.agent_id.clone(), agent.topics.len());
+                    let topics: Vec<_> = agent
+                        .topics
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, t)| (idx as i32, t.path.clone(), t.topic_type.clone()))
+                        .collect();
+                    (Some(info), topics, selected_topic_idx)
+                }
+                None => (None, Vec::new(), 0),
+            }
+        };
+
+        // No agent selected - show placeholder
+        if agent_info.is_none() {
+            let no_agent_text = t!("config.no_agent_selected", locale = &locale).to_string();
+            let muted_fg = cx.theme().muted_foreground;
+            return div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new(no_agent_text)
+                        .text_color(muted_fg),
+                )
+                .into_any_element();
+        }
+
+        let (agent_id, topic_count) = agent_info.expect("checked above");
+
+        // Build tab buttons
+        let mut tabs = Vec::new();
+        for (idx, path, topic_type) in &topics_data {
+            let is_selected = *idx == selected_topic_index;
+            tabs.push(self.render_agent_topic_tab(*idx, path, topic_type, is_selected, cx));
+        }
+
+        // Get selected topic for content
+        let selected_topic_data = topics_data.get(selected_topic_index as usize).cloned();
+
+        let muted_fg = cx.theme().muted_foreground;
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .p_4()
+            .gap_2()
+            // Agent info header
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(format!("Agent: {}", agent_id))
+                            .text_lg(),
+                    )
+                    .child(
+                        Label::new(format!("{} topics", topic_count))
+                            .text_sm()
+                            .text_color(muted_fg),
+                    ),
+            )
+            // Tab bar
+            .child(
+                h_flex()
+                    .gap_1()
+                    .overflow_x_scrollbar()
+                    .children(tabs),
+            )
+            // Tab content
+            .child(self.render_agent_topic_content_from_data(selected_topic_data, cx))
+            .into_any_element()
+    }
+
+    /// Render a topic tab for the selected agent
+    fn render_agent_topic_tab(
+        &self,
+        index: i32,
+        path: &str,
+        topic_type: &str,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let tab_bg = if is_selected {
+            cx.theme().accent
+        } else {
+            cx.theme().secondary
+        };
+
+        let text_color = if is_selected {
+            cx.theme().accent_foreground
+        } else {
+            cx.theme().muted_foreground
+        };
+
+        // Extract short name from path
+        let short_name = path
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .chars()
+            .take(15)
+            .collect::<String>();
+
+        // Add topic type badge
+        let type_color = match topic_type {
+            "prop" => cx.theme().success,
+            "event" => cx.theme().warning,
+            "cmd" => cx.theme().info,
+            "alarm" => cx.theme().danger,
+            _ => cx.theme().muted_foreground,
+        };
+
+        div()
+            .id(("agent-topic-tab", index as usize))
+            .px_3()
+            .py_1()
+            .bg(tab_bg)
+            .cursor_pointer()
+            .rounded_t_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .when(!is_selected, |this| this.border_b_0())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(short_name)
+                            .text_sm()
+                            .text_color(text_color),
+                    )
+                    .child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(type_color.opacity(0.2))
+                            .child(
+                                Label::new(topic_type.to_string())
+                                    .text_xs()
+                                    .text_color(type_color),
+                            ),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.config_state.update(cx, |state, cx| {
+                    state.select_topic(Some(index), cx);
+                });
+            }))
+    }
+
+    /// Render content for selected agent's topic using pre-collected data
+    fn render_agent_topic_content_from_data(
+        &self,
+        topic_data: Option<(i32, String, String)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let bg = cx.theme().background;
+        let border = cx.theme().border;
+
+        let content = if let Some((_idx, path, topic_type)) = topic_data {
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Label::new("Path:").text_sm().text_color(muted_fg))
+                        .child(Label::new(path).text_sm()),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Label::new("Type:").text_sm().text_color(muted_fg))
+                        .child(Label::new(topic_type).text_sm()),
+                )
+        } else {
+            v_flex().child(
+                Label::new("No topic selected")
+                    .text_color(muted_fg),
+            )
+        };
+
+        div()
+            .p_4()
+            .flex_1()
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .rounded_b_md()
+            .rounded_tr_md()
+            .child(content)
+    }
+
+    /// Render the split panel layout (left: agent list, right: topic tabs)
+    fn render_split_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .size_full()
+            .child(self.render_agent_list(window, cx))
+            .child(self.render_agent_topics(window, cx))
+    }
+
     /// Render topic tabs view
     fn render_topic_tabs(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config_state = self.config_state.read(cx);
@@ -530,14 +875,23 @@ impl ConfigView {
         // Clone the state values first to avoid borrow issues
         let load_state = self.config_state.read(cx).load_state().clone();
         let selected_config_id = self.config_state.read(cx).selected_config_id();
+        let has_topic_agents = self.config_state.read(cx)
+            .selected_config()
+            .map(|c| !c.topic_agents.is_empty())
+            .unwrap_or(false);
 
         match load_state {
             ConfigLoadState::Loading => self.render_loading(cx).into_any_element(),
             ConfigLoadState::Error(msg) => self.render_error(&msg, cx).into_any_element(),
             ConfigLoadState::Loaded | ConfigLoadState::Idle => {
                 if selected_config_id.is_some() {
-                    // Show topic tabs
-                    self.render_topic_tabs(window, cx).into_any_element()
+                    if has_topic_agents {
+                        // Show split panel with agent list and topic tabs
+                        self.render_split_panel(window, cx).into_any_element()
+                    } else {
+                        // Fallback to original topic tabs if no topic agents
+                        self.render_topic_tabs(window, cx).into_any_element()
+                    }
                 } else {
                     // Show config table
                     self.render_config_table(window, cx).into_any_element()

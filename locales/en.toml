@@ -175,6 +175,8 @@ topics = "Topics"
 topic = "Topic"
 no_config = "No configuration"
 no_topic = "No topics"
+topic_agent_id = "Topic Agent ID"
+no_agent_selected = "Select an agent to view topics"
 
 [keys]
 title = "Keys Browser"
