@@ -25,7 +25,7 @@ use serde::Deserialize;
 /// Width of the left agent list panel
 const AGENT_LIST_WIDTH: f32 = 320.0;
 /// Height of the top bar for left/right panels (keeps alignment)
-const PANEL_TOPBAR_HEIGHT: f32 = 56.0;
+const PANEL_TOPBAR_HEIGHT: f32 = 48.0;
 
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 enum AgentQueryMode {
