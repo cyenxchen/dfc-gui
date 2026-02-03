@@ -751,6 +751,7 @@ impl ConfigView {
                         h_flex()
                             .flex_1()
                             .gap_2()
+                            .flex_nowrap()
                             .overflow_x_scrollbar()
                             .children(tabs),
                     ),
