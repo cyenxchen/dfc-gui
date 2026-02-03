@@ -227,6 +227,15 @@ impl ConfigState {
         self.selected_agent_id = agent_id;
         // No topic selected by default
         self.selected_topic_index = None;
+        if let Some(agent) = self.selected_agent() {
+            tracing::info!(
+                agent_id = %agent.agent_id,
+                topics = agent.topics.len(),
+                "Selected TopicAgentId"
+            );
+        } else {
+            tracing::info!(agent_id = ?self.selected_agent_id.as_deref(), "Selected TopicAgentId (not found)");
+        }
         cx.notify();
     }
 

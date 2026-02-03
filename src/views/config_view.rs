@@ -7,14 +7,13 @@
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
 use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState};
-use gpui::{Action, App, Context, Corner, Entity, Subscription, Window, div, prelude::*, px};
+use gpui::{Action, App, Context, Corner, Entity, StatefulInteractiveElement as _, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme, Colorize, Icon, IconName, Sizable,
     button::{Button, ButtonVariants, DropdownButton},
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
-    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
@@ -749,10 +748,11 @@ impl ConfigView {
                     .border_color(border)
                     .child(
                         h_flex()
+                            .id("agent-tabs-scroll")
                             .flex_1()
                             .gap_2()
                             .flex_nowrap()
-                            .overflow_x_scrollbar()
+                            .overflow_x_scroll()
                             .children(tabs),
                     ),
             )
@@ -915,8 +915,10 @@ impl ConfigView {
             // Tab bar
             .child(
                 h_flex()
+                    .id("config-tabs-scroll")
                     .gap_1()
-                    .overflow_x_scrollbar()
+                    .flex_nowrap()
+                    .overflow_x_scroll()
                     .children(tabs),
             )
             // Tab content
