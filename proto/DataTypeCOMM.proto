@@ -1,0 +1,43 @@
+/**
+ * 通信协议2.0（最小子集），用于解码 iothub prop_data topic 中的 DataFrame。
+ *
+ * Source of truth/reference: DFC project `DataTypeCOMM.proto` (protobuf v3).
+ */
+syntax = "proto3";
+
+import "DataType.proto";
+
+/* 传输和某一信息模型相关的报文头 */
+message DataHeader {
+  string imGlobalUUID = 1;
+  string seriesType = 2;
+  int32 windowSize = 3;
+  string sourceDevice = 4;
+  ClockTime t = 5;
+  uint32 nanoSecond = 6;
+  map<string, AnyValue> extendsData = 10;
+}
+
+/* 一个属性点的数据 */
+message DataRecord {
+  oneof k {
+    uint32 im2id = 1;
+    IMRRef imr = 2;
+  }
+  AnyValue v = 3;
+  uint32 q = 4;
+  string bcrUUID = 5;
+  ClockTime deviceTime = 6;
+}
+
+/* 同一个时间点上的一条记录（一行，一个断面） */
+message DataRecordSet {
+  DataHeader header = 1;
+  repeated DataRecord data = 2;
+}
+
+/* 一段时间内的数据（一个矩阵） */
+message DataFrame {
+  repeated DataRecordSet frame = 1;
+}
+

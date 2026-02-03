@@ -57,11 +57,16 @@ rust-embed = { version = "8.9", default-features = false }
 # Redis client
 fred = "10"
 
-# Pulsar client (commented out until needed)
-# pulsar = "6"
+# Pulsar client
+pulsar = "6"
+
+# Protobuf (for decoding iothub payloads)
+prost = "0.13"
+prost-types = "0.13"
 
 [build-dependencies]
 winres = "0.1"
+prost-build = "0.13"
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -6,10 +6,14 @@
 
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
-use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState};
-use gpui::{Action, App, Context, Corner, Entity, StatefulInteractiveElement as _, Subscription, Window, div, prelude::*, px};
+use crate::services::spawn_named_in_tokio;
+use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState, PropRow, PropTableLoadState, PropTableState};
+use chrono::Local;
+use crossbeam_channel::{Receiver, Sender};
+use futures::StreamExt;
+use gpui::{Action, App, Context, Corner, Entity, StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme, Colorize, Icon, IconName, Sizable,
+    ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants, DropdownButton},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -17,14 +21,25 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use prost::Message as _;
 use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
 
 /// Width of the left agent list panel
 const AGENT_LIST_WIDTH: f32 = 320.0;
 /// Height of the top bar for left/right panels (keeps alignment)
 const PANEL_TOPBAR_HEIGHT: f32 = 48.0;
+
+#[derive(Debug)]
+enum PropStreamEvent {
+    Rows(Vec<PropRow>),
+    Error(String),
+}
 
 fn topic_display_name(topic_path: &str) -> String {
     if topic_path.contains("thing_service-BZ-RESPONSE") && topic_path.contains("thing_service-BZ-REQUEST") {
@@ -64,6 +79,34 @@ enum AgentQueryMode {
     Exact,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+enum PropPageSize {
+    S10,
+    S20,
+    S50,
+    S100,
+}
+
+impl PropPageSize {
+    fn value(self) -> usize {
+        match self {
+            Self::S10 => 10,
+            Self::S20 => 20,
+            Self::S50 => 50,
+            Self::S100 => 100,
+        }
+    }
+
+    fn from_value(value: usize) -> Self {
+        match value {
+            10 => Self::S10,
+            50 => Self::S50,
+            100 => Self::S100,
+            _ => Self::S20,
+        }
+    }
+}
+
 impl Default for AgentQueryMode {
     fn default() -> Self {
         Self::All
@@ -81,6 +124,16 @@ pub struct ConfigView {
     /// Search input state for filtering TopicAgentIds
     agent_search_state: Entity<InputState>,
     agent_query_mode: AgentQueryMode,
+    /// Prop topic table state (for `prop_data` topics)
+    prop_table_state: Entity<PropTableState>,
+    /// Active prop topic path (to avoid restarting streams on every notify)
+    active_prop_topic: Option<String>,
+    /// Stop signal for the active prop topic stream (tokio)
+    prop_stream_stop: Option<watch::Sender<bool>>,
+    /// UI-side ingest task draining prop rows from channel
+    prop_ingest_task: Option<Task<()>>,
+    /// Monotonic row id generator
+    prop_row_uid: Arc<AtomicU64>,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
 }
@@ -105,6 +158,14 @@ impl ConfigView {
                 .placeholder(placeholder)
         });
 
+        // Prop topic table state
+        let prop_table_state = cx.new(|_| PropTableState::new());
+        let prop_row_uid = Arc::new(AtomicU64::new(1));
+
+        subscriptions.push(cx.observe(&prop_table_state, |_this, _model, cx| {
+            cx.notify();
+        }));
+
         // Subscribe to config state changes
         subscriptions.push(cx.observe(&config_state, |this, _model, cx| {
             let query = this.agent_search_state.read(cx).value().trim().to_string();
@@ -122,6 +183,7 @@ impl ConfigView {
                     }
                 }
             }
+            this.sync_prop_stream_with_selection(cx);
             cx.notify();
         }));
 
@@ -155,6 +217,11 @@ impl ConfigView {
             keys_state,
             agent_search_state,
             agent_query_mode: AgentQueryMode::default(),
+            prop_table_state,
+            active_prop_topic: None,
+            prop_stream_stop: None,
+            prop_ingest_task: None,
+            prop_row_uid,
             _subscriptions: subscriptions,
         }
     }
@@ -190,6 +257,140 @@ impl ConfigView {
                 });
             }
         }
+    }
+
+    fn stop_prop_stream(&mut self) {
+        if let Some(stop) = self.prop_stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = self.prop_ingest_task.take() {
+            drop(task);
+        }
+        self.active_prop_topic = None;
+    }
+
+    fn is_prop_topic_path(topic_path: &str) -> bool {
+        topic_path.contains("prop_data-BZ-")
+    }
+
+    fn sync_prop_stream_with_selection(&mut self, cx: &mut Context<Self>) {
+        let selected_topic_path: Option<String> = {
+            let state = self.config_state.read(cx);
+            match (state.selected_agent(), state.selected_topic_index()) {
+                (Some(agent), Some(idx)) => agent.topics.get(idx as usize).map(|t| t.path.clone()),
+                _ => None,
+            }
+        };
+
+        let selected_prop_topic = selected_topic_path
+            .as_deref()
+            .filter(|path| Self::is_prop_topic_path(path))
+            .map(|s| s.to_string());
+
+        if self.active_prop_topic == selected_prop_topic {
+            return;
+        }
+
+        // Stop any existing stream and reset state if needed.
+        self.stop_prop_stream();
+
+        let Some(topic_path) = selected_prop_topic else {
+            let _ = self.prop_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(None);
+                cx.notify();
+            });
+            return;
+        };
+
+        // Locate the Pulsar service URL + cfgid for this topic.
+        let (service_url, cfgid) = {
+            let config_state = self.config_state.read(cx);
+            match find_topic_origin(config_state.configs(), &topic_path) {
+                Some(v) => v,
+                None => {
+                    let _ = self.prop_table_state.update(cx, |state, cx| {
+                        state.reset_for_topic(Some(topic_path.clone()));
+                        state.set_error("无法定位该 Topic 对应的 service_url/cfgid");
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        };
+
+        let token = cx
+            .global::<DfcGlobalStore>()
+            .read(cx)
+            .selected_server()
+            .and_then(|s| s.pulsar_token.clone())
+            .filter(|t| !t.trim().is_empty());
+
+        self.active_prop_topic = Some(topic_path.clone());
+
+        let _ = self.prop_table_state.update(cx, |state, cx| {
+            state.reset_for_topic(Some(topic_path.clone()));
+            cx.notify();
+        });
+
+        self.start_prop_stream(service_url, cfgid, topic_path, token, cx);
+    }
+
+    fn start_prop_stream(
+        &mut self,
+        service_url: String,
+        cfgid: String,
+        topic_path: String,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, rx): (Sender<PropStreamEvent>, Receiver<PropStreamEvent>) =
+            crossbeam_channel::unbounded();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        self.prop_stream_stop = Some(stop_tx);
+
+        let redis = cx.global::<DfcGlobalStore>().services().redis().clone();
+        let uid = self.prop_row_uid.clone();
+
+        spawn_named_in_tokio("prop-topic-stream", async move {
+            run_prop_topic_stream(service_url, topic_path, token, cfgid, redis, stop_rx, tx, uid)
+                .await;
+        });
+
+        let prop_state = self.prop_table_state.clone();
+        let task = cx.spawn(async move |_, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+
+            let mut rows: Vec<PropRow> = Vec::new();
+            let mut error: Option<String> = None;
+
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    PropStreamEvent::Rows(mut batch) => rows.append(&mut batch),
+                    PropStreamEvent::Error(msg) => error = Some(msg),
+                }
+            }
+
+            if let Some(msg) = error {
+                let _ = prop_state.update(cx, |state, cx| {
+                    state.set_error(msg);
+                    cx.notify();
+                });
+                continue;
+            }
+
+            if rows.is_empty() {
+                continue;
+            }
+
+            let _ = prop_state.update(cx, |state, cx| {
+                state.push_rows_front(rows);
+                cx.notify();
+            });
+        });
+
+        self.prop_ingest_task = Some(task);
     }
 
     /// Render loading state
@@ -774,6 +975,13 @@ impl ConfigView {
         let no_topic_selected = t!("config.no_topic_selected", locale = &locale).to_string();
 
         let selected_topic_index = selected_topic_index.filter(|idx| (*idx as usize) < topic_paths.len());
+        let selected_topic_path = selected_topic_index
+            .and_then(|idx| topic_paths.get(idx as usize))
+            .cloned();
+        let is_prop_topic = selected_topic_path
+            .as_deref()
+            .map(Self::is_prop_topic_path)
+            .unwrap_or(false);
 
         // Build tab buttons
         let mut tabs = Vec::new();
@@ -808,8 +1016,16 @@ impl ConfigView {
                             .children(tabs),
                     ),
             )
-            // Placeholder content area (intentionally blank for now)
-            .child(div().flex_1())
+            // Content area
+            .child(
+                div()
+                    .flex_1()
+                    .child(match (selected_topic_path.as_deref(), is_prop_topic) {
+                        (Some(topic_path), true) => self.render_prop_table(topic_path, cx).into_any_element(),
+                        (Some(topic_path), false) => self.render_unsupported_topic(topic_path, cx).into_any_element(),
+                        (None, _) => div().flex_1().into_any_element(),
+                    }),
+            )
             // Bottom status bar
             .child(
                 h_flex()
@@ -819,9 +1035,307 @@ impl ConfigView {
                     .border_t_1()
                     .border_color(border)
                     .bg(secondary_bg)
-                    .child(Label::new(no_topic_selected).text_color(muted_fg)),
+                    .child(if is_prop_topic {
+                        self.render_prop_pagination(cx).into_any_element()
+                    } else {
+                        Label::new(no_topic_selected)
+                            .text_color(muted_fg)
+                            .into_any_element()
+                    }),
             )
             .into_any_element()
+    }
+
+    fn render_unsupported_topic(&self, topic_path: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+
+        v_flex()
+            .flex_1()
+            .p_4()
+            .gap_2()
+            .child(
+                Label::new("当前仅实现 prop_data Topic 的内容展示")
+                    .text_color(muted_fg),
+            )
+            .child(
+                div()
+                    .border_1()
+                    .border_color(border)
+                    .rounded_md()
+                    .p_3()
+                    .child(
+                        Label::new(topic_path.to_string())
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .text_ellipsis(),
+                    ),
+            )
+    }
+
+    fn render_prop_table(&self, selected_topic_path: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let header_bg = cx.theme().secondary;
+        let muted_fg = cx.theme().muted_foreground;
+
+        let (topic_path, load_state, page_rows, total_rows) = {
+            let state = self.prop_table_state.read(cx);
+            (
+                state.topic_path().map(|s| s.to_string()),
+                state.load_state().clone(),
+                state.page_rows().cloned().collect::<Vec<PropRow>>(),
+                state.rows_len(),
+            )
+        };
+
+        if topic_path.as_deref() != Some(selected_topic_path) {
+            return div()
+                .flex_1()
+                .p_4()
+                .child(Label::new("正在切换 Topic…").text_color(muted_fg))
+                .into_any_element();
+        }
+
+        match &load_state {
+            PropTableLoadState::Error(msg) => {
+                return div()
+                    .flex_1()
+                    .p_4()
+                    .child(Label::new(format!("加载失败: {msg}")).text_color(cx.theme().danger))
+                    .into_any_element();
+            }
+            PropTableLoadState::Loading if total_rows == 0 => {
+                return div()
+                    .flex_1()
+                    .p_4()
+                    .child(Label::new("等待数据…").text_color(muted_fg))
+                    .into_any_element();
+            }
+            _ => {}
+        }
+
+        // Build rows
+        let mut rows = Vec::new();
+        for (idx, row) in page_rows.iter().enumerate() {
+            let bg = if idx % 2 == 0 {
+                if cx.theme().is_dark() {
+                    cx.theme().background.lighten(0.3)
+                } else {
+                    cx.theme().background.darken(0.01)
+                }
+            } else {
+                cx.theme().background
+            };
+
+            rows.push(
+                h_flex()
+                    .id(("prop-row", row.uid as usize))
+                    .w_full()
+                    .bg(bg)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(self.render_prop_cell(180.0, &row.global_uuid, cx))
+                    .child(self.render_prop_cell(110.0, &row.device, cx))
+                    .child(self.render_prop_cell(320.0, &row.imr, cx))
+                    .child(self.render_prop_cell(90.0, &row.imid.to_string(), cx))
+                    .child(self.render_prop_cell(120.0, &row.value, cx))
+                    .child(self.render_prop_cell(90.0, &row.quality.to_string(), cx))
+                    .child(self.render_prop_cell(140.0, &row.bcrid, cx))
+                    .child(self.render_prop_cell(180.0, &row.time, cx))
+                    .child(self.render_prop_cell(180.0, &row.message_time, cx))
+                    .child(self.render_prop_cell(240.0, &row.summary, cx)),
+            );
+        }
+
+        // Horizontal scroll wrapper
+        div()
+            .flex_1()
+            .p_3()
+            .child(
+                div()
+                    .w_full()
+                    .h_full()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("prop-table-x-scroll")
+                            .flex_1()
+                            .overflow_x_scroll()
+                            .child(
+                                v_flex()
+                                    .min_w(px(1_650.0))
+                                    .w(px(1_650.0))
+                                    // Header
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .bg(header_bg)
+                                            .border_b_1()
+                                            .border_color(border)
+                                            .child(self.render_prop_header_cell(180.0, "全局UUID", cx))
+                                            .child(self.render_prop_header_cell(110.0, "设备号", cx))
+                                            .child(self.render_prop_header_cell(320.0, "IMR", cx))
+                                            .child(self.render_prop_header_cell(90.0, "IMID", cx))
+                                            .child(self.render_prop_header_cell(120.0, "值", cx))
+                                            .child(self.render_prop_header_cell(90.0, "数据质量", cx))
+                                            .child(self.render_prop_header_cell(140.0, "BCRID", cx))
+                                            .child(self.render_prop_header_cell(180.0, "数据时间", cx))
+                                            .child(self.render_prop_header_cell(180.0, "报文时间", cx))
+                                            .child(self.render_prop_header_cell(240.0, "报文摘要", cx)),
+                                    )
+                                    // Body
+                                    .child(
+                                        div()
+                                            .id("prop-table-y-scroll")
+                                            .flex_1()
+                                            .overflow_y_scroll()
+                                            .children(rows),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_prop_header_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(w))
+            .px_2()
+            .py_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                Label::new(text.to_string())
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .text_ellipsis(),
+            )
+    }
+
+    fn render_prop_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(w))
+            .px_2()
+            .py_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                Label::new(text.to_string())
+                    .text_sm()
+                    .text_ellipsis(),
+            )
+    }
+
+    fn render_prop_pagination(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (total, start, end, pages, page_index, page_size) = {
+            let state = self.prop_table_state.read(cx);
+            let total = state.rows_len();
+            let (start, end) = state.page_range();
+            (
+                total,
+                start,
+                end,
+                state.total_pages(),
+                state.page_index(),
+                state.page_size(),
+            )
+        };
+
+        let display_start = if total == 0 { 0 } else { start + 1 };
+        let display_end = if total == 0 { 0 } else { end };
+
+        let info = format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total} 条记录");
+        let page_label = format!("第 {} / {} 页", page_index + 1, pages);
+
+        let current_size = PropPageSize::from_value(page_size);
+        let dropdown = DropdownButton::new("prop-page-size-dropdown")
+            .button(
+                Button::new("prop-page-size-btn")
+                    .ghost()
+                    .compact()
+                    .label(format!("{page_size}")),
+            )
+            .dropdown_menu_with_anchor(Corner::TopLeft, move |menu, _, _| {
+                let menu = menu
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S10,
+                        Box::new(PropPageSize::S10),
+                        move |_, _cx| Label::new("10").ml_2().text_xs(),
+                    )
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S20,
+                        Box::new(PropPageSize::S20),
+                        move |_, _cx| Label::new("20").ml_2().text_xs(),
+                    )
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S50,
+                        Box::new(PropPageSize::S50),
+                        move |_, _cx| Label::new("50").ml_2().text_xs(),
+                    )
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S100,
+                        Box::new(PropPageSize::S100),
+                        move |_, _cx| Label::new("100").ml_2().text_xs(),
+                    );
+                menu
+            });
+
+        let prev_disabled = page_index == 0;
+        let next_disabled = page_index + 1 >= pages;
+
+        let prev_btn = Button::new("prop-page-prev")
+            .ghost()
+            .icon(IconName::ChevronLeft)
+            .disabled(prev_disabled)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.prop_table_state.update(cx, |state, cx| {
+                    let current = state.page_index();
+                    state.set_page_index(current.saturating_sub(1));
+                    cx.notify();
+                });
+            }));
+
+        let next_btn = Button::new("prop-page-next")
+            .ghost()
+            .icon(IconName::ChevronRight)
+            .disabled(next_disabled)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.prop_table_state.update(cx, |state, cx| {
+                    let current = state.page_index();
+                    state.set_page_index(current + 1);
+                    cx.notify();
+                });
+            }));
+
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(Label::new(info).text_xs().text_color(cx.theme().muted_foreground))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Label::new("每页显示").text_xs().text_color(cx.theme().muted_foreground))
+                            .child(dropdown)
+                            .child(Label::new("条记录").text_xs().text_color(cx.theme().muted_foreground)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(prev_btn)
+                    .child(Label::new(page_label).text_xs().text_color(cx.theme().muted_foreground))
+                    .child(next_btn),
+            )
     }
 
     /// Render a topic tab for the selected agent
@@ -1005,6 +1519,259 @@ impl ConfigView {
     }
 }
 
+fn find_topic_origin(configs: &[ConfigItem], topic_path: &str) -> Option<(String, String)> {
+    for config in configs {
+        for agent in &config.topic_agents {
+            for topic in &agent.topics {
+                if topic.path == topic_path {
+                    let cfgid = extract_cfgid_from_source(&config.source)?;
+                    return Some((config.service_url.clone(), cfgid));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_cfgid_from_source(source: &str) -> Option<String> {
+    if !source.starts_with("CMC_") {
+        return None;
+    }
+
+    if let (Some(start), Some(end)) = (source.find('{'), source.find('}')) {
+        if start < end {
+            let inner = &source[start + 1..end];
+            if !inner.is_empty() {
+                return Some(inner.to_string());
+            }
+        }
+    }
+
+    if let Some(sg_pos) = source.find("_sg") {
+        let raw = &source["CMC_".len()..sg_pos];
+        let trimmed = raw.trim_start_matches('{').trim_end_matches('}');
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn split_summary_and_proto(data: &[u8]) -> (String, &[u8]) {
+    if data.len() < 3 {
+        return (String::new(), data);
+    }
+
+    let summary_len = data[2] as usize;
+    let start = 3usize.saturating_add(summary_len);
+    if start >= data.len() {
+        return (String::new(), data);
+    }
+
+    let summary = if summary_len == 0 {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&data[3..start]).to_string()
+    };
+
+    (summary, &data[start..])
+}
+
+fn format_clock_time(clock: Option<&crate::proto::iothub::ClockTime>) -> String {
+    let Some(clock) = clock else {
+        return String::new();
+    };
+
+    let secs = i64::from(clock.t);
+    let Some(dt_utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) else {
+        return String::new();
+    };
+
+    dt_utc
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+fn any_value_to_string(v: Option<&crate::proto::iothub::AnyValue>) -> String {
+    let Some(v) = v else {
+        return String::new();
+    };
+
+    use crate::proto::iothub::any_value::V;
+    match v.v.as_ref() {
+        Some(V::DoubleV(x)) => x.to_string(),
+        Some(V::FloatV(x)) => x.to_string(),
+        Some(V::Int32V(x)) => x.to_string(),
+        Some(V::Uint32V(x)) => x.to_string(),
+        Some(V::Uint64V(x)) => x.to_string(),
+        Some(V::Sint32V(x)) => x.to_string(),
+        Some(V::Sint64V(x)) => x.to_string(),
+        Some(V::Fixed32V(x)) => x.to_string(),
+        Some(V::Fixed64V(x)) => x.to_string(),
+        Some(V::Sfixed32V(x)) => x.to_string(),
+        Some(V::Sfixed64V(x)) => x.to_string(),
+        Some(V::BoolV(x)) => x.to_string(),
+        Some(V::StringV(s)) => s.clone(),
+        Some(V::BytesV(b)) => format!("{} bytes", b.len()),
+        Some(V::AnyV(a)) => format!("any({}) {} bytes", a.type_url, a.value.len()),
+        Some(V::NullV(_)) => String::new(),
+        Some(V::JsonV(s)) => s.clone(),
+        Some(V::MsgPackV(b)) => format!("msgpack {} bytes", b.len()),
+        None => String::new(),
+    }
+}
+
+fn parse_prop_rows_from_payload(
+    payload: &[u8],
+    imid2imr: &std::collections::HashMap<(String, u32), String>,
+    uid: &AtomicU64,
+) -> Vec<PropRow> {
+    let (summary, proto) = split_summary_and_proto(payload);
+
+    let df = match crate::proto::iothub::DataFrame::decode(proto) {
+        Ok(df) => df,
+        Err(e) => {
+            tracing::debug!("Failed to decode DataFrame: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for set in df.frame {
+        let Some(header) = set.header.as_ref() else {
+            continue;
+        };
+
+        let global_uuid = header.im_global_uuid.clone();
+        let device = header.source_device.clone();
+        let message_time = format_clock_time(header.t.as_ref());
+
+        for record in &set.data {
+            let (imid, imr) = match record.k.as_ref() {
+                Some(crate::proto::iothub::data_record::K::Im2id(id)) => {
+                    let key = (global_uuid.clone(), *id);
+                    let imr = imid2imr
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown Imr".to_string());
+                    (i32::try_from(*id).unwrap_or(0), imr)
+                }
+                Some(crate::proto::iothub::data_record::K::Imr(imr_ref)) => (0, imr_ref.path.clone()),
+                None => (0, "Unknown Imr".to_string()),
+            };
+
+            let time = format_clock_time(record.device_time.as_ref());
+
+            out.push(PropRow {
+                uid: uid.fetch_add(1, Ordering::Relaxed),
+                global_uuid: global_uuid.clone(),
+                device: device.clone(),
+                imr,
+                imid,
+                value: any_value_to_string(record.v.as_ref()),
+                quality: i32::try_from(record.q).unwrap_or(0),
+                bcrid: record.bcr_uuid.clone(),
+                time,
+                message_time: message_time.clone(),
+                summary: summary.clone(),
+            });
+        }
+    }
+
+    out
+}
+
+async fn run_prop_topic_stream(
+    service_url: String,
+    topic_path: String,
+    token: Option<String>,
+    cfgid: String,
+    redis: Arc<crate::services::RedisRepo>,
+    mut stop: watch::Receiver<bool>,
+    tx: Sender<PropStreamEvent>,
+    uid: Arc<AtomicU64>,
+) {
+    let imid2imr = match redis.fetch_imid2imr(&cfgid).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!("Failed to load IMID->IMR mapping: {}", e);
+            std::collections::HashMap::new()
+        }
+    };
+
+    let mut builder = pulsar::Pulsar::builder(service_url.clone(), pulsar::TokioExecutor);
+    if let Some(token) = token {
+        builder = builder.with_auth(pulsar::Authentication {
+            name: "token".to_string(),
+            data: token.into_bytes(),
+        });
+    }
+
+    let client: pulsar::Pulsar<_> = match builder.build().await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(PropStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
+            return;
+        }
+    };
+
+    let mut reader: pulsar::reader::Reader<Vec<u8>, _> = match client
+        .reader()
+        .with_topic(&topic_path)
+        .with_subscription("dfc-gui-prop-reader")
+        .with_consumer_name("dfc-gui-prop-reader")
+        .into_reader()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(PropStreamEvent::Error(format!("创建 Reader 失败: {e}")));
+            return;
+        }
+    };
+
+    // Align with DFC default: seek to last 20 minutes for persistent topics.
+    if topic_path.starts_with("persistent://") {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if now_ms > 0 {
+            let seek_ms = now_ms.saturating_sub(20 * 60 * 1000) as u64;
+            let _ = reader.seek(None, Some(seek_ms)).await;
+        }
+    }
+
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    break;
+                }
+            }
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(message)) => {
+                        let data = message.deserialize();
+                        let rows = parse_prop_rows_from_payload(&data, &imid2imr, &uid);
+                        if !rows.is_empty() {
+                            let _ = tx.send(PropStreamEvent::Rows(rows));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = tx.send(PropStreamEvent::Error(format!("读取消息失败: {e}")));
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::topic_display_name;
@@ -1056,6 +1823,13 @@ impl Render for ConfigView {
                 this.agent_query_mode = *mode;
                 this.clear_selected_agent_if_filtered_out(cx);
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, size: &PropPageSize, _window, cx| {
+                let page_size = size.value();
+                this.prop_table_state.update(cx, |state, cx| {
+                    state.set_page_size(page_size);
+                    cx.notify();
+                });
             }))
             .child(self.render_content(window, cx))
     }

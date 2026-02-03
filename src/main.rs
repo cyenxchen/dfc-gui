@@ -30,6 +30,7 @@ mod connection;
 mod constants;
 mod error;
 mod helpers;
+mod proto;
 mod services;
 mod states;
 mod views;

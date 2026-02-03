@@ -14,6 +14,7 @@ use fred::prelude::*;
 use fred::clients::Client as FredClient;
 use fred::types::config::Config as FredConfig;
 use fred::types::CustomCommand;
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -142,9 +143,6 @@ impl RedisRepo {
 
     /// Fetch configuration items from Redis
     pub async fn fetch_configs(&self, cfgid: Option<&str>) -> Result<Vec<ConfigItem>> {
-        // Enter tokio runtime context for fred client operations
-        let _guard = super::runtime_handle().enter();
-
         let guard = self.client.read().await;
         let client = guard.as_ref().ok_or_else(|| Error::Connection {
             message: "Not connected to Redis".to_string(),
@@ -411,6 +409,64 @@ impl RedisRepo {
         let mut ids: Vec<String> = agent_ids.into_iter().collect();
         ids.sort();
         ids
+    }
+
+    /// Load InfoModel property mapping (IMID -> IMR) from Redis.
+    ///
+    /// Aligns with DFC `Loader.LoadImid2Imr` logic:
+    /// - Key: `CMC_{cfgid}_sg.infomodel.property`
+    /// - JSON is an array of objects: `{ "uuid": "...", "props": [{ "imid": 1, "uuid": "..."}, ...] }`
+    /// - `uuid` is normalized by taking substring before first `_`.
+    pub async fn fetch_imid2imr(
+        &self,
+        cfgid: &str,
+    ) -> Result<std::collections::HashMap<(String, u32), String>> {
+        #[derive(Debug, Deserialize)]
+        struct InfoProp {
+            #[serde(default)]
+            uuid: String,
+            #[serde(default)]
+            imid: u32,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Info {
+            #[serde(default)]
+            uuid: String,
+            #[serde(default)]
+            props: Vec<InfoProp>,
+        }
+
+        let guard = self.client.read().await;
+        let client = guard.as_ref().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })?;
+
+        let wrapped = Self::wrap_cfgid(cfgid);
+        let key = format!("CMC_{}_sg.infomodel.property", wrapped);
+
+        let Some(json) = self.get_config_json(client, &key).await else {
+            return Ok(std::collections::HashMap::new());
+        };
+
+        let infos: Vec<Info> = serde_json::from_value(json).unwrap_or_default();
+        let mut map: std::collections::HashMap<(String, u32), String> = std::collections::HashMap::new();
+
+        for info in infos {
+            let uuid_base = match info.uuid.split('_').next() {
+                Some(v) if !v.is_empty() => v.to_string(),
+                _ => info.uuid.clone(),
+            };
+
+            for prop in info.props {
+                if prop.imid == 0 || prop.uuid.is_empty() || uuid_base.is_empty() {
+                    continue;
+                }
+                map.insert((uuid_base.clone(), prop.imid), prop.uuid);
+            }
+        }
+
+        Ok(map)
     }
 
     fn build_topic_agents_from_details(

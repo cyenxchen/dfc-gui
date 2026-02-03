@@ -1,0 +1,52 @@
+/**
+ * Minimal subset of IM2 DataType definitions required for decoding iothub
+ * prop_data payloads (DataFrame/DataRecordSet).
+ *
+ * Source of truth/reference: DFC project `DataType.proto` (protobuf v3).
+ */
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+
+/* 任意类型，用于各种类型不能事先确定的场景 */
+message AnyValue {
+  oneof v {
+    double doubleV = 1;
+    float floatV = 2;
+    int32 int32V = 3;
+    uint32 uint32V = 4;
+    uint64 uint64V = 5;
+    sint32 sint32V = 6;
+    sint64 sint64V = 7;
+    fixed32 fixed32V = 8;
+    fixed64 fixed64V = 9;
+    sfixed32 sfixed32V = 10;
+    sfixed64 sfixed64V = 11;
+    bool boolV = 12;
+    string stringV = 13;
+    bytes bytesV = 14;
+
+    /* 消息类（复杂结构体）数据使用下面这个 */
+    google.protobuf.Any anyV = 15;
+
+    /* 空值 */
+    google.protobuf.NullValue nullV = 16;
+
+    /* 自定义的复合结构，适用于protobuf没有相应定义的场景 */
+    string jsonV = 17;
+    bytes msgPackV = 18;
+  }
+}
+
+/* 时间类型（unix seconds） */
+message ClockTime {
+  uint32 t = 1;
+  int32 zoneInfo = 2;
+}
+
+/* 由IMR序列化产生的唯一字符串，类似于URL。 */
+message IMRRef {
+  string path = 1;
+}
+
