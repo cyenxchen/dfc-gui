@@ -716,7 +716,7 @@ impl ConfigView {
                 .into_any_element();
         }
 
-        let (agent_id, topic_count) = agent_info.expect("checked above");
+        let (_agent_id, topic_count) = agent_info.expect("checked above");
 
         let muted_fg = cx.theme().muted_foreground;
         let border = cx.theme().border;
@@ -741,10 +741,19 @@ impl ConfigView {
                 h_flex()
                     .w_full()
                     .h(px(PANEL_TOPBAR_HEIGHT))
+                    .items_center()
+                    .px_4()
+                    .gap_2()
                     .bg(secondary_bg)
                     .border_b_1()
                     .border_color(border)
-                    .child(div().flex_1()),
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .gap_2()
+                            .overflow_x_scrollbar()
+                            .children(tabs),
+                    ),
             )
             .child(
                 v_flex()
@@ -752,28 +761,9 @@ impl ConfigView {
                     .p_4()
                     .gap_2()
                     .child(
-                        h_flex()
-                            .w_full()
-                            .items_start()
-                            .gap_4()
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .flex_none()
-                                    .child(Label::new(format!("Agent: {}", agent_id)).text_lg())
-                                    .child(
-                                        Label::new(format!("{} topics", topic_count))
-                                            .text_sm()
-                                            .text_color(muted_fg),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .gap_2()
-                                    .overflow_x_scrollbar()
-                                    .children(tabs),
-                            ),
+                        Label::new(format!("{} topics", topic_count))
+                            .text_sm()
+                            .text_color(muted_fg),
                     )
                     // Placeholder content area (intentionally blank for now)
                     .child(div().flex_1()),
