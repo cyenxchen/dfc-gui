@@ -28,6 +28,7 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::watch;
 
 /// Width of the left agent list panel
@@ -1558,24 +1559,49 @@ fn extract_cfgid_from_source(source: &str) -> Option<String> {
     None
 }
 
-fn split_summary_and_proto(data: &[u8]) -> (String, &[u8]) {
-    if data.len() < 3 {
-        return (String::new(), data);
+fn decode_data_frame(payload: &[u8]) -> Option<(String, crate::proto::iothub::DataFrame)> {
+    fn try_with_summary_len_at(
+        payload: &[u8],
+        summary_len_index: usize,
+    ) -> Option<(String, crate::proto::iothub::DataFrame)> {
+        if payload.len() <= summary_len_index {
+            return None;
+        }
+
+        let summary_len = payload[summary_len_index] as usize;
+        let prefix_len = summary_len_index + 1;
+        let summary_end = prefix_len.saturating_add(summary_len);
+        if summary_end > payload.len() {
+            return None;
+        }
+
+        let summary = if summary_len == 0 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&payload[prefix_len..summary_end]).to_string()
+        };
+
+        let proto = &payload[summary_end..];
+        let df = crate::proto::iothub::DataFrame::decode(proto).ok()?;
+        Some((summary, df))
     }
 
-    let summary_len = data[2] as usize;
-    let start = 3usize.saturating_add(summary_len);
-    if start >= data.len() {
-        return (String::new(), data);
+    // Most common (DFC): payload[2] is summary length, summary starts at payload[3]
+    if let Some(v) = try_with_summary_len_at(payload, 2) {
+        return Some(v);
+    }
+    // Some producers omit the 2-byte prefix: summary length at payload[0] or payload[1]
+    if let Some(v) = try_with_summary_len_at(payload, 0) {
+        return Some(v);
+    }
+    if let Some(v) = try_with_summary_len_at(payload, 1) {
+        return Some(v);
     }
 
-    let summary = if summary_len == 0 {
-        String::new()
-    } else {
-        String::from_utf8_lossy(&data[3..start]).to_string()
-    };
-
-    (summary, &data[start..])
+    // Fallback: no summary framing, payload is raw protobuf
+    crate::proto::iothub::DataFrame::decode(payload)
+        .ok()
+        .map(|df| (String::new(), df))
 }
 
 fn format_clock_time(clock: Option<&crate::proto::iothub::ClockTime>) -> String {
@@ -1627,15 +1653,9 @@ fn parse_prop_rows_from_payload(
     payload: &[u8],
     imid2imr: &std::collections::HashMap<(String, u32), String>,
     uid: &AtomicU64,
-) -> Vec<PropRow> {
-    let (summary, proto) = split_summary_and_proto(payload);
-
-    let df = match crate::proto::iothub::DataFrame::decode(proto) {
-        Ok(df) => df,
-        Err(e) => {
-            tracing::debug!("Failed to decode DataFrame: {}", e);
-            return Vec::new();
-        }
+) -> (Vec<PropRow>, bool) {
+    let Some((summary, df)) = decode_data_frame(payload) else {
+        return (Vec::new(), false);
     };
 
     let mut out = Vec::new();
@@ -1680,7 +1700,7 @@ fn parse_prop_rows_from_payload(
         }
     }
 
-    out
+    (out, true)
 }
 
 async fn run_prop_topic_stream(
@@ -1717,29 +1737,56 @@ async fn run_prop_topic_stream(
         }
     };
 
-    let mut reader: pulsar::reader::Reader<Vec<u8>, _> = match client
-        .reader()
+    // Use a Consumer (not Reader) so partitioned topics work correctly.
+    // The pulsar crate Reader only binds to one partition for partitioned topics.
+    let subscription = format!("dfc-gui-prop-{}", uuid::Uuid::new_v4());
+    let options = pulsar::ConsumerOptions::default()
+        .durable(false)
+        .with_receiver_queue_size(1000);
+    let mut consumer: pulsar::Consumer<Vec<u8>, _> = match client
+        .consumer()
         .with_topic(&topic_path)
-        .with_subscription("dfc-gui-prop-reader")
-        .with_consumer_name("dfc-gui-prop-reader")
-        .into_reader()
+        .with_subscription(subscription)
+        .with_subscription_type(pulsar::SubType::Exclusive)
+        .with_consumer_name("dfc-gui-prop-consumer")
+        .with_options(options)
+        .build()
         .await
     {
-        Ok(r) => r,
+        Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(PropStreamEvent::Error(format!("创建 Reader 失败: {e}")));
+            let _ = tx.send(PropStreamEvent::Error(format!("创建 Consumer 失败: {e}")));
             return;
         }
     };
 
-    // Align with DFC default: seek to last 20 minutes for persistent topics.
+    // Align with DFC default: seek to last 20 minutes for persistent topics when possible.
+    // Note: Pulsar seek is only reliable for non-partitioned topics.
     if topic_path.starts_with("persistent://") {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if now_ms > 0 {
-            let seek_ms = now_ms.saturating_sub(20 * 60 * 1000) as u64;
-            let _ = reader.seek(None, Some(seek_ms)).await;
+        if let Ok(parts) = client.lookup_partitioned_topic(topic_path.clone()).await {
+            if parts.len() == 1 {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if now_ms > 0 {
+                    let seek_ms = now_ms.saturating_sub(20 * 60 * 1000) as u64;
+                    let _ = consumer
+                        .seek(None, None, Some(seek_ms), client.clone())
+                        .await;
+                }
+            } else {
+                tracing::debug!(
+                    topic = %topic_path,
+                    partitions = parts.len(),
+                    "prop topic is partitioned; skipping seek"
+                );
+            }
         }
     }
+
+    let mut last_stats = Instant::now();
+    let mut received_messages: u64 = 0;
+    let mut decoded_messages: u64 = 0;
+    let mut decode_failures: u64 = 0;
+    let mut emitted_rows: u64 = 0;
 
     loop {
         if *stop.borrow() {
@@ -1752,13 +1799,36 @@ async fn run_prop_topic_stream(
                     break;
                 }
             }
-            msg = reader.next() => {
+            msg = consumer.next() => {
                 match msg {
                     Some(Ok(message)) => {
+                        received_messages += 1;
+
                         let data = message.deserialize();
-                        let rows = parse_prop_rows_from_payload(&data, &imid2imr, &uid);
+                        let (rows, decoded) = parse_prop_rows_from_payload(&data, &imid2imr, &uid);
+                        if decoded {
+                            decoded_messages += 1;
+                        } else {
+                            decode_failures += 1;
+                        }
                         if !rows.is_empty() {
+                            emitted_rows += rows.len() as u64;
                             let _ = tx.send(PropStreamEvent::Rows(rows));
+                        }
+
+                        // Ack to avoid redelivery / memory build-up.
+                        let _ = consumer.ack(&message).await;
+
+                        if last_stats.elapsed() >= Duration::from_secs(10) {
+                            tracing::info!(
+                                topic = %topic_path,
+                                received_messages,
+                                decoded_messages,
+                                decode_failures,
+                                emitted_rows,
+                                "prop topic stream stats"
+                            );
+                            last_stats = Instant::now();
                         }
                     }
                     Some(Err(e)) => {
