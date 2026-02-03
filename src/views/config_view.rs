@@ -756,18 +756,18 @@ impl ConfigView {
                     ),
             )
             .child(
-                v_flex()
-                    .flex_1()
-                    .p_4()
-                    .gap_2()
+                h_flex()
+                    .w_full()
+                    .px_4()
+                    .py_2()
                     .child(
                         Label::new(format!("{} topics", topic_count))
                             .text_sm()
                             .text_color(muted_fg),
-                    )
-                    // Placeholder content area (intentionally blank for now)
-                    .child(div().flex_1()),
+                    ),
             )
+            // Placeholder content area (intentionally blank for now)
+            .child(div().flex_1())
             // Bottom status bar
             .child(
                 h_flex()
@@ -802,6 +802,7 @@ impl ConfigView {
             .py_2()
             .bg(tab_bg)
             .cursor_pointer()
+            .flex_none()
             .rounded_md()
             .border_1()
             .border_color(border_color)
