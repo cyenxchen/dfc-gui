@@ -752,6 +752,7 @@ impl ConfigView {
                             .flex_1()
                             .gap_2()
                             .flex_nowrap()
+                            .justify_center()
                             .overflow_x_scroll()
                             .children(tabs),
                     ),
@@ -792,8 +793,12 @@ impl ConfigView {
         is_selected: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let tab_bg = if is_selected { cx.theme().secondary } else { cx.theme().background };
-        let border_color = if is_selected { cx.theme().accent } else { cx.theme().border };
+        let tab_bg = if is_selected {
+            cx.theme().primary.opacity(0.12)
+        } else {
+            cx.theme().background
+        };
+        let border_color = if is_selected { cx.theme().primary } else { cx.theme().border };
         let text_color = if is_selected { cx.theme().foreground } else { cx.theme().muted_foreground };
         let tooltip_label = topic_path.to_string();
 
@@ -805,7 +810,7 @@ impl ConfigView {
             .cursor_pointer()
             .flex_none()
             .rounded_md()
-            .border_1()
+            .border_2()
             .border_color(border_color)
             .child(
                 Label::new(label)
