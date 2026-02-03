@@ -527,6 +527,7 @@ impl ConfigView {
         &self,
         index: usize,
         agent_id: String,
+        topic_count: usize,
         is_selected: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -546,6 +547,12 @@ impl ConfigView {
         let border_color = cx.theme().border;
         let agent_id_for_click = agent_id.clone();
 
+        let count_color = if is_selected {
+            cx.theme().accent_foreground.opacity(0.9)
+        } else {
+            cx.theme().muted_foreground
+        };
+
         div()
             .id(("agent-item", index))
             .w_full()
@@ -557,9 +564,22 @@ impl ConfigView {
             .border_color(border_color)
             .hover(|this| this.bg(hover_color))
             .child(
-                Label::new(agent_id.clone())
-                    .text_sm()
-                    .text_color(text_color),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Label::new(agent_id.clone())
+                            .text_sm()
+                            .text_color(text_color)
+                            .text_ellipsis()
+                            .flex_1(),
+                    )
+                    .child(
+                        Label::new(format!("{} topics", topic_count))
+                            .text_xs()
+                            .text_color(count_color),
+                    ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.config_state.update(cx, |state, cx| {
@@ -573,7 +593,7 @@ impl ConfigView {
         let query = self.agent_search_state.read(cx).value().trim().to_string();
 
         // Collect agent data first to avoid borrow conflicts
-        let agents_data: Vec<(usize, String, bool)> = {
+        let agents_data: Vec<(usize, String, usize, bool)> = {
             let config_state = self.config_state.read(cx);
             let topic_agents = config_state.topic_agents();
             let selected_agent_id = config_state.selected_agent_id();
@@ -584,14 +604,14 @@ impl ConfigView {
                 .enumerate()
                 .map(|(idx, agent)| {
                     let is_selected = selected_agent_id == Some(&agent.agent_id);
-                    (idx, agent.agent_id.clone(), is_selected)
+                    (idx, agent.agent_id.clone(), agent.topics.len(), is_selected)
                 })
                 .collect()
         };
 
         let mut agent_items: Vec<gpui::Stateful<gpui::Div>> = Vec::new();
-        for (index, agent_id, is_selected) in agents_data {
-            agent_items.push(self.render_agent_item(index, agent_id, is_selected, cx));
+        for (index, agent_id, topic_count, is_selected) in agents_data {
+            agent_items.push(self.render_agent_item(index, agent_id, topic_count, is_selected, cx));
         }
 
         let border_color = cx.theme().border;
@@ -715,7 +735,7 @@ impl ConfigView {
                 .into_any_element();
         }
 
-        let (_agent_id, topic_count) = agent_info.expect("checked above");
+        let (_agent_id, _topic_count) = agent_info.expect("checked above");
 
         let muted_fg = cx.theme().muted_foreground;
         let border = cx.theme().border;
@@ -755,17 +775,6 @@ impl ConfigView {
                             .justify_center()
                             .overflow_x_scroll()
                             .children(tabs),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_4()
-                    .py_2()
-                    .child(
-                        Label::new(format!("{} topics", topic_count))
-                            .text_sm()
-                            .text_color(muted_fg),
                     ),
             )
             // Placeholder content area (intentionally blank for now)
