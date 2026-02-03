@@ -1739,48 +1739,10 @@ async fn run_prop_topic_stream(
 
     // Use a Consumer (not Reader) so partitioned topics work correctly.
     // The pulsar crate Reader only binds to one partition for partitioned topics.
+    //
+    // NOTE: We use `Shared` to avoid exclusive-subscription churn when the broker
+    // takes time to release a closed consumer during reconnects.
     let subscription = format!("dfc-gui-prop-{}", uuid::Uuid::new_v4());
-    let options = pulsar::ConsumerOptions::default()
-        .durable(false)
-        .with_receiver_queue_size(1000);
-    let mut consumer: pulsar::Consumer<Vec<u8>, _> = match client
-        .consumer()
-        .with_topic(&topic_path)
-        .with_subscription(subscription)
-        .with_subscription_type(pulsar::SubType::Exclusive)
-        .with_consumer_name("dfc-gui-prop-consumer")
-        .with_options(options)
-        .build()
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(PropStreamEvent::Error(format!("创建 Consumer 失败: {e}")));
-            return;
-        }
-    };
-
-    // Align with DFC default: seek to last 20 minutes for persistent topics when possible.
-    // Note: Pulsar seek is only reliable for non-partitioned topics.
-    if topic_path.starts_with("persistent://") {
-        if let Ok(parts) = client.lookup_partitioned_topic(topic_path.clone()).await {
-            if parts.len() == 1 {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                if now_ms > 0 {
-                    let seek_ms = now_ms.saturating_sub(20 * 60 * 1000) as u64;
-                    let _ = consumer
-                        .seek(None, None, Some(seek_ms), client.clone())
-                        .await;
-                }
-            } else {
-                tracing::debug!(
-                    topic = %topic_path,
-                    partitions = parts.len(),
-                    "prop topic is partitioned; skipping seek"
-                );
-            }
-        }
-    }
 
     let mut last_stats = Instant::now();
     let mut received_messages: u64 = 0;
@@ -1788,57 +1750,138 @@ async fn run_prop_topic_stream(
     let mut decode_failures: u64 = 0;
     let mut emitted_rows: u64 = 0;
 
-    loop {
-        if *stop.borrow() {
-            break;
-        }
+    let mut connect_attempt: u64 = 0;
+    let mut seek_done = false;
 
-        tokio::select! {
-            _ = stop.changed() => {
-                if *stop.borrow() {
-                    break;
+    while !*stop.borrow() {
+        connect_attempt += 1;
+
+        let options = pulsar::ConsumerOptions::default()
+            .durable(false)
+            .with_receiver_queue_size(1000);
+        let consumer_name = format!("dfc-gui-prop-consumer-{}", uuid::Uuid::new_v4());
+
+        tracing::info!(
+            topic = %topic_path,
+            subscription = %subscription,
+            consumer_name = %consumer_name,
+            attempt = connect_attempt,
+            "connecting prop topic consumer"
+        );
+
+        let mut consumer: pulsar::Consumer<Vec<u8>, _> = match client
+            .consumer()
+            .with_topic(&topic_path)
+            .with_subscription(subscription.clone())
+            .with_subscription_type(pulsar::SubType::Shared)
+            .with_consumer_name(consumer_name)
+            .with_options(options)
+            .build()
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(PropStreamEvent::Error(format!("创建 Consumer 失败: {e}")));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        // Align with DFC default: seek to last 20 minutes for persistent topics when possible.
+        // Note: Pulsar seek is only reliable for non-partitioned topics.
+        if !seek_done && topic_path.starts_with("persistent://") {
+            if let Ok(parts) = client.lookup_partitioned_topic(topic_path.clone()).await {
+                if parts.len() == 1 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if now_ms > 0 {
+                        let seek_ms = now_ms.saturating_sub(20 * 60 * 1000) as u64;
+                        let _ = consumer
+                            .seek(None, None, Some(seek_ms), client.clone())
+                            .await;
+                    }
+                    seek_done = true;
+                } else {
+                    tracing::debug!(
+                        topic = %topic_path,
+                        partitions = parts.len(),
+                        "prop topic is partitioned; skipping seek"
+                    );
+                    seek_done = true;
                 }
             }
-            msg = consumer.next() => {
-                match msg {
-                    Some(Ok(message)) => {
-                        received_messages += 1;
+        }
 
-                        let data = message.deserialize();
-                        let (rows, decoded) = parse_prop_rows_from_payload(&data, &imid2imr, &uid);
-                        if decoded {
-                            decoded_messages += 1;
-                        } else {
-                            decode_failures += 1;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+
+            tokio::select! {
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    tracing::debug!(
+                        topic = %topic_path,
+                        received_messages,
+                        decoded_messages,
+                        decode_failures,
+                        emitted_rows,
+                        consumer_received = consumer.messages_received(),
+                        "prop topic consumer heartbeat"
+                    );
+                }
+                msg = consumer.next() => {
+                    match msg {
+                        Some(Ok(message)) => {
+                            received_messages += 1;
+
+                            let data = message.deserialize();
+                            let (rows, decoded) = parse_prop_rows_from_payload(&data, &imid2imr, &uid);
+                            if decoded {
+                                decoded_messages += 1;
+                            } else {
+                                decode_failures += 1;
+                            }
+                            if !rows.is_empty() {
+                                emitted_rows += rows.len() as u64;
+                                let _ = tx.send(PropStreamEvent::Rows(rows));
+                            }
+
+                            // Ack to avoid redelivery / memory build-up.
+                            let _ = consumer.ack(&message).await;
+
+                            if last_stats.elapsed() >= Duration::from_secs(10) {
+                                tracing::info!(
+                                    topic = %topic_path,
+                                    received_messages,
+                                    decoded_messages,
+                                    decode_failures,
+                                    emitted_rows,
+                                    "prop topic stream stats"
+                                );
+                                last_stats = Instant::now();
+                            }
                         }
-                        if !rows.is_empty() {
-                            emitted_rows += rows.len() as u64;
-                            let _ = tx.send(PropStreamEvent::Rows(rows));
+                        Some(Err(e)) => {
+                            let _ = tx.send(PropStreamEvent::Error(format!("读取消息失败: {e}")));
+                            break;
                         }
-
-                        // Ack to avoid redelivery / memory build-up.
-                        let _ = consumer.ack(&message).await;
-
-                        if last_stats.elapsed() >= Duration::from_secs(10) {
-                            tracing::info!(
-                                topic = %topic_path,
-                                received_messages,
-                                decoded_messages,
-                                decode_failures,
-                                emitted_rows,
-                                "prop topic stream stats"
-                            );
-                            last_stats = Instant::now();
+                        None => {
+                            let _ = tx.send(PropStreamEvent::Error("Consumer 数据流意外结束，正在重连…".to_string()));
+                            break;
                         }
                     }
-                    Some(Err(e)) => {
-                        let _ = tx.send(PropStreamEvent::Error(format!("读取消息失败: {e}")));
-                        break;
-                    }
-                    None => break,
                 }
             }
         }
+
+        // Backoff before reconnecting.
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

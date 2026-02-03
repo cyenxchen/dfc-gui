@@ -106,7 +106,7 @@ impl PropTableState {
     }
 
     pub fn mark_ready(&mut self) {
-        if !matches!(self.load_state, PropTableLoadState::Error(_)) {
+        if self.topic_path.is_some() {
             self.load_state = PropTableLoadState::Ready;
         }
     }
@@ -156,4 +156,3 @@ impl Default for PropTableState {
         Self::new()
     }
 }
-
