@@ -26,6 +26,37 @@ const AGENT_LIST_WIDTH: f32 = 320.0;
 /// Height of the top bar for left/right panels (keeps alignment)
 const PANEL_TOPBAR_HEIGHT: f32 = 48.0;
 
+fn topic_display_name(topic_path: &str) -> String {
+    if topic_path.contains("thing_service-BZ-RESPONSE") && topic_path.contains("thing_service-BZ-REQUEST") {
+        return "service".to_string();
+    }
+
+    if let Some(start) = topic_path.find("prop_data-BZ-") {
+        let after_prefix = start + "prop_data-BZ-".len();
+        if let Some(realdev_pos) = topic_path[after_prefix..].find("-realdev-") {
+            let a = &topic_path[after_prefix..after_prefix + realdev_pos];
+            let b_start = after_prefix + realdev_pos + "-realdev-".len();
+            if let Some(last_dash) = topic_path.rfind('-') {
+                if last_dash > b_start {
+                    let b = &topic_path[b_start..last_dash];
+                    if !a.is_empty() && !b.is_empty() {
+                        return format!("{a}_{b}");
+                    }
+                }
+            }
+        }
+    }
+
+    let mut last = topic_path.rsplit('/').next().unwrap_or(topic_path).to_string();
+    if let Some(last_dash) = last.rfind('-') {
+        let tail = &last[last_dash + 1..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            last.truncate(last_dash);
+        }
+    }
+    last
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 enum AgentQueryMode {
     All,
@@ -747,7 +778,7 @@ impl ConfigView {
         // Build tab buttons
         let mut tabs = Vec::new();
         for (pos, path) in topic_paths.iter().enumerate() {
-            let label = format!("topic{}", pos + 1);
+            let label = topic_display_name(path);
             let is_selected = selected_topic_index == Some(pos as i32);
             tabs.push(self.render_agent_topic_tab(pos as i32, label, path, is_selected, cx));
         }
@@ -971,6 +1002,49 @@ impl ConfigView {
                     .into_any_element()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::topic_display_name;
+
+    #[test]
+    fn topic_display_name_prop_data_rules() {
+        assert_eq!(
+            topic_display_name("persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-626221420272574464"),
+            "GRID_Guarantee"
+        );
+        assert_eq!(
+            topic_display_name("non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee-626221420272574464"),
+            "FAST_Guarantee"
+        );
+        assert_eq!(
+            topic_display_name("persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-60-626221420272574464"),
+            "GRID_SECTION_60"
+        );
+        assert_eq!(
+            topic_display_name("persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-WindPower-626221420272574464"),
+            "GRID_SECTION_WindPower"
+        );
+    }
+
+    #[test]
+    fn topic_display_name_service_rule() {
+        assert_eq!(
+            topic_display_name(
+                "persistent://goldwind/iothub/thing_service-BZ-RESPONSE-626221420272574464,persistent://goldwind/iothub/thing_service-BZ-REQUEST-626221420272574464"
+            ),
+            "service"
+        );
+    }
+
+    #[test]
+    fn topic_display_name_fallback_is_stable_and_not_topic_n() {
+        assert_eq!(
+            topic_display_name("persistent://goldwind/iothub/thing_event-BZ-626221420272574464"),
+            "thing_event-BZ"
+        );
     }
 }
 
