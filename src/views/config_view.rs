@@ -21,6 +21,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
@@ -1024,6 +1025,8 @@ impl ConfigView {
             .child(
                 div()
                     .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
                     .child(match (selected_topic_path.as_deref(), is_prop_topic) {
                         (Some(topic_path), true) => self.render_prop_table(topic_path, cx).into_any_element(),
                         (Some(topic_path), false) => self.render_unsupported_topic(topic_path, cx).into_any_element(),
@@ -1154,11 +1157,13 @@ impl ConfigView {
         // Horizontal scroll wrapper
         div()
             .flex_1()
+            .min_h(px(0.0))
             .p_3()
             .child(
                 div()
                     .w_full()
                     .h_full()
+                    .min_h(px(0.0))
                     .rounded_md()
                     .border_1()
                     .border_color(border)
@@ -1167,11 +1172,14 @@ impl ConfigView {
                         div()
                             .id("prop-table-x-scroll")
                             .flex_1()
+                            .min_h(px(0.0))
                             .overflow_x_scroll()
                             .child(
                                 v_flex()
                                     .min_w(px(1_650.0))
                                     .w(px(1_650.0))
+                                    .h_full()
+                                    .min_h(px(0.0))
                                     // Header
                                     .child(
                                         h_flex()
@@ -1195,7 +1203,8 @@ impl ConfigView {
                                         div()
                                             .id("prop-table-y-scroll")
                                             .flex_1()
-                                            .overflow_y_scroll()
+                                            .min_h(px(0.0))
+                                            .overflow_y_scrollbar()
                                             .children(rows),
                                     ),
                             ),
@@ -1375,12 +1384,25 @@ impl ConfigView {
         h_flex()
             .w_full()
             .items_center()
-            .justify_between()
+            .gap_6()
             .child(
                 h_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .items_center()
                     .gap_3()
-                    .child(Label::new(info).text_xs().text_color(cx.theme().muted_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(
+                                Label::new(info)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_ellipsis(),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .items_center()
@@ -1392,6 +1414,7 @@ impl ConfigView {
             )
             .child(
                 h_flex()
+                    .flex_none()
                     .items_center()
                     .gap_2()
                     .child(prev_btn)
