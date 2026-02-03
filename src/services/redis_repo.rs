@@ -189,100 +189,631 @@ impl RedisRepo {
             };
 
             for key in keys {
-                // First check the key type
-                let type_cmd = CustomCommand::new_static("TYPE", None, false);
-                let type_result: Value = client.custom(type_cmd, vec![Value::from(key.clone())]).await.unwrap_or(Value::Null);
-                let key_type = type_result.into_string().unwrap_or_default();
-
-                let value: Option<String> = match key_type.as_str() {
-                    "string" => {
-                        // Get string value
-                        let cmd = CustomCommand::new_static("GET", None, false);
-                        let result: Value = client.custom(cmd, vec![Value::from(key.clone())]).await.unwrap_or(Value::Null);
-                        result.into_string()
-                    }
-                    "hash" => {
-                        // Get hash value and convert to JSON
-                        let cmd = CustomCommand::new_static("HGETALL", None, false);
-                        let result: Value = client.custom(cmd, vec![Value::from(key.clone())]).await.unwrap_or(Value::Null);
-                        if let Value::Array(arr) = result {
-                            // Convert pairs to JSON object
-                            let mut map = serde_json::Map::new();
-                            let mut iter = arr.into_iter();
-                            while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
-                                if let (Some(key_str), Some(val_str)) = (k.into_string(), v.into_string()) {
-                                    // Try to parse value as JSON, otherwise use as string
-                                    let json_val = serde_json::from_str(&val_str)
-                                        .unwrap_or(serde_json::Value::String(val_str));
-                                    map.insert(key_str, json_val);
-                                }
-                            }
-                            Some(serde_json::to_string(&map).unwrap_or_default())
-                        } else {
-                            None
-                        }
-                    }
-                    "list" => {
-                        // Get list value and convert to JSON array
-                        let cmd = CustomCommand::new_static("LRANGE", None, false);
-                        let result: Value = client.custom(cmd, vec![
-                            Value::from(key.clone()),
-                            Value::from("0"),
-                            Value::from("-1"),  // Get all elements
-                        ]).await.unwrap_or(Value::Null);
-                        if let Value::Array(arr) = result {
-                            let items: Vec<serde_json::Value> = arr
-                                .into_iter()
-                                .filter_map(|v| v.into_string())
-                                .map(|s| {
-                                    // Try to parse each item as JSON, otherwise use as string
-                                    serde_json::from_str(&s)
-                                        .unwrap_or(serde_json::Value::String(s))
-                                })
-                                .collect();
-                            Some(serde_json::to_string(&items).unwrap_or_default())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => {
-                        tracing::debug!("Skipping key {} with unsupported type: {}", key, key_type);
-                        None
-                    }
+                let Some(config_json) = self.get_config_json(client, &key).await else {
+                    continue;
                 };
 
-                if let Some(val) = value {
-                    // Parse the value as JSON to extract topic details
-                    let details = self.parse_config_value(&val, group_id);
+                let raw_value = match &config_json {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => config_json.to_string(),
+                };
 
-                    // Extract service URL from the key or value
-                    let service_url = self.extract_service_url(&key, &val);
+                let details = if self.is_output_iothub_key(&key)
+                    || self.is_input_iothub_key(&key)
+                    || self.is_io_iothub_key(&key)
+                {
+                    Vec::new()
+                } else {
+                    self.parse_config_value(&raw_value, group_id)
+                };
 
-                    // Extract cfgid from the key (e.g., CMC_{DCC0001}_sg.og.output.iothub -> DCC0001)
-                    let cfgid = self.extract_cfgid_from_key(&key);
+                let service_url = self
+                    .extract_service_url_from_json(&config_json)
+                    .unwrap_or_else(|| self.extract_service_url(&key, &raw_value));
 
-                    // Fetch TopicAgentIds for this config
-                    let topic_agents = if let Some(ref cfg) = cfgid {
-                        self.fetch_topic_agent_ids_internal(client, cfg, group_id, &details).await
+                // Extract cfgid from the key (e.g., CMC_{DCC0001}_sg.og.output.iothub -> DCC0001)
+                let cfgid = self.extract_cfgid_from_key(&key);
+
+                let topic_agents = if let Some(ref cfg) = cfgid {
+                    let app_id = self.fetch_app_id(client, cfg).await;
+                    let agent_ids = self.fetch_topic_agent_ids(client, cfg, &app_id).await;
+
+                    if self.is_output_iothub_key(&key) {
+                        self.build_output_iothub_topic_agents(&config_json, &agent_ids, group_id)
+                    } else if self.is_input_iothub_key(&key) {
+                        self.build_input_iothub_topic_agents(&config_json, &agent_ids, &app_id, group_id)
+                    } else if self.is_io_iothub_key(&key) {
+                        self.build_io_iothub_topic_agents(&config_json, &agent_ids, &app_id, group_id)
                     } else {
-                        Vec::new()
-                    };
+                        self.build_topic_agents_from_details(&agent_ids, &details, group_id)
+                    }
+                } else {
+                    Vec::new()
+                };
 
-                    configs.push(ConfigItem {
-                        group_id,
-                        service_url,
-                        source: key,
-                        details,
-                        topic_agents,
-                    });
+                configs.push(ConfigItem {
+                    group_id,
+                    service_url,
+                    source: key,
+                    details,
+                    topic_agents,
+                });
 
-                    group_id += 1;
-                }
+                group_id += 1;
             }
         }
 
         tracing::info!("Fetched {} config items from Redis", configs.len());
         Ok(configs)
+    }
+
+    fn is_output_iothub_key(&self, key: &str) -> bool {
+        key.ends_with("sg.og.output.iothub")
+    }
+
+    fn is_input_iothub_key(&self, key: &str) -> bool {
+        key.ends_with("sg.og.input.iothub")
+    }
+
+    fn is_io_iothub_key(&self, key: &str) -> bool {
+        key.ends_with("sg.io.iothub")
+    }
+
+    fn wrap_cfgid(cfgid: &str) -> String {
+        if cfgid.starts_with('{') && cfgid.ends_with('}') {
+            cfgid.to_string()
+        } else {
+            format!("{{{}}}", cfgid)
+        }
+    }
+
+    fn parse_config_string_value(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+    }
+
+    fn parse_list_values(values: Vec<String>) -> serde_json::Value {
+        let items: Vec<serde_json::Value> = values
+            .into_iter()
+            .map(|s| Self::parse_config_string_value(&s))
+            .collect();
+        serde_json::Value::Array(items)
+    }
+
+    fn parse_hash_pairs(pairs: Vec<(String, String)>) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (key, value) in pairs {
+            let json_val = Self::parse_config_string_value(&value);
+            map.insert(key, json_val);
+        }
+        serde_json::Value::Object(map)
+    }
+
+    async fn get_config_json(&self, client: &FredClient, key: &str) -> Option<serde_json::Value> {
+        let type_cmd = CustomCommand::new_static("TYPE", None, false);
+        let type_result: Value = client
+            .custom(type_cmd, vec![Value::from(key.to_string())])
+            .await
+            .unwrap_or(Value::Null);
+        let key_type = type_result.into_string().unwrap_or_default();
+
+        match key_type.as_str() {
+            "string" => {
+                let cmd = CustomCommand::new_static("GET", None, false);
+                let result: Value = client
+                    .custom(cmd, vec![Value::from(key.to_string())])
+                    .await
+                    .unwrap_or(Value::Null);
+                result.into_string().map(|s| Self::parse_config_string_value(&s))
+            }
+            "list" => {
+                let cmd = CustomCommand::new_static("LRANGE", None, false);
+                let result: Value = client
+                    .custom(
+                        cmd,
+                        vec![
+                            Value::from(key.to_string()),
+                            Value::from("0"),
+                            Value::from("-1"),
+                        ],
+                    )
+                    .await
+                    .unwrap_or(Value::Null);
+                if let Value::Array(arr) = result {
+                    let values: Vec<String> = arr.into_iter().filter_map(|v| v.into_string()).collect();
+                    Some(Self::parse_list_values(values))
+                } else {
+                    None
+                }
+            }
+            "hash" => {
+                let cmd = CustomCommand::new_static("HGETALL", None, false);
+                let result: Value = client
+                    .custom(cmd, vec![Value::from(key.to_string())])
+                    .await
+                    .unwrap_or(Value::Null);
+                if let Value::Array(arr) = result {
+                    let mut pairs = Vec::new();
+                    let mut iter = arr.into_iter();
+                    while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                        if let (Some(key_str), Some(val_str)) = (k.into_string(), v.into_string()) {
+                            pairs.push((key_str, val_str));
+                        }
+                    }
+                    Some(Self::parse_hash_pairs(pairs))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                tracing::debug!("Skipping key {} with unsupported type: {}", key, key_type);
+                None
+            }
+        }
+    }
+
+    fn extract_service_url_from_json(&self, value: &serde_json::Value) -> Option<String> {
+        for entry in Self::value_as_array(value) {
+            if let Some(url) = Self::get_json_string_multi(
+                entry,
+                &["serviceurl", "serviceUrl", "service_url", "url"],
+            ) {
+                return Some(url);
+            }
+        }
+        None
+    }
+
+    async fn fetch_app_id(&self, client: &FredClient, cfgid: &str) -> String {
+        let wrapped = Self::wrap_cfgid(cfgid);
+        let main_key = format!("CMC_{}_sg.main", wrapped);
+        let Some(json) = self.get_config_json(client, &main_key).await else {
+            return cfgid.to_string();
+        };
+        if let Some(app_id) = Self::get_json_string_multi(&json, &["appId", "appid", "app_id"]) {
+            return app_id;
+        }
+        cfgid.to_string()
+    }
+
+    async fn fetch_topic_agent_ids(
+        &self,
+        client: &FredClient,
+        cfgid: &str,
+        app_id: &str,
+    ) -> Vec<String> {
+        let wrapped = Self::wrap_cfgid(cfgid);
+        let device_key = format!("CMC_{}_sg.device", wrapped);
+        let Some(json) = self.get_config_json(client, &device_key).await else {
+            return vec![app_id.to_string()];
+        };
+
+        let Some(devices) = json.as_array() else {
+            return vec![app_id.to_string()];
+        };
+
+        let mut agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for device in devices {
+            if let Some(agent_id) = device.get("topicAgentId").and_then(|v| v.as_str()) {
+                if !agent_id.is_empty() {
+                    agent_ids.insert(agent_id.to_string());
+                } else {
+                    agent_ids.insert(app_id.to_string());
+                }
+            } else {
+                agent_ids.insert(app_id.to_string());
+            }
+        }
+
+        if agent_ids.is_empty() {
+            agent_ids.insert(app_id.to_string());
+        }
+
+        let mut ids: Vec<String> = agent_ids.into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    fn build_topic_agents_from_details(
+        &self,
+        agent_ids: &[String],
+        details: &[DetailItem],
+        group_id: i32,
+    ) -> Vec<TopicAgentItem> {
+        let mut topic_agents: Vec<TopicAgentItem> = agent_ids
+            .iter()
+            .cloned()
+            .map(|agent_id| {
+                let topics: Vec<TopicDetail> = details
+                    .iter()
+                    .filter(|d| d.path.contains(&agent_id))
+                    .map(|d| TopicDetail {
+                        index: d.index,
+                        path: d.path.clone(),
+                        visibility: d.visibility,
+                        topic_type: Self::extract_topic_type_for_path(&d.path),
+                    })
+                    .collect();
+
+                TopicAgentItem {
+                    agent_id,
+                    topics,
+                    group_id,
+                }
+            })
+            .collect();
+
+        if topic_agents.iter().all(|ta| ta.topics.is_empty()) && !topic_agents.is_empty() {
+            let all_topics: Vec<TopicDetail> = details
+                .iter()
+                .map(|d| TopicDetail {
+                    index: d.index,
+                    path: d.path.clone(),
+                    visibility: d.visibility,
+                    topic_type: Self::extract_topic_type_for_path(&d.path),
+                })
+                .collect();
+            if let Some(first) = topic_agents.first_mut() {
+                first.topics = all_topics;
+            }
+        }
+
+        topic_agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        topic_agents
+    }
+
+    fn build_output_iothub_topic_agents(
+        &self,
+        config_json: &serde_json::Value,
+        agent_ids: &[String],
+        group_id: i32,
+    ) -> Vec<TopicAgentItem> {
+        if agent_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut topics_by_agent: std::collections::BTreeMap<String, Vec<TopicDetail>> =
+            agent_ids
+                .iter()
+                .map(|id| (id.clone(), Vec::new()))
+                .collect();
+        let mut index_by_agent: std::collections::BTreeMap<String, i32> =
+            agent_ids.iter().map(|id| (id.clone(), 0)).collect();
+
+        for entry in Self::value_as_array(config_json) {
+            let guarantee = Self::get_json_string_array(entry, "guaranteeTopic");
+            let one_data = Self::get_json_string_array(entry, "oneDataTopic");
+            let ten_data = Self::get_json_string_array(entry, "tenDataTopic");
+            let curve_data = Self::get_json_string_array(entry, "curveDataTopic");
+
+            let prop = Self::pick_first_starting_with(&guarantee, "persistent");
+            let fast = Self::pick_first_starting_with(&guarantee, "non-persistent");
+            let one = Self::pick_first_starting_with_and_ends(&one_data, "persistent", "-60")
+                .or_else(|| one_data.first().cloned());
+            let ten = Self::pick_first_starting_with_and_ends(&ten_data, "persistent", "-600")
+                .or_else(|| ten_data.first().cloned());
+            let curve = Self::pick_first_starting_with(&curve_data, "persistent")
+                .or_else(|| curve_data.first().cloned());
+            let event = Self::get_json_string(entry, "topicEvent");
+            let cmd_req = Self::get_json_string(entry, "topicSvrReq");
+            let cmd_resp = Self::get_json_string(entry, "topicSvrResp");
+
+            for agent_id in agent_ids {
+                let idx = index_by_agent
+                    .get_mut(agent_id)
+                    .expect("agent index");
+                let topics = topics_by_agent
+                    .get_mut(agent_id)
+                    .expect("agent topics");
+
+                let mut push_topic = |value: Option<String>| {
+                    if let Some(path) = value.filter(|s| !s.is_empty()) {
+                        let combined = Self::combine_app_id(&path, agent_id);
+                        topics.push(TopicDetail {
+                            index: *idx,
+                            path: combined.clone(),
+                            visibility: true,
+                            topic_type: Self::extract_topic_type_for_path(&combined),
+                        });
+                        *idx += 1;
+                    }
+                };
+
+                push_topic(prop.clone());
+                push_topic(fast.clone());
+                push_topic(one.clone());
+                push_topic(ten.clone());
+                push_topic(curve.clone());
+                push_topic(event.clone());
+
+                if let (Some(resp), Some(req)) = (cmd_resp.clone(), cmd_req.clone()) {
+                    if !resp.is_empty() && !req.is_empty() {
+                        let resp = Self::combine_app_id(&resp, agent_id);
+                        let req = Self::combine_app_id(&req, agent_id);
+                        let path = format!("{},{}", resp, req);
+                        topics.push(TopicDetail {
+                            index: *idx,
+                            path: path.clone(),
+                            visibility: true,
+                            topic_type: Self::extract_topic_type_for_path(&path),
+                        });
+                        *idx += 1;
+                    }
+                }
+            }
+        }
+
+        topics_by_agent
+            .into_iter()
+            .map(|(agent_id, topics)| TopicAgentItem {
+                agent_id,
+                topics,
+                group_id,
+            })
+            .collect()
+    }
+
+    fn build_input_iothub_topic_agents(
+        &self,
+        config_json: &serde_json::Value,
+        agent_ids: &[String],
+        app_id: &str,
+        group_id: i32,
+    ) -> Vec<TopicAgentItem> {
+        let mut topics_by_agent: std::collections::BTreeMap<String, Vec<TopicDetail>> =
+            std::collections::BTreeMap::new();
+        let mut index_by_agent: std::collections::BTreeMap<String, i32> =
+            std::collections::BTreeMap::new();
+
+        let effective_agents: Vec<String> = if agent_ids.is_empty() {
+            vec![app_id.to_string()]
+        } else {
+            agent_ids.to_vec()
+        };
+
+        for agent in &effective_agents {
+            topics_by_agent.insert(agent.clone(), Vec::new());
+            index_by_agent.insert(agent.clone(), 0);
+        }
+
+        for entry in Self::value_as_array(config_json) {
+            let topic_prop = Self::get_json_string(entry, "topicProp");
+            let (prop, fast) = if let Some(prop) = topic_prop {
+                if prop.starts_with("persistent") {
+                    (Some(prop), None)
+                } else if prop.starts_with("non-persistent") {
+                    (None, Some(prop))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            let event = Self::get_json_string(entry, "topicEvent");
+            let cmd_req = Self::get_json_string(entry, "topicSvrReq");
+            let cmd_resp = Self::get_json_string(entry, "topicSvrResp");
+
+            let mut base_topics: Vec<String> = Vec::new();
+            if let Some(prop) = prop {
+                base_topics.push(prop);
+            }
+            if let Some(fast) = fast {
+                base_topics.push(fast);
+            }
+            if let Some(event) = event {
+                base_topics.push(event);
+            }
+            if let (Some(resp), Some(req)) = (cmd_resp, cmd_req) {
+                if !resp.is_empty() && !req.is_empty() {
+                    base_topics.push(format!("{},{}", resp, req));
+                }
+            }
+
+            for topic in base_topics {
+                let mut matched = false;
+                for agent_id in &effective_agents {
+                    if Self::topic_matches_agent(&topic, agent_id) {
+                        let idx = index_by_agent
+                            .get_mut(agent_id)
+                            .expect("agent index");
+                        let list = topics_by_agent
+                            .get_mut(agent_id)
+                            .expect("agent list");
+                        list.push(TopicDetail {
+                            index: *idx,
+                            path: topic.clone(),
+                            visibility: true,
+                            topic_type: Self::extract_topic_type_for_path(&topic),
+                        });
+                        *idx += 1;
+                        matched = true;
+                    }
+                }
+
+                if !matched {
+                    for agent_id in &effective_agents {
+                        let idx = index_by_agent
+                            .get_mut(agent_id)
+                            .expect("agent index");
+                        let list = topics_by_agent
+                            .get_mut(agent_id)
+                            .expect("agent list");
+                        list.push(TopicDetail {
+                            index: *idx,
+                            path: topic.clone(),
+                            visibility: true,
+                            topic_type: Self::extract_topic_type_for_path(&topic),
+                        });
+                        *idx += 1;
+                    }
+                }
+            }
+        }
+
+        topics_by_agent
+            .into_iter()
+            .map(|(agent_id, topics)| TopicAgentItem {
+                agent_id,
+                topics,
+                group_id,
+            })
+            .collect()
+    }
+
+    fn build_io_iothub_topic_agents(
+        &self,
+        config_json: &serde_json::Value,
+        agent_ids: &[String],
+        app_id: &str,
+        group_id: i32,
+    ) -> Vec<TopicAgentItem> {
+        let mut topics_by_agent: std::collections::BTreeMap<String, Vec<TopicDetail>> =
+            std::collections::BTreeMap::new();
+        let mut index_by_agent: std::collections::BTreeMap<String, i32> =
+            std::collections::BTreeMap::new();
+
+        if !app_id.is_empty() {
+            topics_by_agent.entry(app_id.to_string()).or_default();
+            index_by_agent.entry(app_id.to_string()).or_insert(0);
+        }
+        for agent_id in agent_ids {
+            topics_by_agent.entry(agent_id.clone()).or_default();
+            index_by_agent.entry(agent_id.clone()).or_insert(0);
+        }
+
+        for entry in Self::value_as_array(config_json) {
+            let mut topics: Vec<String> = Vec::new();
+            topics.extend(Self::get_json_string_array(entry, "consumer"));
+            topics.extend(Self::get_json_string_array(entry, "producer"));
+
+            for topic in topics {
+                let mut matched = false;
+                for agent_id in agent_ids {
+                    if Self::topic_matches_agent(&topic, agent_id) {
+                        let idx = index_by_agent
+                            .get_mut(agent_id)
+                            .expect("agent index");
+                        let list = topics_by_agent
+                            .get_mut(agent_id)
+                            .expect("agent list");
+                        list.push(TopicDetail {
+                            index: *idx,
+                            path: topic.clone(),
+                            visibility: true,
+                            topic_type: Self::extract_topic_type_for_path(&topic),
+                        });
+                        *idx += 1;
+                        matched = true;
+                    }
+                }
+
+                if !matched {
+                    let target_id = if app_id.is_empty() {
+                        agent_ids.first().cloned()
+                    } else {
+                        Some(app_id.to_string())
+                    };
+                    if let Some(target_id) = target_id {
+                        let idx = index_by_agent
+                            .get_mut(&target_id)
+                            .expect("agent index");
+                        let list = topics_by_agent
+                            .get_mut(&target_id)
+                            .expect("agent list");
+                        list.push(TopicDetail {
+                            index: *idx,
+                            path: topic.clone(),
+                            visibility: true,
+                            topic_type: Self::extract_topic_type_for_path(&topic),
+                        });
+                        *idx += 1;
+                    }
+                }
+            }
+        }
+
+        topics_by_agent
+            .into_iter()
+            .map(|(agent_id, topics)| TopicAgentItem {
+                agent_id,
+                topics,
+                group_id,
+            })
+            .collect()
+    }
+
+    fn combine_app_id(topic: &str, agent_id: &str) -> String {
+        if agent_id.is_empty() {
+            topic.to_string()
+        } else {
+            format!("{topic}-{agent_id}")
+        }
+    }
+
+    fn topic_matches_agent(topic: &str, agent_id: &str) -> bool {
+        let suffix = format!("-{agent_id}");
+        if topic.ends_with(&suffix) {
+            return true;
+        }
+        if topic.contains(',') {
+            return topic
+                .split(',')
+                .any(|part| part.trim_end().ends_with(&suffix));
+        }
+        false
+    }
+
+    fn value_as_array<'a>(value: &'a serde_json::Value) -> Vec<&'a serde_json::Value> {
+        match value {
+            serde_json::Value::Array(arr) => arr.iter().collect(),
+            serde_json::Value::Object(_) => vec![value],
+            _ => Vec::new(),
+        }
+    }
+
+    fn get_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn get_json_string_multi(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        for key in keys {
+            if let Some(val) = Self::get_json_string(value, key) {
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    fn get_json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+        match value.get(key) {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            Some(serde_json::Value::String(s)) => vec![s.to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn pick_first_starting_with(values: &[String], prefix: &str) -> Option<String> {
+        values
+            .iter()
+            .find(|s| s.starts_with(prefix))
+            .cloned()
+    }
+
+    fn pick_first_starting_with_and_ends(
+        values: &[String],
+        prefix: &str,
+        suffix: &str,
+    ) -> Option<String> {
+        values
+            .iter()
+            .find(|s| s.starts_with(prefix) && s.ends_with(suffix))
+            .cloned()
     }
 
     /// Parse config value to extract topic details
@@ -384,6 +915,7 @@ impl RedisRepo {
             if let Some(url) = json.get("url")
                 .or_else(|| json.get("serviceUrl"))
                 .or_else(|| json.get("service_url"))
+                .or_else(|| json.get("serviceurl"))
                 .and_then(|v| v.as_str())
             {
                 return url.to_string();
@@ -420,144 +952,12 @@ impl RedisRepo {
         None
     }
 
-    /// Fetch TopicAgentIds from CMC_{cfgid}_sg.device key
-    async fn fetch_topic_agent_ids_internal(
-        &self,
-        client: &FredClient,
-        cfgid: &str,
-        group_id: i32,
-        details: &[DetailItem],
-    ) -> Vec<TopicAgentItem> {
-        // Build the device key: CMC_{cfgid}_sg.device
-        let device_key = format!("CMC_{{{}}}_sg.device", cfgid);
-        tracing::debug!("Fetching TopicAgentIds from key: {}", device_key);
-
-        // First check the key type
-        let type_cmd = CustomCommand::new_static("TYPE", None, false);
-        let type_result: Value = client
-            .custom(type_cmd, vec![Value::from(device_key.clone())])
-            .await
-            .unwrap_or(Value::Null);
-        let key_type = type_result.into_string().unwrap_or_default();
-
-        let value: Option<String> = match key_type.as_str() {
-            "string" => {
-                let cmd = CustomCommand::new_static("GET", None, false);
-                let result: Value = client
-                    .custom(cmd, vec![Value::from(device_key.clone())])
-                    .await
-                    .unwrap_or(Value::Null);
-                result.into_string()
-            }
-            "list" => {
-                // Handle list type
-                let cmd = CustomCommand::new_static("LRANGE", None, false);
-                let result: Value = client
-                    .custom(cmd, vec![
-                        Value::from(device_key.clone()),
-                        Value::from("0"),
-                        Value::from("-1"),
-                    ])
-                    .await
-                    .unwrap_or(Value::Null);
-                if let Value::Array(arr) = result {
-                    let items: Vec<serde_json::Value> = arr
-                        .into_iter()
-                        .filter_map(|v| v.into_string())
-                        .filter_map(|s| serde_json::from_str(&s).ok())
-                        .collect();
-                    Some(serde_json::to_string(&items).unwrap_or_default())
-                } else {
-                    None
-                }
-            }
-            _ => {
-                tracing::debug!("Device key {} has unsupported type: {}", device_key, key_type);
-                None
-            }
-        };
-
-        // Parse the JSON array to extract topicAgentIds
-        let Some(value) = value else {
-            tracing::debug!("No value found for device key: {}", device_key);
-            return Vec::new();
-        };
-
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&value) else {
-            tracing::debug!("Failed to parse device JSON: {}", value);
-            return Vec::new();
-        };
-
-        let Some(devices_arr) = json.as_array() else {
-            tracing::debug!("Device value is not an array");
-            return Vec::new();
-        };
-
-        // Collect unique TopicAgentIds
-        let mut agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for device in devices_arr {
-            if let Some(agent_id) = device.get("topicAgentId").and_then(|v| v.as_str()) {
-                if !agent_id.is_empty() {
-                    agent_ids.insert(agent_id.to_string());
-                }
-            }
-        }
-
-        tracing::debug!("Found {} unique TopicAgentIds", agent_ids.len());
-
-        // Create TopicAgentItem for each unique agent_id
-        // Associate topics based on the agent_id pattern in the topic path
-        let mut topic_agents: Vec<TopicAgentItem> = agent_ids
-            .into_iter()
-            .map(|agent_id| {
-                // Filter topics that contain this agent_id in their path
-                let topics: Vec<TopicDetail> = details
-                    .iter()
-                    .filter(|d| d.path.contains(&agent_id))
-                    .map(|d| TopicDetail {
-                        index: d.index,
-                        path: d.path.clone(),
-                        visibility: d.visibility,
-                        topic_type: self.extract_topic_type(&d.path),
-                    })
-                    .collect();
-
-                TopicAgentItem {
-                    agent_id,
-                    topics,
-                    group_id,
-                }
-            })
-            .collect();
-
-        // If no topics matched by agent_id, create one TopicAgentItem with all topics
-        // This handles the case where topics don't contain agent_id in their path
-        if topic_agents.iter().all(|ta| ta.topics.is_empty()) && !topic_agents.is_empty() {
-            // Assign all topics to the first agent
-            let all_topics: Vec<TopicDetail> = details
-                .iter()
-                .map(|d| TopicDetail {
-                    index: d.index,
-                    path: d.path.clone(),
-                    visibility: d.visibility,
-                    topic_type: self.extract_topic_type(&d.path),
-                })
-                .collect();
-
-            if let Some(first) = topic_agents.first_mut() {
-                first.topics = all_topics;
-            }
-        }
-
-        // Sort by agent_id for consistent ordering
-        topic_agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
-
-        topic_agents
-    }
-
     /// Extract topic type from path
     fn extract_topic_type(&self, path: &str) -> String {
+        Self::extract_topic_type_for_path(path)
+    }
+
+    fn extract_topic_type_for_path(path: &str) -> String {
         // Common topic type patterns
         if path.contains("/prop/") || path.contains("/properties/") {
             "prop".to_string()
@@ -937,5 +1337,77 @@ impl std::fmt::Debug for RedisRepo {
         f.debug_struct("RedisRepo")
             .field("config", &self.config)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_config_string_value_handles_json_and_plain() {
+        let parsed = RedisRepo::parse_config_string_value("{\"a\":1}");
+        assert!(parsed.is_object());
+
+        let parsed = RedisRepo::parse_config_string_value("plain");
+        assert!(parsed.is_string());
+    }
+
+    #[test]
+    fn parse_list_values_parses_each_item() {
+        let value = RedisRepo::parse_list_values(vec![
+            "{\"a\":1}".to_string(),
+            "plain".to_string(),
+        ]);
+        let arr = value.as_array().expect("array");
+        assert!(arr[0].is_object());
+        assert!(arr[1].is_string());
+    }
+
+    #[test]
+    fn parse_hash_pairs_parses_values() {
+        let value = RedisRepo::parse_hash_pairs(vec![
+            ("a".to_string(), "{\"x\":1}".to_string()),
+            ("b".to_string(), "plain".to_string()),
+        ]);
+        let obj = value.as_object().expect("object");
+        assert!(obj.get("a").unwrap().is_object());
+        assert!(obj.get("b").unwrap().is_string());
+    }
+
+    #[test]
+    fn build_output_iothub_topics_combines_agent_id() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let repo = RedisRepo::new(&RedisConfig::default(), tx).expect("repo");
+
+        let config_json = json!([
+            {
+                "guaranteeTopic": [
+                    "persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee",
+                    "non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee"
+                ],
+                "oneDataTopic": [
+                    "persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-60"
+                ],
+                "tenDataTopic": [
+                    "persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-600"
+                ],
+                "curveDataTopic": [
+                    "persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-WindPower"
+                ],
+                "topicEvent": "persistent://goldwind/iothub/thing_event-BZ",
+                "topicSvrReq": "persistent://goldwind/iothub/thing_service-BZ-REQUEST",
+                "topicSvrResp": "persistent://goldwind/iothub/thing_service-BZ-RESPONSE"
+            }
+        ]);
+
+        let agents = vec!["622".to_string()];
+        let topic_agents = repo.build_output_iothub_topic_agents(&config_json, &agents, 1);
+        assert_eq!(topic_agents.len(), 1);
+        assert!(topic_agents[0].topics.len() >= 6);
+        for topic in &topic_agents[0].topics {
+            assert!(topic.path.contains("-622"));
+        }
     }
 }
