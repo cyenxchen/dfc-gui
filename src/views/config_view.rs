@@ -24,6 +24,8 @@ use serde::Deserialize;
 
 /// Width of the left agent list panel
 const AGENT_LIST_WIDTH: f32 = 320.0;
+/// Height of the top bar for left/right panels (keeps alignment)
+const PANEL_TOPBAR_HEIGHT: f32 = 56.0;
 
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 enum AgentQueryMode {
@@ -656,7 +658,9 @@ impl ConfigView {
             .child(
                 h_flex()
                     .w_full()
+                    .h(px(PANEL_TOPBAR_HEIGHT))
                     .p_2()
+                    .items_center()
                     .border_b_1()
                     .border_color(border_color)
                     .child(keyword_input),
@@ -732,6 +736,16 @@ impl ConfigView {
         v_flex()
             .flex_1()
             .h_full()
+            // Top bar spacer (align with left search bar)
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(PANEL_TOPBAR_HEIGHT))
+                    .bg(secondary_bg)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(div().flex_1()),
+            )
             .child(
                 v_flex()
                     .flex_1()
