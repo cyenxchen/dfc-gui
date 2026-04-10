@@ -90,61 +90,62 @@ impl RedisRepo {
             server.port
         );
 
-        // Build list of (username, password, label) attempts
-        let mut attempts: Vec<(Option<String>, Option<String>, &str)> = Vec::new();
-
-        // 1. Server's own password
-        if let Some(ref pwd) = server.password {
-            if !pwd.is_empty() {
-                attempts.push((None, Some(pwd.clone()), "server password"));
-            }
-        }
-
-        // 2. Each preset credential
-        for cred in preset_credentials {
-            attempts.push((
-                cred.username.clone(),
-                Some(cred.password.clone()),
-                "preset credential",
-            ));
-        }
-
-        // 3. No-auth fallback
-        attempts.push((None, None, "no auth"));
+        // Detect cluster mode once before credential loop
+        let clustered = self.detect_cluster(&server.host, server.port).await;
 
         let mut last_error = None;
 
-        for (username, password, label) in &attempts {
+        // Try server's own password first
+        if let Some(ref pwd) = server.password {
+            if !pwd.is_empty() {
+                match self
+                    .build_and_connect(&server.host, server.port, None, Some(pwd), clustered)
+                    .await
+                {
+                    Ok(client) => {
+                        return self.store_connected_client(client, &server.name, "server password").await;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Auth attempt failed (server password): {}", e);
+                        last_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        // Try each preset credential
+        for cred in preset_credentials {
             match self
-                .try_connect(
+                .build_and_connect(
                     &server.host,
                     server.port,
-                    username.as_deref(),
-                    password.as_deref(),
+                    cred.username.as_deref(),
+                    Some(&cred.password),
+                    clustered,
                 )
                 .await
             {
                 Ok(client) => {
-                    let mut guard = self.client.write().await;
-                    *guard = Some(client);
-
-                    let _ = self.tx.send(ServiceEvent::ConnectionState {
-                        service: "redis".into(),
-                        connected: true,
-                        detail: format!("Connected to {}", server.name).into(),
-                    });
-
-                    tracing::info!(
-                        "Successfully connected to Redis server: {} (via {})",
-                        server.name,
-                        label
-                    );
-                    return Ok(());
+                    return self.store_connected_client(client, &server.name, "preset credential").await;
                 }
                 Err(e) => {
-                    tracing::debug!("Auth attempt failed ({}): {}", label, e);
+                    tracing::debug!("Auth attempt failed (preset credential): {}", e);
                     last_error = Some(e);
                 }
+            }
+        }
+
+        // No-auth fallback
+        match self
+            .build_and_connect(&server.host, server.port, None, None, clustered)
+            .await
+        {
+            Ok(client) => {
+                return self.store_connected_client(client, &server.name, "no auth").await;
+            }
+            Err(e) => {
+                tracing::debug!("Auth attempt failed (no auth): {}", e);
+                last_error = Some(e);
             }
         }
 
@@ -155,35 +156,52 @@ impl RedisRepo {
         Err(err)
     }
 
-    /// Try connecting with specific credentials, auto-detecting cluster mode
-    async fn try_connect(
+    /// Store a successfully connected client and notify
+    async fn store_connected_client(
         &self,
-        host: &str,
-        port: u16,
-        username: Option<&str>,
-        password: Option<&str>,
-    ) -> Result<FredClient> {
-        // Connect in centralized mode first
-        let client = self
-            .build_and_connect(host, port, username, password, false)
-            .await?;
+        client: FredClient,
+        server_name: &str,
+        via: &str,
+    ) -> Result<()> {
+        let mut guard = self.client.write().await;
+        *guard = Some(client);
 
-        // Detect cluster mode via INFO server
+        let _ = self.tx.send(ServiceEvent::ConnectionState {
+            service: "redis".into(),
+            connected: true,
+            detail: format!("Connected to {}", server_name).into(),
+        });
+
+        tracing::info!(
+            "Successfully connected to Redis server: {} (via {})",
+            server_name,
+            via
+        );
+        Ok(())
+    }
+
+    /// Detect whether the Redis server runs in cluster mode
+    async fn detect_cluster(&self, host: &str, port: u16) -> bool {
+        let Ok(client) = self
+            .build_and_connect(host, port, None, None, false)
+            .await
+        else {
+            return false;
+        };
+
         let info_cmd = CustomCommand::new_static("INFO", None, false);
         let info: String = client
             .custom(info_cmd, vec![Value::from("server")])
             .await
             .unwrap_or_default();
 
-        if info.contains("redis_mode:cluster") {
-            tracing::info!("Detected Redis Cluster mode, reconnecting...");
-            let _ = client.quit().await;
-            return self
-                .build_and_connect(host, port, username, password, true)
-                .await;
-        }
+        let _ = client.quit().await;
 
-        Ok(client)
+        let is_cluster = info.contains("redis_mode:cluster");
+        if is_cluster {
+            tracing::info!("Detected Redis Cluster mode");
+        }
+        is_cluster
     }
 
     /// Build a fred client and connect
