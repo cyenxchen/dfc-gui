@@ -21,6 +21,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
@@ -997,15 +998,11 @@ impl ConfigView {
 
         v_flex()
             .flex_1()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
             .h_full()
-            .overflow_hidden()
             // Top bar spacer (align with left search bar)
             .child(
                 h_flex()
                     .w_full()
-                    .flex_none()
                     .h(px(PANEL_TOPBAR_HEIGHT))
                     .items_center()
                     .px_4()
@@ -1028,7 +1025,6 @@ impl ConfigView {
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .child(match (selected_topic_path.as_deref(), is_prop_topic) {
@@ -1040,34 +1036,19 @@ impl ConfigView {
             // Bottom status bar
             .child(
                 h_flex()
-                    .w_full()
-                    .flex_none()
-                    .min_w(px(0.0))
                     .h(px(48.0))
                     .items_center()
                     .px_4()
                     .border_t_1()
                     .border_color(border)
                     .bg(secondary_bg)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .child(if is_prop_topic {
-                                self.render_prop_pagination(cx).into_any_element()
-                            } else {
-                                div()
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .child(
-                                        Label::new(no_topic_selected)
-                                            .text_xs()
-                                            .text_color(muted_fg)
-                                            .text_ellipsis(),
-                                    )
-                                    .into_any_element()
-                            }),
-                    ),
+                    .child(if is_prop_topic {
+                        self.render_prop_pagination(cx).into_any_element()
+                    } else {
+                        Label::new(no_topic_selected)
+                            .text_color(muted_fg)
+                            .into_any_element()
+                    }),
             )
             .into_any_element()
     }
@@ -1176,13 +1157,12 @@ impl ConfigView {
         // Horizontal scroll wrapper
         div()
             .flex_1()
-            .min_w(px(0.0))
             .min_h(px(0.0))
             .p_3()
             .child(
                 div()
                     .w_full()
-                    .flex_1()
+                    .h_full()
                     .min_h(px(0.0))
                     .rounded_md()
                     .border_1()
@@ -1198,13 +1178,12 @@ impl ConfigView {
                                 v_flex()
                                     .min_w(px(1_650.0))
                                     .w(px(1_650.0))
-                                    .flex_1()
+                                    .h_full()
                                     .min_h(px(0.0))
                                     // Header
                                     .child(
                                         h_flex()
                                             .w_full()
-                                            .flex_none()
                                             .bg(header_bg)
                                             .border_b_1()
                                             .border_color(border)
@@ -1225,7 +1204,7 @@ impl ConfigView {
                                             .id("prop-table-y-scroll")
                                             .flex_1()
                                             .min_h(px(0.0))
-                                            .overflow_y_scroll()
+                                            .overflow_y_scrollbar()
                                             .children(rows),
                                     ),
                             ),
@@ -1339,7 +1318,7 @@ impl ConfigView {
         let display_start = if total == 0 { 0 } else { start + 1 };
         let display_end = if total == 0 { 0 } else { end };
 
-        let info = format!("{display_start}-{display_end} / {total} 条");
+        let info = format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total} 条记录");
         let page_label = format!("第 {} / {} 页", page_index + 1, pages);
 
         let current_size = PropPageSize::from_value(page_size);
@@ -1404,48 +1383,43 @@ impl ConfigView {
 
         h_flex()
             .w_full()
-            .min_w(px(0.0))
             .items_center()
-            .gap_4()
-            .child(
-                div()
-                    .flex_none()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        Label::new(info)
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .text_ellipsis(),
-                    ),
-            )
-            .child(div().flex_1().min_w(px(0.0)))
+            .gap_6()
             .child(
                 h_flex()
-                    .flex_none()
-                    .flex_shrink_0()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .items_center()
-                    .gap_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(
+                                Label::new(info)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_ellipsis(),
+                            ),
+                    )
                     .child(
                         h_flex()
-                            .flex_none()
-                            .flex_shrink_0()
                             .items_center()
                             .gap_2()
                             .child(Label::new("每页显示").text_xs().text_color(cx.theme().muted_foreground))
                             .child(dropdown)
                             .child(Label::new("条记录").text_xs().text_color(cx.theme().muted_foreground)),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .flex_shrink_0()
-                            .items_center()
-                            .gap_2()
-                            .child(prev_btn)
-                            .child(Label::new(page_label).text_xs().text_color(cx.theme().muted_foreground))
-                            .child(next_btn),
                     ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(prev_btn)
+                    .child(Label::new(page_label).text_xs().text_color(cx.theme().muted_foreground))
+                    .child(next_btn),
             )
     }
 
@@ -1538,16 +1512,8 @@ impl ConfigView {
         h_flex()
             .size_full()
             .child(self.render_agent_list(window, cx))
-            .child(div().flex_none().w(px(2.0)).h_full().bg(cx.theme().border))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    .h_full()
-                    .overflow_hidden()
-                    .child(self.render_agent_topics(window, cx)),
-            )
+            .child(div().w(px(2.0)).h_full().bg(cx.theme().border))
+            .child(self.render_agent_topics(window, cx))
     }
 
     /// Render topic tabs view
