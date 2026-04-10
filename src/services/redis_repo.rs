@@ -4,8 +4,8 @@
 //! stored in Redis. Handles one-time queries and caching.
 
 use crate::connection::{
-    ConfigItem, DetailItem, DfcServerConfig, REDIS_KEY_PATTERNS, RedisKeyItem, RedisKeyType,
-    RedisKeyValue, TopicAgentItem, TopicDetail,
+    ConfigItem, DetailItem, DfcServerConfig, PresetCredential, REDIS_KEY_PATTERNS, RedisKeyItem,
+    RedisKeyType, RedisKeyValue, TopicAgentItem, TopicDetail,
 };
 use crate::error::{Error, Result};
 use crate::services::events::{DeviceId, DeviceMeta};
@@ -77,8 +77,12 @@ impl RedisRepo {
         Ok(())
     }
 
-    /// Connect to a specific server configuration
-    pub async fn connect_to_server(&self, server: &DfcServerConfig) -> Result<()> {
+    /// Connect to a specific server configuration, trying preset credentials if needed
+    pub async fn connect_to_server(
+        &self,
+        server: &DfcServerConfig,
+        preset_credentials: &[PresetCredential],
+    ) -> Result<()> {
         tracing::info!(
             "Connecting to Redis server: {} ({}:{})",
             server.name,
@@ -86,19 +90,151 @@ impl RedisRepo {
             server.port
         );
 
-        // Build Redis config
-        let mut redis_config = FredConfig::default();
-        redis_config.server = ServerConfig::Centralized {
-            server: fred::prelude::Server::new(server.host.clone(), server.port),
-        };
+        // Detect cluster mode once before credential loop
+        let clustered = self.detect_cluster(&server.host, server.port).await;
 
-        if let Some(ref password) = server.password {
-            if !password.is_empty() {
-                redis_config.password = Some(password.clone());
+        let mut last_error = None;
+
+        // Try server's own password first
+        if let Some(ref pwd) = server.password {
+            if !pwd.is_empty() {
+                match self
+                    .build_and_connect(&server.host, server.port, None, Some(pwd), clustered)
+                    .await
+                {
+                    Ok(client) => {
+                        return self.store_connected_client(client, &server.name, "server password").await;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Auth attempt failed (server password): {}", e);
+                        last_error = Some(e);
+                    }
+                }
             }
         }
 
-        // Create client with connection config
+        // Try each preset credential
+        for cred in preset_credentials {
+            match self
+                .build_and_connect(
+                    &server.host,
+                    server.port,
+                    cred.username.as_deref(),
+                    Some(&cred.password),
+                    clustered,
+                )
+                .await
+            {
+                Ok(client) => {
+                    return self.store_connected_client(client, &server.name, "preset credential").await;
+                }
+                Err(e) => {
+                    tracing::debug!("Auth attempt failed (preset credential): {}", e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // No-auth fallback
+        match self
+            .build_and_connect(&server.host, server.port, None, None, clustered)
+            .await
+        {
+            Ok(client) => {
+                return self.store_connected_client(client, &server.name, "no auth").await;
+            }
+            Err(e) => {
+                tracing::debug!("Auth attempt failed (no auth): {}", e);
+                last_error = Some(e);
+            }
+        }
+
+        let err = last_error.unwrap_or_else(|| Error::Connection {
+            message: format!("Failed to connect to {}", server.display_name()),
+        });
+        tracing::error!("Failed to connect to Redis: {}", err);
+        Err(err)
+    }
+
+    /// Store a successfully connected client and notify
+    async fn store_connected_client(
+        &self,
+        client: FredClient,
+        server_name: &str,
+        via: &str,
+    ) -> Result<()> {
+        let mut guard = self.client.write().await;
+        *guard = Some(client);
+
+        let _ = self.tx.send(ServiceEvent::ConnectionState {
+            service: "redis".into(),
+            connected: true,
+            detail: format!("Connected to {}", server_name).into(),
+        });
+
+        tracing::info!(
+            "Successfully connected to Redis server: {} (via {})",
+            server_name,
+            via
+        );
+        Ok(())
+    }
+
+    /// Detect whether the Redis server runs in cluster mode
+    async fn detect_cluster(&self, host: &str, port: u16) -> bool {
+        let Ok(client) = self
+            .build_and_connect(host, port, None, None, false)
+            .await
+        else {
+            return false;
+        };
+
+        let info_cmd = CustomCommand::new_static("INFO", None, false);
+        let info: String = client
+            .custom(info_cmd, vec![Value::from("server")])
+            .await
+            .unwrap_or_default();
+
+        let _ = client.quit().await;
+
+        let is_cluster = info.contains("redis_mode:cluster");
+        if is_cluster {
+            tracing::info!("Detected Redis Cluster mode");
+        }
+        is_cluster
+    }
+
+    /// Build a fred client and connect
+    async fn build_and_connect(
+        &self,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+        clustered: bool,
+    ) -> Result<FredClient> {
+        let server = fred::prelude::Server::new(host.to_string(), port);
+        let mut redis_config = FredConfig::default();
+        redis_config.server = if clustered {
+            ServerConfig::Clustered {
+                hosts: vec![server],
+                policy: fred::types::config::ClusterDiscoveryPolicy::ConfigEndpoint,
+            }
+        } else {
+            ServerConfig::Centralized { server }
+        };
+
+        if let Some(pwd) = password {
+            if !pwd.is_empty() {
+                redis_config.password = Some(pwd.to_string());
+            }
+        }
+        if let Some(user) = username {
+            if !user.is_empty() {
+                redis_config.username = Some(user.to_string());
+            }
+        }
+
         let client = Builder::from_config(redis_config)
             .with_connection_config(|config| {
                 config.connection_timeout = Duration::from_secs(10);
@@ -108,32 +244,16 @@ impl RedisRepo {
                 message: e.to_string(),
             })?;
 
-        // Enter tokio runtime context for fred client
-        // Fred internally uses tokio::task::spawn which requires a tokio runtime
         let _guard = super::runtime_handle().enter();
-
-        // Connect
         client.connect();
-        client.wait_for_connect().await.map_err(|e| {
-            tracing::error!("Failed to connect to Redis: {}", e);
-            Error::Connection {
+        client
+            .wait_for_connect()
+            .await
+            .map_err(|e| Error::Connection {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
-        // Store client
-        let mut guard = self.client.write().await;
-        *guard = Some(client);
-
-        // Notify connection state
-        let _ = self.tx.send(ServiceEvent::ConnectionState {
-            service: "redis".into(),
-            connected: true,
-            detail: format!("Connected to {}", server.name).into(),
-        });
-
-        tracing::info!("Successfully connected to Redis server: {}", server.name);
-        Ok(())
+        Ok(client)
     }
 
     /// Disconnect from current server

@@ -576,6 +576,7 @@ impl DfcContent {
         let Some(server) = self.app_state.read(cx).server(server_id).cloned() else {
             return;
         };
+        let credentials = self.app_state.read(cx).preset_credentials();
 
         let server_id = server_id.to_string();
 
@@ -609,7 +610,7 @@ impl DfcContent {
             let redis = store.services().redis();
             let cfgid = server.cfgid.as_deref();
 
-            if let Err(e) = redis.connect_to_server(&server).await {
+            if let Err(e) = redis.connect_to_server(&server, &credentials).await {
                 tracing::error!("Failed to connect to Redis: {}", e);
                 let _ = config_state.update(cx, |state, cx| {
                     state.set_error(e.to_string(), cx);
