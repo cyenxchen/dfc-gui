@@ -41,6 +41,7 @@ font_size_medium = "Medium (Default)"
 font_size_small = "Small"
 about = "About"
 search = "Search"
+reconnect = "Reconnect"
 
 [devices]
 title = "Device Fleet"

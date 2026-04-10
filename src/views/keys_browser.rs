@@ -29,11 +29,7 @@ pub struct KeysBrowserView {
 
 impl KeysBrowserView {
     /// Create a new keys browser view
-    pub fn new(
-        keys_state: Entity<KeysState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(keys_state: Entity<KeysState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = Vec::new();
 
         // Subscribe to keys state changes
@@ -74,7 +70,11 @@ impl KeysBrowserView {
     }
 
     /// Render type badge with color
-    fn render_type_badge(&self, key_type: RedisKeyType, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_type_badge(
+        &self,
+        key_type: RedisKeyType,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (bg_color, text_color) = match key_type {
             RedisKeyType::String => (cx.theme().success.opacity(0.2), cx.theme().success),
             RedisKeyType::Hash => (cx.theme().warning.opacity(0.2), cx.theme().warning),
@@ -85,16 +85,11 @@ impl KeysBrowserView {
             RedisKeyType::Unknown => (cx.theme().muted.opacity(0.2), cx.theme().muted_foreground),
         };
 
-        div()
-            .px_1()
-            .py_px()
-            .rounded_sm()
-            .bg(bg_color)
-            .child(
-                Label::new(key_type.short_name())
-                    .text_xs()
-                    .text_color(text_color),
-            )
+        div().px_1().py_px().rounded_sm().bg(bg_color).child(
+            Label::new(key_type.short_name())
+                .text_xs()
+                .text_color(text_color),
+        )
     }
 
     /// Render a single key item
@@ -170,10 +165,7 @@ impl KeysBrowserView {
                         Err(e) => {
                             tracing::error!("Failed to get key value: {}", e);
                             let _ = keys_state.update(cx, |state, cx| {
-                                state.set_selected_value(
-                                    RedisKeyValue::Error(e.to_string()),
-                                    cx,
-                                );
+                                state.set_selected_value(RedisKeyValue::Error(e.to_string()), cx);
                             });
                         }
                     }
@@ -260,55 +252,52 @@ impl KeysBrowserView {
                     .when(has_more && !is_loading, |this| {
                         let load_more_label = t!("keys.load_more", locale = &locale).to_string();
                         this.child(
-                            div()
-                                .w_full()
-                                .p_2()
-                                .child(
-                                    Button::new("load-more-btn")
-                                        .ghost()
-                                        .w_full()
-                                        .label(load_more_label)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            let cursor = this.keys_state.read(cx).scan_cursor();
-                                            let store = cx.global::<DfcGlobalStore>().clone();
-                                            let keys_state = this.keys_state.clone();
+                            div().w_full().p_2().child(
+                                Button::new("load-more-btn")
+                                    .ghost()
+                                    .w_full()
+                                    .label(load_more_label)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let cursor = this.keys_state.read(cx).scan_cursor();
+                                        let store = cx.global::<DfcGlobalStore>().clone();
+                                        let keys_state = this.keys_state.clone();
 
-                                            cx.spawn(async move |_, cx| {
-                                                let redis = store.services().redis();
-                                                match redis.scan_keys("*", cursor, 100).await {
-                                                    Ok((keys, next_cursor)) => {
-                                                        let _ = keys_state.update(cx, |state, cx| {
-                                                            state.append_keys(keys, next_cursor, cx);
-                                                        });
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!("Failed to load more keys: {}", e);
-                                                    }
+                                        cx.spawn(async move |_, cx| {
+                                            let redis = store.services().redis();
+                                            match redis.scan_keys("*", cursor, 100).await {
+                                                Ok((keys, next_cursor)) => {
+                                                    let _ = keys_state.update(cx, |state, cx| {
+                                                        state.append_keys(keys, next_cursor, cx);
+                                                    });
                                                 }
-                                            })
-                                            .detach();
-                                        })),
-                                ),
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to load more keys: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        })
+                                        .detach();
+                                    })),
+                            ),
                         )
                     })
                     // Loading indicator
                     .when(is_loading, |this| {
                         let loading_label = t!("keys.loading", locale = &locale).to_string();
                         this.child(
-                            div()
-                                .w_full()
-                                .p_4()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .justify_center()
-                                        .child(Icon::new(IconName::Loader).size_4())
-                                        .child(
-                                            Label::new(loading_label)
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground),
-                                        ),
-                                ),
+                            div().w_full().p_4().child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_center()
+                                    .child(Icon::new(IconName::Loader).size_4())
+                                    .child(
+                                        Label::new(loading_label)
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
+                            ),
                         )
                     }),
             )
@@ -337,7 +326,11 @@ impl KeysBrowserView {
     }
 
     /// Render hash value
-    fn render_hash_value(&self, pairs: &[(String, String)], cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_hash_value(
+        &self,
+        pairs: &[(String, String)],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let locale = self.locale(cx);
         let field_label = t!("keys.field", locale = &locale).to_string();
         let value_label = t!("keys.value", locale = &locale).to_string();
@@ -372,22 +365,14 @@ impl KeysBrowserView {
                             .py_1()
                             .border_r_1()
                             .border_color(border_color)
-                            .child(
-                                Label::new(field.clone())
-                                    .text_sm()
-                                    .text_ellipsis(),
-                            ),
+                            .child(Label::new(field.clone()).text_sm().text_ellipsis()),
                     )
                     .child(
                         div()
                             .flex_1()
                             .px_2()
                             .py_1()
-                            .child(
-                                Label::new(value.clone())
-                                    .text_sm()
-                                    .text_ellipsis(),
-                            ),
+                            .child(Label::new(value.clone()).text_sm().text_ellipsis()),
                     ),
             );
         }
@@ -427,15 +412,11 @@ impl KeysBrowserView {
                                     ),
                             )
                             .child(
-                                div()
-                                    .flex_1()
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        Label::new(value_label)
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground),
-                                    ),
+                                div().flex_1().px_2().py_1().child(
+                                    Label::new(value_label)
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
                             ),
                     )
                     // Table body
@@ -454,7 +435,8 @@ impl KeysBrowserView {
         let locale = self.locale(cx);
         let index_label = t!("keys.index", locale = &locale).to_string();
         let value_label = t!("keys.value", locale = &locale).to_string();
-        let count_label = t!("keys.list_elements", count = items.len(), locale = &locale).to_string();
+        let count_label =
+            t!("keys.list_elements", count = items.len(), locale = &locale).to_string();
 
         let header_bg = cx.theme().secondary;
         let border_color = cx.theme().border;
@@ -496,11 +478,7 @@ impl KeysBrowserView {
                             .flex_1()
                             .px_2()
                             .py_1()
-                            .child(
-                                Label::new(value.clone())
-                                    .text_sm()
-                                    .text_ellipsis(),
-                            ),
+                            .child(Label::new(value.clone()).text_sm().text_ellipsis()),
                     ),
             );
         }
@@ -540,15 +518,11 @@ impl KeysBrowserView {
                                     ),
                             )
                             .child(
-                                div()
-                                    .flex_1()
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        Label::new(value_label)
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground),
-                                    ),
+                                div().flex_1().px_2().py_1().child(
+                                    Label::new(value_label)
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
                             ),
                     )
                     // Table body
@@ -566,7 +540,8 @@ impl KeysBrowserView {
     fn render_set_value(&self, members: &[String], cx: &mut Context<Self>) -> impl IntoElement {
         let locale = self.locale(cx);
         let member_label = t!("keys.member", locale = &locale).to_string();
-        let count_label = t!("keys.set_members", count = members.len(), locale = &locale).to_string();
+        let count_label =
+            t!("keys.set_members", count = members.len(), locale = &locale).to_string();
 
         let header_bg = cx.theme().secondary;
         let border_color = cx.theme().border;
@@ -592,11 +567,7 @@ impl KeysBrowserView {
                     .py_1()
                     .border_b_1()
                     .border_color(border_color)
-                    .child(
-                        Label::new(member.clone())
-                            .text_sm()
-                            .text_ellipsis(),
-                    ),
+                    .child(Label::new(member.clone()).text_sm().text_ellipsis()),
             );
         }
 
@@ -641,11 +612,16 @@ impl KeysBrowserView {
     }
 
     /// Render sorted set value
-    fn render_zset_value(&self, members: &[(String, f64)], cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_zset_value(
+        &self,
+        members: &[(String, f64)],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let locale = self.locale(cx);
         let member_label = t!("keys.member", locale = &locale).to_string();
         let score_label = t!("keys.score", locale = &locale).to_string();
-        let count_label = t!("keys.zset_members", count = members.len(), locale = &locale).to_string();
+        let count_label =
+            t!("keys.zset_members", count = members.len(), locale = &locale).to_string();
 
         let header_bg = cx.theme().secondary;
         let border_color = cx.theme().border;
@@ -687,11 +663,7 @@ impl KeysBrowserView {
                             .flex_1()
                             .px_2()
                             .py_1()
-                            .child(
-                                Label::new(member.clone())
-                                    .text_sm()
-                                    .text_ellipsis(),
-                            ),
+                            .child(Label::new(member.clone()).text_sm().text_ellipsis()),
                     ),
             );
         }
@@ -731,15 +703,11 @@ impl KeysBrowserView {
                                     ),
                             )
                             .child(
-                                div()
-                                    .flex_1()
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        Label::new(member_label)
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground),
-                                    ),
+                                div().flex_1().px_2().py_1().child(
+                                    Label::new(member_label)
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
                             ),
                     )
                     // Table body
@@ -761,9 +729,9 @@ impl KeysBrowserView {
         let selected_value = keys_state.selected_value().clone();
 
         // Find the key item for type and TTL info
-        let key_item = selected_key.as_ref().and_then(|key| {
-            keys_state.keys().iter().find(|k| &k.key == key).cloned()
-        });
+        let key_item = selected_key
+            .as_ref()
+            .and_then(|key| keys_state.keys().iter().find(|k| &k.key == key).cloned());
 
         let content = match (&selected_key, &selected_value) {
             (None, _) => {
@@ -773,10 +741,7 @@ impl KeysBrowserView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        Label::new(select_key_label)
-                            .text_color(cx.theme().muted_foreground),
-                    )
+                    .child(Label::new(select_key_label).text_color(cx.theme().muted_foreground))
                     .into_any_element()
             }
             (Some(_), RedisKeyValue::Loading) => {
@@ -791,8 +756,7 @@ impl KeysBrowserView {
                             .gap_2()
                             .child(Icon::new(IconName::Loader).size_4())
                             .child(
-                                Label::new(loading_label)
-                                    .text_color(cx.theme().muted_foreground),
+                                Label::new(loading_label).text_color(cx.theme().muted_foreground),
                             ),
                     )
                     .into_any_element()
@@ -816,10 +780,7 @@ impl KeysBrowserView {
                                             .size_5()
                                             .text_color(cx.theme().danger),
                                     )
-                                    .child(
-                                        Label::new(error_label)
-                                            .text_color(cx.theme().danger),
-                                    ),
+                                    .child(Label::new(error_label).text_color(cx.theme().danger)),
                             )
                             .child(
                                 Label::new(err.clone())
@@ -851,10 +812,7 @@ impl KeysBrowserView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        Label::new(select_key_label)
-                            .text_color(cx.theme().muted_foreground),
-                    )
+                    .child(Label::new(select_key_label).text_color(cx.theme().muted_foreground))
                     .into_any_element()
             }
         };
@@ -886,11 +844,7 @@ impl KeysBrowserView {
                         .child(
                             h_flex()
                                 .gap_2()
-                                .child(
-                                    Label::new(key_label.clone())
-                                        .text_sm()
-                                        .text_color(muted_fg),
-                                )
+                                .child(Label::new(key_label.clone()).text_sm().text_color(muted_fg))
                                 .child(Label::new(item.key.clone()).text_sm()),
                         )
                         .child(
@@ -915,9 +869,7 @@ impl KeysBrowserView {
                                                 .text_color(muted_fg),
                                         )
                                         .child(
-                                            Label::new(ttl_display)
-                                                .text_xs()
-                                                .text_color(muted_fg),
+                                            Label::new(ttl_display).text_xs().text_color(muted_fg),
                                         ),
                                 ),
                         ),
@@ -985,14 +937,11 @@ impl KeysBrowserView {
 
 impl Render for KeysBrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .child(self.render_header(cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .child(self.render_keys_list(window, cx))
-                    .child(self.render_value_panel(window, cx)),
-            )
+        v_flex().size_full().child(self.render_header(cx)).child(
+            h_flex()
+                .flex_1()
+                .child(self.render_keys_list(window, cx))
+                .child(self.render_value_panel(window, cx)),
+        )
     }
 }

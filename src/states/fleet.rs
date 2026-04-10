@@ -173,7 +173,8 @@ impl FleetState {
                 if let Some(state) = self.devices.get_mut(&id) {
                     state.meta = meta;
                 } else {
-                    self.devices.insert(id.clone(), DeviceRuntimeState::from_meta(meta));
+                    self.devices
+                        .insert(id.clone(), DeviceRuntimeState::from_meta(meta));
                     self.order.push(id);
                 }
             }
@@ -186,7 +187,11 @@ impl FleetState {
                 }
             }
 
-            ServiceEvent::Telemetry { device, ts_ms, points } => {
+            ServiceEvent::Telemetry {
+                device,
+                ts_ms,
+                points,
+            } => {
                 if let Some(state) = self.devices.get_mut(&device) {
                     state.last_seen_ts_ms = Some(ts_ms);
                     for point in points {
@@ -195,7 +200,13 @@ impl FleetState {
                 }
             }
 
-            ServiceEvent::Alarm { device, ts_ms, code, message, severity } => {
+            ServiceEvent::Alarm {
+                device,
+                ts_ms,
+                code,
+                message,
+                severity,
+            } => {
                 if let Some(state) = self.devices.get_mut(&device) {
                     state.alarms.push(DeviceAlarm {
                         ts_ms,
@@ -206,18 +217,31 @@ impl FleetState {
                 }
                 // Emit UI event for high severity alarms
                 if severity >= AlarmSeverity::Error {
-                    cx.emit(UIEvent::AlarmReceived { device, code, severity });
+                    cx.emit(UIEvent::AlarmReceived {
+                        device,
+                        code,
+                        severity,
+                    });
                 }
             }
 
-            ServiceEvent::DeviceOnlineChanged { device, online, ts_ms } => {
+            ServiceEvent::DeviceOnlineChanged {
+                device,
+                online,
+                ts_ms,
+            } => {
                 if let Some(state) = self.devices.get_mut(&device) {
                     state.online = online;
                     state.last_seen_ts_ms = Some(ts_ms);
                 }
             }
 
-            ServiceEvent::CommandAck { correlation_id, success, payload, error } => {
+            ServiceEvent::CommandAck {
+                correlation_id,
+                success,
+                payload,
+                error,
+            } => {
                 if let Some(cmd) = self.pending_commands.get_mut(&correlation_id) {
                     cmd.status = if success {
                         CommandStatus::Success
@@ -229,7 +253,11 @@ impl FleetState {
                     let message = if success {
                         format!("Command {} succeeded", cmd.method)
                     } else {
-                        format!("Command {} failed: {}", cmd.method, error.as_deref().unwrap_or("Unknown error"))
+                        format!(
+                            "Command {} failed: {}",
+                            cmd.method,
+                            error.as_deref().unwrap_or("Unknown error")
+                        )
                     };
 
                     cx.emit(UIEvent::Toast {
@@ -239,7 +267,11 @@ impl FleetState {
                 }
             }
 
-            ServiceEvent::ConnectionState { service, connected, detail } => {
+            ServiceEvent::ConnectionState {
+                service,
+                connected,
+                detail,
+            } => {
                 cx.emit(UIEvent::ConnectionStateChanged {
                     service,
                     connected,
@@ -372,7 +404,8 @@ impl FleetState {
 
         for meta in metas {
             let id = meta.id.clone();
-            self.devices.insert(id.clone(), DeviceRuntimeState::from_meta(meta));
+            self.devices
+                .insert(id.clone(), DeviceRuntimeState::from_meta(meta));
             self.order.push(id);
         }
 

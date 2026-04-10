@@ -4,12 +4,16 @@
 
 use crate::assets::CustomIconName;
 use crate::constants::SIDEBAR_WIDTH;
-use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState, Route, i18n_sidebar};
-use gpui::{Context, Entity, Subscription, Window, div, prelude::*, px};
+use crate::helpers::ServerAction;
+use crate::states::{
+    ConfigState, DfcAppState, DfcGlobalStore, KeysState, Route, i18n_common, i18n_sidebar,
+};
+use gpui::{AnyElement, Context, Entity, Subscription, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants},
     label::Label,
+    menu::{ContextMenuExt, PopupMenuItem},
     tooltip::Tooltip,
     v_flex,
 };
@@ -128,38 +132,91 @@ impl DfcSidebar {
             .child(btn)
     }
 
-    fn render_connected_config_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let connected_server_id = self.config_state.read(cx).connected_server_id();
-        let selected_server_id = self.app_state.read(cx).selected_server_id();
-        let server_id = connected_server_id.or(selected_server_id).map(|id| id.to_string());
+    /// Render all connected config server tabs
+    fn render_connected_config_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let server_ids: Vec<String> = self.config_state.read(cx).connected_server_ids().to_vec();
 
-        let Some(server_id) = server_id else {
+        if server_ids.is_empty() {
             return div().into_any_element();
-        };
+        }
 
-        let server = self.app_state.read(cx).server(&server_id).cloned();
-        let server_name = server
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| server_id.clone());
+        let app = self.app_state.read(cx);
+        let selected_server_id = app.selected_server_id().map(|s| s.to_string());
+        let servers_data: Vec<_> = server_ids
+            .iter()
+            .enumerate()
+            .map(|(index, server_id)| {
+                let server_name = app
+                    .server(server_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| server_id.clone());
+                let is_active = selected_server_id.as_deref() == Some(server_id.as_str());
+                (index, server_id.clone(), server_name, is_active)
+            })
+            .collect();
 
-        let is_active = self
-            .app_state
-            .read(cx)
-            .selected_server_id()
-            .is_some_and(|id| id == server_id);
+        let mut items: Vec<AnyElement> = Vec::new();
+        for (index, server_id, server_name, is_active) in servers_data {
+            let store_for_click = cx.global::<DfcGlobalStore>().clone();
+            let server_id_for_click = server_id.clone();
+            let config_state = self.config_state.clone();
+            let app_state = self.app_state.clone();
+            let server_id_for_close = server_id.clone();
 
-        let tooltip_label = server_name.clone();
+            items.push(self.render_server_tab(
+                ("config-tab", index),
+                ("config-tab-wrapper", index),
+                server_id,
+                server_name,
+                is_active,
+                move |_, window, cx| {
+                    store_for_click.set_pending_server(server_id_for_click.clone());
+                    window.dispatch_action(Box::new(ServerAction::Reconnect), cx);
+                },
+                move |_, _, cx| {
+                    config_state.update(cx, |state, cx| {
+                        state.remove_connected_server(&server_id_for_close, cx);
+                    });
+                    app_state.update(cx, |state, cx| {
+                        if state.selected_server_id() == Some(server_id_for_close.as_str()) {
+                            state.select_server(None, cx);
+                        }
+                    });
+                },
+                cx,
+            ));
+        }
+
+        v_flex().children(items).into_any_element()
+    }
+
+    /// Render a server tab with icon, label, active styling, and context menu.
+    /// Shared between config tabs and keys browser tabs.
+    fn render_server_tab(
+        &self,
+        btn_id: impl Into<gpui::ElementId>,
+        wrapper_id: impl Into<gpui::ElementId>,
+        server_id: String,
+        server_name: String,
+        is_active: bool,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+        on_close: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let list_active = cx.theme().list_active;
         let list_active_border = cx.theme().list_active_border;
-        let config_state = self.config_state.clone();
-        let app_state = self.app_state.clone();
-        let server_id_for_click = server_id.clone();
+        let store = cx.global::<DfcGlobalStore>().clone();
+        let server_id_for_edit = server_id.clone();
+        let server_id_for_reconnect = server_id;
+        let edit_label = i18n_common(cx, "edit");
+        let reconnect_label = i18n_sidebar(cx, "reconnect");
+        let close_label = i18n_common(cx, "close");
 
-        let btn = Button::new("connected-config-tab")
+        let btn = Button::new(btn_id)
             .ghost()
             .w_full()
             .h(px(56.0))
+            .tooltip(server_name.clone())
             .child(
                 v_flex()
                     .items_center()
@@ -173,33 +230,49 @@ impl DfcSidebar {
                             .max_w(px(70.0)),
                     ),
             )
-            .on_click(move |_, _, cx| {
-                config_state.update(cx, |state, cx| {
-                    state.set_connected_server(Some(server_id_for_click.clone()), cx);
-                });
-                app_state.update(cx, |state, cx| {
-                    state.select_server(Some(server_id_for_click.clone()), cx);
-                });
-                cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
-                    store.update(cx, |state, cx| {
-                        state.go_to(Route::Home, cx);
-                    });
-                });
-            });
+            .on_click(on_click);
 
         div()
-            .id("connected-config-tab-wrapper")
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .id(wrapper_id)
             .when(is_active, |this| {
                 this.bg(list_active)
                     .border_r_2()
                     .border_color(list_active_border)
             })
             .child(btn)
+            .context_menu(move |menu, _, _| {
+                let store_for_edit = store.clone();
+                let store_for_reconnect = store.clone();
+                let sid_edit = server_id_for_edit.clone();
+                let sid_reconnect = server_id_for_reconnect.clone();
+                let on_close = on_close.clone();
+
+                menu.item(
+                    PopupMenuItem::new(edit_label.clone())
+                        .icon(Icon::from(CustomIconName::FilePenLine))
+                        .on_click(move |_, window, cx| {
+                            store_for_edit.set_pending_server(sid_edit.clone());
+                            window.dispatch_action(Box::new(ServerAction::Edit), cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(reconnect_label.clone())
+                        .icon(Icon::new(IconName::Redo2))
+                        .on_click(move |_, window, cx| {
+                            store_for_reconnect.set_pending_server(sid_reconnect.clone());
+                            window.dispatch_action(Box::new(ServerAction::Reconnect), cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(close_label.clone())
+                        .icon(Icon::new(IconName::Close))
+                        .on_click(on_close),
+                )
+            })
             .into_any_element()
     }
 
-    /// Render a connected server item
+    /// Render a connected server item (keys browser)
     fn render_server_item(
         &self,
         index: usize,
@@ -207,52 +280,36 @@ impl DfcSidebar {
         server_name: String,
         is_active: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let list_active = cx.theme().list_active;
-        let list_active_border = cx.theme().list_active_border;
-        let keys_state = self.keys_state.clone();
+    ) -> AnyElement {
+        let keys_state_for_click = self.keys_state.clone();
+        let keys_state_for_close = self.keys_state.clone();
         let server_id_for_click = server_id.clone();
-        let server_name_for_tooltip = server_name.clone();
+        let server_id_for_close = server_id.clone();
 
-        let btn = Button::new(("server-nav", index))
-            .ghost()
-            .w_full()
-            .h(px(56.0))
-            .child(
-                v_flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .child(Icon::from(CustomIconName::DatabaseZap))
-                    .child(
-                        Label::new(server_name.clone())
-                            .text_xs()
-                            .text_ellipsis()
-                            .max_w(px(70.0)),
-                    ),
-            )
-            .on_click(move |_, _, cx| {
+        self.render_server_tab(
+            ("server-nav", index),
+            ("server-item", index),
+            server_id,
+            server_name,
+            is_active,
+            move |_, _, cx| {
                 let server_id = server_id_for_click.clone();
-                keys_state.update(cx, |state, cx| {
+                keys_state_for_click.update(cx, |state, cx| {
                     state.set_active_server(Some(server_id), cx);
                 });
-                // Navigate to home to show keys browser
                 cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
                     store.update(cx, |state, cx| {
                         state.go_to(Route::Home, cx);
                     });
                 });
-            });
-
-        div()
-            .id(("server-item", index))
-            .tooltip(move |window, cx| Tooltip::new(server_name_for_tooltip.clone()).build(window, cx))
-            .when(is_active, |this| {
-                this.bg(list_active)
-                    .border_r_2()
-                    .border_color(list_active_border)
-            })
-            .child(btn)
+            },
+            move |_, _, cx| {
+                keys_state_for_close.update(cx, |state, cx| {
+                    state.remove_connected_server(&server_id_for_close, cx);
+                });
+            },
+            cx,
+        )
     }
 
     /// Render connected servers section
@@ -271,13 +328,18 @@ impl DfcSidebar {
             .enumerate()
             .map(|(index, server)| {
                 let is_active = active_server_id == Some(&server.server_id);
-                (index, server.server_id.clone(), server.server_name.clone(), is_active)
+                (
+                    index,
+                    server.server_id.clone(),
+                    server.server_name.clone(),
+                    is_active,
+                )
             })
             .collect();
 
         let border_color = cx.theme().border;
 
-        let mut items = Vec::new();
+        let mut items: Vec<AnyElement> = Vec::new();
         for (index, server_id, server_name, is_active) in servers_data {
             items.push(self.render_server_item(index, server_id, server_name, is_active, cx));
         }
@@ -351,8 +413,14 @@ impl Render for DfcSidebar {
                 v_flex()
                     .flex_1()
                     .pt_2()
-                    .child(self.render_nav_button("home", Route::Home, IconName::LayoutDashboard, "home", cx))
-                    .child(self.render_connected_config_tab(cx))
+                    .child(self.render_nav_button(
+                        "home",
+                        Route::Home,
+                        IconName::LayoutDashboard,
+                        "home",
+                        cx,
+                    ))
+                    .child(self.render_connected_config_tabs(cx))
                     // Connected servers
                     .child(self.render_connected_servers(cx)),
             )

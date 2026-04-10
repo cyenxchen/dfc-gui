@@ -128,9 +128,9 @@ impl KeysState {
 
     /// Get the active connected server info
     pub fn active_server(&self) -> Option<&ConnectedServerInfo> {
-        self.active_server_id.as_ref().and_then(|id| {
-            self.connected_servers.iter().find(|s| &s.server_id == id)
-        })
+        self.active_server_id
+            .as_ref()
+            .and_then(|id| self.connected_servers.iter().find(|s| &s.server_id == id))
     }
 
     /// Check if there are more keys to load
@@ -198,7 +198,11 @@ impl KeysState {
     /// Add a connected server
     pub fn add_connected_server(&mut self, server: ConnectedServerInfo, cx: &mut Context<Self>) {
         // Don't add duplicates
-        if !self.connected_servers.iter().any(|s| s.server_id == server.server_id) {
+        if !self
+            .connected_servers
+            .iter()
+            .any(|s| s.server_id == server.server_id)
+        {
             let server_id = server.server_id.clone();
             self.connected_servers.push(server);
             // Auto-activate the newly connected server
