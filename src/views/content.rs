@@ -892,6 +892,8 @@ impl Render for DfcContent {
             .id("content")
             .flex_1()
             .h_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
             .track_focus(&self.focus_handle)
             .bg(cx.theme().background)
             .child(content)

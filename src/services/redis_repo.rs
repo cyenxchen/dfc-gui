@@ -15,6 +15,7 @@ use fred::prelude::*;
 use fred::types::CustomCommand;
 use fred::types::config::Config as FredConfig;
 use serde::Deserialize;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -51,6 +52,8 @@ pub struct RedisRepo {
     tx: Sender<ServiceEvent>,
     /// Redis client instance
     client: Arc<RwLock<Option<FredClient>>>,
+    /// Prevent swapping the active client while requests are still using it.
+    client_access: Arc<RwLock<()>>,
 }
 
 impl RedisRepo {
@@ -60,6 +63,7 @@ impl RedisRepo {
             config: config.clone(),
             tx,
             client: Arc::new(RwLock::new(None)),
+            client_access: Arc::new(RwLock::new(())),
         })
     }
 
@@ -103,7 +107,9 @@ impl RedisRepo {
                     .await
                 {
                     Ok(client) => {
-                        return self.store_connected_client(client, &server.name, "server password").await;
+                        return self
+                            .store_connected_client(client, &server.name, "server password")
+                            .await;
                     }
                     Err(e) => {
                         tracing::debug!("Auth attempt failed (server password): {}", e);
@@ -126,7 +132,9 @@ impl RedisRepo {
                 .await
             {
                 Ok(client) => {
-                    return self.store_connected_client(client, &server.name, "preset credential").await;
+                    return self
+                        .store_connected_client(client, &server.name, "preset credential")
+                        .await;
                 }
                 Err(e) => {
                     tracing::debug!("Auth attempt failed (preset credential): {}", e);
@@ -141,7 +149,9 @@ impl RedisRepo {
             .await
         {
             Ok(client) => {
-                return self.store_connected_client(client, &server.name, "no auth").await;
+                return self
+                    .store_connected_client(client, &server.name, "no auth")
+                    .await;
             }
             Err(e) => {
                 tracing::debug!("Auth attempt failed (no auth): {}", e);
@@ -156,6 +166,24 @@ impl RedisRepo {
         Err(err)
     }
 
+    async fn current_client(&self) -> Result<FredClient> {
+        let guard = self.client.read().await;
+        guard.as_ref().cloned().ok_or_else(|| Error::Connection {
+            message: "Not connected to Redis".to_string(),
+        })
+    }
+
+    async fn with_connected_client<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(FredClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _access_guard = self.client_access.read().await;
+        let client = self.current_client().await?;
+        super::run_in_tokio(async move { f(client).await }).await
+    }
+
     /// Store a successfully connected client and notify
     async fn store_connected_client(
         &self,
@@ -163,6 +191,7 @@ impl RedisRepo {
         server_name: &str,
         via: &str,
     ) -> Result<()> {
+        let _access_guard = self.client_access.write().await;
         let mut guard = self.client.write().await;
         *guard = Some(client);
 
@@ -182,20 +211,20 @@ impl RedisRepo {
 
     /// Detect whether the Redis server runs in cluster mode
     async fn detect_cluster(&self, host: &str, port: u16) -> bool {
-        let Ok(client) = self
-            .build_and_connect(host, port, None, None, false)
-            .await
-        else {
+        let Ok(client) = self.build_and_connect(host, port, None, None, false).await else {
             return false;
         };
 
-        let info_cmd = CustomCommand::new_static("INFO", None, false);
-        let info: String = client
-            .custom(info_cmd, vec![Value::from("server")])
-            .await
-            .unwrap_or_default();
-
-        let _ = client.quit().await;
+        let info: String = super::run_in_tokio(async move {
+            let info_cmd = CustomCommand::new_static("INFO", None, false);
+            let info = client
+                .custom(info_cmd, vec![Value::from("server")])
+                .await
+                .unwrap_or_default();
+            let _ = client.quit().await;
+            info
+        })
+        .await;
 
         let is_cluster = info.contains("redis_mode:cluster");
         if is_cluster {
@@ -213,54 +242,63 @@ impl RedisRepo {
         password: Option<&str>,
         clustered: bool,
     ) -> Result<FredClient> {
-        let server = fred::prelude::Server::new(host.to_string(), port);
-        let mut redis_config = FredConfig::default();
-        redis_config.server = if clustered {
-            ServerConfig::Clustered {
-                hosts: vec![server],
-                policy: fred::types::config::ClusterDiscoveryPolicy::ConfigEndpoint,
-            }
-        } else {
-            ServerConfig::Centralized { server }
-        };
+        let host = host.to_string();
+        let username = username
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let password = password
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
 
-        if let Some(pwd) = password {
-            if !pwd.is_empty() {
-                redis_config.password = Some(pwd.to_string());
-            }
-        }
-        if let Some(user) = username {
-            if !user.is_empty() {
-                redis_config.username = Some(user.to_string());
-            }
-        }
+        super::run_in_tokio(async move {
+            let server = fred::prelude::Server::new(host, port);
+            let mut redis_config = FredConfig::default();
+            redis_config.server = if clustered {
+                ServerConfig::Clustered {
+                    hosts: vec![server],
+                    policy: fred::types::config::ClusterDiscoveryPolicy::ConfigEndpoint,
+                }
+            } else {
+                ServerConfig::Centralized { server }
+            };
+            redis_config.username = username;
+            redis_config.password = password;
 
-        let client = Builder::from_config(redis_config)
-            .with_connection_config(|config| {
-                config.connection_timeout = Duration::from_secs(10);
-            })
-            .build()
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
+            let client = Builder::from_config(redis_config)
+                .with_connection_config(|config| {
+                    config.connection_timeout = Duration::from_secs(10);
+                })
+                .build()
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        let _guard = super::runtime_handle().enter();
-        client.connect();
-        client
-            .wait_for_connect()
-            .await
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
+            client.connect();
+            client
+                .wait_for_connect()
+                .await
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        Ok(client)
+            Ok(client)
+        })
+        .await
     }
 
     /// Disconnect from current server
     pub async fn disconnect(&self) {
-        let mut guard = self.client.write().await;
-        if let Some(client) = guard.take() {
-            let _ = client.quit().await;
+        let _access_guard = self.client_access.write().await;
+        let client = {
+            let mut guard = self.client.write().await;
+            guard.take()
+        };
+
+        if let Some(client) = client {
+            let _ = super::run_in_tokio(async move {
+                let _ = client.quit().await;
+            })
+            .await;
         }
 
         let _ = self.tx.send(ServiceEvent::ConnectionState {
@@ -272,129 +310,125 @@ impl RedisRepo {
 
     /// Fetch configuration items from Redis
     pub async fn fetch_configs(&self, cfgid: Option<&str>) -> Result<Vec<ConfigItem>> {
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
+        let cfgid = cfgid.map(str::to_string);
 
         tracing::debug!("Fetching configs from Redis, cfgid filter: {:?}", cfgid);
 
-        let mut configs = Vec::new();
-        let mut group_id = 1;
+        self.with_connected_client(move |client| async move {
+            let mut configs = Vec::new();
+            let mut group_id = 1;
 
-        // Scan for matching keys using each pattern
-        for pattern in REDIS_KEY_PATTERNS {
-            let scan_pattern = if let Some(cfg) = cfgid {
-                // Check if cfgid already has braces, add them if not
-                // Redis keys use format: CMC_{DCC0001}_sg.og.output.iothub
-                let wrapped_cfgid = if cfg.starts_with('{') && cfg.ends_with('}') {
-                    cfg.to_string()
-                } else {
-                    format!("{{{}}}", cfg) // Add braces: DCC0001 -> {DCC0001}
-                };
-                pattern.replace('*', &wrapped_cfgid)
-            } else {
-                pattern.to_string()
-            };
-
-            tracing::debug!("Scanning with pattern: {}", scan_pattern);
-
-            // Use KEYS command for pattern matching
-            let cmd = CustomCommand::new_static("KEYS", None, false);
-            let keys_result: Value = client
-                .custom(cmd, vec![Value::from(scan_pattern.clone())])
-                .await
-                .map_err(|e: fred::error::Error| {
-                    tracing::error!("Redis KEYS failed: {}", e);
-                    Error::Connection {
-                        message: e.to_string(),
-                    }
-                })?;
-
-            // Convert Value to Vec<String>
-            let keys: Vec<String> = match keys_result {
-                Value::Array(arr) => arr.into_iter().filter_map(|v| v.into_string()).collect(),
-                _ => vec![],
-            };
-
-            for key in keys {
-                let Some(config_json) = self.get_config_json(client, &key).await else {
-                    continue;
-                };
-
-                let raw_value = match &config_json {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => config_json.to_string(),
-                };
-
-                let details = if self.is_output_iothub_key(&key)
-                    || self.is_input_iothub_key(&key)
-                    || self.is_io_iothub_key(&key)
-                {
-                    Vec::new()
-                } else {
-                    self.parse_config_value(&raw_value, group_id)
-                };
-
-                let service_url = self
-                    .extract_service_url_from_json(&config_json)
-                    .unwrap_or_else(|| self.extract_service_url(&key, &raw_value));
-
-                // Extract cfgid from the key (e.g., CMC_{DCC0001}_sg.og.output.iothub -> DCC0001)
-                let cfgid = self.extract_cfgid_from_key(&key);
-
-                let topic_agents = if let Some(ref cfg) = cfgid {
-                    let app_id = self.fetch_app_id(client, cfg).await;
-                    let agent_ids = self.fetch_topic_agent_ids(client, cfg, &app_id).await;
-
-                    if self.is_output_iothub_key(&key) {
-                        self.build_output_iothub_topic_agents(&config_json, &agent_ids, group_id)
-                    } else if self.is_input_iothub_key(&key) {
-                        self.build_input_iothub_topic_agents(
-                            &config_json,
-                            &agent_ids,
-                            &app_id,
-                            group_id,
-                        )
-                    } else if self.is_io_iothub_key(&key) {
-                        self.build_io_iothub_topic_agents(
-                            &config_json,
-                            &agent_ids,
-                            &app_id,
-                            group_id,
-                        )
+            for pattern in REDIS_KEY_PATTERNS {
+                let scan_pattern = if let Some(cfg) = cfgid.as_deref() {
+                    let wrapped_cfgid = if cfg.starts_with('{') && cfg.ends_with('}') {
+                        cfg.to_string()
                     } else {
-                        self.build_topic_agents_from_details(&agent_ids, &details, group_id)
-                    }
+                        format!("{{{}}}", cfg)
+                    };
+                    pattern.replace('*', &wrapped_cfgid)
                 } else {
-                    Vec::new()
+                    pattern.to_string()
                 };
 
-                configs.push(ConfigItem {
-                    group_id,
-                    service_url,
-                    source: key,
-                    details,
-                    topic_agents,
-                });
+                tracing::debug!("Scanning with pattern: {}", scan_pattern);
 
-                group_id += 1;
+                let cmd = CustomCommand::new_static("KEYS", None, false);
+                let keys_result: Value = client
+                    .custom(cmd, vec![Value::from(scan_pattern.clone())])
+                    .await
+                    .map_err(|e: fred::error::Error| {
+                        tracing::error!("Redis KEYS failed: {}", e);
+                        Error::Connection {
+                            message: e.to_string(),
+                        }
+                    })?;
+
+                let keys: Vec<String> = match keys_result {
+                    Value::Array(arr) => arr.into_iter().filter_map(|v| v.into_string()).collect(),
+                    _ => vec![],
+                };
+
+                for key in keys {
+                    let Some(config_json) = Self::get_config_json(&client, &key).await else {
+                        continue;
+                    };
+
+                    let raw_value = match &config_json {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => config_json.to_string(),
+                    };
+
+                    let details = if Self::is_output_iothub_key(&key)
+                        || Self::is_input_iothub_key(&key)
+                        || Self::is_io_iothub_key(&key)
+                    {
+                        Vec::new()
+                    } else {
+                        Self::parse_config_value(&raw_value, group_id)
+                    };
+
+                    let service_url = Self::extract_service_url_from_json(&config_json)
+                        .unwrap_or_else(|| Self::extract_service_url(&key, &raw_value));
+                    let cfgid = Self::extract_cfgid_from_key(&key);
+
+                    let topic_agents = if let Some(ref cfg) = cfgid {
+                        let app_id = Self::fetch_app_id(&client, cfg).await;
+                        let agent_ids = Self::fetch_topic_agent_ids(&client, cfg, &app_id).await;
+
+                        if Self::is_output_iothub_key(&key) {
+                            Self::build_output_iothub_topic_agents(
+                                &config_json,
+                                &agent_ids,
+                                group_id,
+                            )
+                        } else if Self::is_input_iothub_key(&key) {
+                            Self::build_input_iothub_topic_agents(
+                                &config_json,
+                                &agent_ids,
+                                &app_id,
+                                group_id,
+                            )
+                        } else if Self::is_io_iothub_key(&key) {
+                            Self::build_io_iothub_topic_agents(
+                                &config_json,
+                                &agent_ids,
+                                &app_id,
+                                group_id,
+                            )
+                        } else {
+                            Self::build_topic_agents_from_details(&agent_ids, &details, group_id)
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    configs.push(ConfigItem {
+                        group_id,
+                        service_url,
+                        source: key,
+                        details,
+                        topic_agents,
+                    });
+
+                    group_id += 1;
+                }
             }
-        }
 
-        tracing::info!("Fetched {} config items from Redis", configs.len());
-        Ok(configs)
+            tracing::info!("Fetched {} config items from Redis", configs.len());
+            Ok(configs)
+        })
+        .await
     }
 
-    fn is_output_iothub_key(&self, key: &str) -> bool {
+    fn is_output_iothub_key(key: &str) -> bool {
         key.ends_with("sg.og.output.iothub")
     }
 
-    fn is_input_iothub_key(&self, key: &str) -> bool {
+    fn is_input_iothub_key(key: &str) -> bool {
         key.ends_with("sg.og.input.iothub")
     }
 
-    fn is_io_iothub_key(&self, key: &str) -> bool {
+    fn is_io_iothub_key(key: &str) -> bool {
         key.ends_with("sg.io.iothub")
     }
 
@@ -427,7 +461,7 @@ impl RedisRepo {
         serde_json::Value::Object(map)
     }
 
-    async fn get_config_json(&self, client: &FredClient, key: &str) -> Option<serde_json::Value> {
+    async fn get_config_json(client: &FredClient, key: &str) -> Option<serde_json::Value> {
         let type_cmd = CustomCommand::new_static("TYPE", None, false);
         let type_result: Value = client
             .custom(type_cmd, vec![Value::from(key.to_string())])
@@ -493,7 +527,7 @@ impl RedisRepo {
         }
     }
 
-    fn extract_service_url_from_json(&self, value: &serde_json::Value) -> Option<String> {
+    fn extract_service_url_from_json(value: &serde_json::Value) -> Option<String> {
         for entry in Self::value_as_array(value) {
             if let Some(url) = Self::get_json_string_multi(
                 entry,
@@ -505,10 +539,10 @@ impl RedisRepo {
         None
     }
 
-    async fn fetch_app_id(&self, client: &FredClient, cfgid: &str) -> String {
+    async fn fetch_app_id(client: &FredClient, cfgid: &str) -> String {
         let wrapped = Self::wrap_cfgid(cfgid);
         let main_key = format!("CMC_{}_sg.main", wrapped);
-        let Some(json) = self.get_config_json(client, &main_key).await else {
+        let Some(json) = Self::get_config_json(client, &main_key).await else {
             return cfgid.to_string();
         };
         if let Some(app_id) = Self::get_json_string_multi(&json, &["appId", "appid", "app_id"]) {
@@ -517,15 +551,10 @@ impl RedisRepo {
         cfgid.to_string()
     }
 
-    async fn fetch_topic_agent_ids(
-        &self,
-        client: &FredClient,
-        cfgid: &str,
-        app_id: &str,
-    ) -> Vec<String> {
+    async fn fetch_topic_agent_ids(client: &FredClient, cfgid: &str, app_id: &str) -> Vec<String> {
         let wrapped = Self::wrap_cfgid(cfgid);
         let device_key = format!("CMC_{}_sg.device", wrapped);
-        let Some(json) = self.get_config_json(client, &device_key).await else {
+        let Some(json) = Self::get_config_json(client, &device_key).await else {
             return vec![app_id.to_string()];
         };
 
@@ -581,41 +610,38 @@ impl RedisRepo {
             props: Vec<InfoProp>,
         }
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
         let wrapped = Self::wrap_cfgid(cfgid);
         let key = format!("CMC_{}_sg.infomodel.property", wrapped);
 
-        let Some(json) = self.get_config_json(client, &key).await else {
-            return Ok(std::collections::HashMap::new());
-        };
-
-        let infos: Vec<Info> = serde_json::from_value(json).unwrap_or_default();
-        let mut map: std::collections::HashMap<(String, u32), String> =
-            std::collections::HashMap::new();
-
-        for info in infos {
-            let uuid_base = match info.uuid.split('_').next() {
-                Some(v) if !v.is_empty() => v.to_string(),
-                _ => info.uuid.clone(),
+        self.with_connected_client(move |client| async move {
+            let Some(json) = Self::get_config_json(&client, &key).await else {
+                return Ok(std::collections::HashMap::new());
             };
 
-            for prop in info.props {
-                if prop.imid == 0 || prop.uuid.is_empty() || uuid_base.is_empty() {
-                    continue;
-                }
-                map.insert((uuid_base.clone(), prop.imid), prop.uuid);
-            }
-        }
+            let infos: Vec<Info> = serde_json::from_value(json).unwrap_or_default();
+            let mut map: std::collections::HashMap<(String, u32), String> =
+                std::collections::HashMap::new();
 
-        Ok(map)
+            for info in infos {
+                let uuid_base = match info.uuid.split('_').next() {
+                    Some(v) if !v.is_empty() => v.to_string(),
+                    _ => info.uuid.clone(),
+                };
+
+                for prop in info.props {
+                    if prop.imid == 0 || prop.uuid.is_empty() || uuid_base.is_empty() {
+                        continue;
+                    }
+                    map.insert((uuid_base.clone(), prop.imid), prop.uuid);
+                }
+            }
+
+            Ok(map)
+        })
+        .await
     }
 
     fn build_topic_agents_from_details(
-        &self,
         agent_ids: &[String],
         details: &[DetailItem],
         group_id: i32,
@@ -663,7 +689,6 @@ impl RedisRepo {
     }
 
     fn build_output_iothub_topic_agents(
-        &self,
         config_json: &serde_json::Value,
         agent_ids: &[String],
         group_id: i32,
@@ -749,7 +774,6 @@ impl RedisRepo {
     }
 
     fn build_input_iothub_topic_agents(
-        &self,
         config_json: &serde_json::Value,
         agent_ids: &[String],
         app_id: &str,
@@ -849,7 +873,6 @@ impl RedisRepo {
     }
 
     fn build_io_iothub_topic_agents(
-        &self,
         config_json: &serde_json::Value,
         agent_ids: &[String],
         app_id: &str,
@@ -994,10 +1017,10 @@ impl RedisRepo {
     }
 
     /// Parse config value to extract topic details
-    fn parse_config_value(&self, value: &str, group_id: i32) -> Vec<DetailItem> {
+    fn parse_config_value(value: &str, group_id: i32) -> Vec<DetailItem> {
         // Try to parse as JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
-            return self.extract_topics_from_json(&json, group_id);
+            return Self::extract_topics_from_json(&json, group_id);
         }
 
         // If not JSON, treat as a single topic path
@@ -1010,7 +1033,7 @@ impl RedisRepo {
     }
 
     /// Extract topic paths from JSON value
-    fn extract_topics_from_json(&self, json: &serde_json::Value, group_id: i32) -> Vec<DetailItem> {
+    fn extract_topics_from_json(json: &serde_json::Value, group_id: i32) -> Vec<DetailItem> {
         let mut details = Vec::new();
         let mut index = 0;
 
@@ -1088,7 +1111,7 @@ impl RedisRepo {
     }
 
     /// Extract service URL from key or value
-    fn extract_service_url(&self, key: &str, value: &str) -> String {
+    fn extract_service_url(key: &str, value: &str) -> String {
         // Try to extract from JSON value first
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
             if let Some(url) = json
@@ -1108,7 +1131,7 @@ impl RedisRepo {
 
     /// Extract cfgid from Redis key
     /// e.g., CMC_{DCC0001}_sg.og.output.iothub -> DCC0001
-    fn extract_cfgid_from_key(&self, key: &str) -> Option<String> {
+    fn extract_cfgid_from_key(key: &str) -> Option<String> {
         // Pattern: CMC_{cfgid}_sg.*
         if key.starts_with("CMC_") {
             // Find the content between { and }
@@ -1231,78 +1254,75 @@ impl RedisRepo {
         cursor: u64,
         count: usize,
     ) -> Result<(Vec<RedisKeyItem>, u64)> {
-        let _guard = super::runtime_handle().enter();
+        let pattern = pattern.to_string();
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
+        self.with_connected_client(move |client| async move {
+            tracing::debug!(
+                "Scanning keys with pattern: {}, cursor: {}",
+                pattern,
+                cursor
+            );
 
-        tracing::debug!(
-            "Scanning keys with pattern: {}, cursor: {}",
-            pattern,
-            cursor
-        );
+            let cmd = CustomCommand::new_static("SCAN", None, false);
+            let mut args = vec![Value::from(cursor.to_string())];
 
-        // Build SCAN command: SCAN cursor [MATCH pattern] [COUNT count]
-        let cmd = CustomCommand::new_static("SCAN", None, false);
-        let mut args = vec![Value::from(cursor.to_string())];
-
-        if !pattern.is_empty() && pattern != "*" {
-            args.push(Value::from("MATCH"));
-            args.push(Value::from(pattern.to_string()));
-        }
-
-        args.push(Value::from("COUNT"));
-        args.push(Value::from(count.to_string()));
-
-        let result: Value = client.custom(cmd, args).await.map_err(|e| {
-            tracing::error!("Redis SCAN failed: {}", e);
-            Error::Connection {
-                message: e.to_string(),
+            if !pattern.is_empty() && pattern != "*" {
+                args.push(Value::from("MATCH"));
+                args.push(Value::from(pattern));
             }
-        })?;
 
-        // Parse SCAN result: [cursor, [key1, key2, ...]]
-        let (next_cursor, keys_raw) = match result {
-            Value::Array(mut arr) if arr.len() >= 2 => {
-                let cursor_val = arr.remove(0);
-                let keys_val = arr.remove(0);
+            args.push(Value::from("COUNT"));
+            args.push(Value::from(count.to_string()));
 
-                let next_cursor = cursor_val
-                    .into_string()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+            let result: Value = client.custom(cmd, args).await.map_err(|e| {
+                tracing::error!("Redis SCAN failed: {}", e);
+                Error::Connection {
+                    message: e.to_string(),
+                }
+            })?;
 
-                let keys: Vec<String> = match keys_val {
-                    Value::Array(arr) => arr.into_iter().filter_map(|v| v.into_string()).collect(),
-                    _ => vec![],
-                };
+            let (next_cursor, keys_raw) = match result {
+                Value::Array(mut arr) if arr.len() >= 2 => {
+                    let cursor_val = arr.remove(0);
+                    let keys_val = arr.remove(0);
 
-                (next_cursor, keys)
+                    let next_cursor = cursor_val
+                        .into_string()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+
+                    let keys: Vec<String> = match keys_val {
+                        Value::Array(arr) => {
+                            arr.into_iter().filter_map(|v| v.into_string()).collect()
+                        }
+                        _ => vec![],
+                    };
+
+                    (next_cursor, keys)
+                }
+                _ => (0, vec![]),
+            };
+
+            let mut key_items = Vec::with_capacity(keys_raw.len());
+            for key in keys_raw {
+                let key_type = Self::get_key_type_internal(&client, &key).await;
+                let ttl = Self::get_key_ttl_internal(&client, &key).await;
+                key_items.push(RedisKeyItem::new(key, key_type, ttl));
             }
-            _ => (0, vec![]),
-        };
 
-        // Get type and TTL for each key
-        let mut key_items = Vec::with_capacity(keys_raw.len());
-        for key in keys_raw {
-            let key_type = self.get_key_type_internal(client, &key).await;
-            let ttl = self.get_key_ttl_internal(client, &key).await;
-            key_items.push(RedisKeyItem::new(key, key_type, ttl));
-        }
+            tracing::debug!(
+                "Scan returned {} keys, next cursor: {}",
+                key_items.len(),
+                next_cursor
+            );
 
-        tracing::debug!(
-            "Scan returned {} keys, next cursor: {}",
-            key_items.len(),
-            next_cursor
-        );
-
-        Ok((key_items, next_cursor))
+            Ok((key_items, next_cursor))
+        })
+        .await
     }
 
     /// Get the type of a key
-    async fn get_key_type_internal(&self, client: &FredClient, key: &str) -> RedisKeyType {
+    async fn get_key_type_internal(client: &FredClient, key: &str) -> RedisKeyType {
         let cmd = CustomCommand::new_static("TYPE", None, false);
         let result: Value = client
             .custom(cmd, vec![Value::from(key.to_string())])
@@ -1316,7 +1336,7 @@ impl RedisRepo {
     }
 
     /// Get the TTL of a key
-    async fn get_key_ttl_internal(&self, client: &FredClient, key: &str) -> i64 {
+    async fn get_key_ttl_internal(client: &FredClient, key: &str) -> i64 {
         let cmd = CustomCommand::new_static("TTL", None, false);
         let result: Value = client
             .custom(cmd, vec![Value::from(key.to_string())])
@@ -1331,165 +1351,147 @@ impl RedisRepo {
 
     /// Get the type of a key (public API)
     pub async fn get_key_type(&self, key: &str) -> Result<RedisKeyType> {
-        let _guard = super::runtime_handle().enter();
-
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
-        Ok(self.get_key_type_internal(client, key).await)
+        let key = key.to_string();
+        self.with_connected_client(move |client| async move {
+            Ok(Self::get_key_type_internal(&client, &key).await)
+        })
+        .await
     }
 
     /// Get a string value
     pub async fn get_string(&self, key: &str) -> Result<String> {
-        let _guard = super::runtime_handle().enter();
+        let key = key.to_string();
+        self.with_connected_client(move |client| async move {
+            let cmd = CustomCommand::new_static("GET", None, false);
+            let result: Value = client
+                .custom(cmd, vec![Value::from(key)])
+                .await
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
-        let cmd = CustomCommand::new_static("GET", None, false);
-        let result: Value = client
-            .custom(cmd, vec![Value::from(key.to_string())])
-            .await
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
-
-        result.into_string().ok_or_else(|| Error::Parse {
-            message: "Failed to parse string value".to_string(),
+            result.into_string().ok_or_else(|| Error::Parse {
+                message: "Failed to parse string value".to_string(),
+            })
         })
+        .await
     }
 
     /// Get a hash value (all fields)
     pub async fn get_hash(&self, key: &str) -> Result<Vec<(String, String)>> {
-        let _guard = super::runtime_handle().enter();
+        let key = key.to_string();
+        self.with_connected_client(move |client| async move {
+            let cmd = CustomCommand::new_static("HGETALL", None, false);
+            let result: Value = client
+                .custom(cmd, vec![Value::from(key)])
+                .await
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
-        let cmd = CustomCommand::new_static("HGETALL", None, false);
-        let result: Value = client
-            .custom(cmd, vec![Value::from(key.to_string())])
-            .await
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
-
-        match result {
-            Value::Array(arr) => {
-                let mut pairs = Vec::new();
-                let mut iter = arr.into_iter();
-                while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
-                    if let (Some(key_str), Some(val_str)) = (k.into_string(), v.into_string()) {
-                        pairs.push((key_str, val_str));
+            match result {
+                Value::Array(arr) => {
+                    let mut pairs = Vec::new();
+                    let mut iter = arr.into_iter();
+                    while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                        if let (Some(key_str), Some(val_str)) = (k.into_string(), v.into_string()) {
+                            pairs.push((key_str, val_str));
+                        }
                     }
+                    Ok(pairs)
                 }
-                Ok(pairs)
+                _ => Ok(vec![]),
             }
-            _ => Ok(vec![]),
-        }
+        })
+        .await
     }
 
     /// Get a list value (with range)
     pub async fn get_list(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>> {
-        let _guard = super::runtime_handle().enter();
+        let key = key.to_string();
+        self.with_connected_client(move |client| async move {
+            let cmd = CustomCommand::new_static("LRANGE", None, false);
+            let result: Value = client
+                .custom(
+                    cmd,
+                    vec![
+                        Value::from(key),
+                        Value::from(start.to_string()),
+                        Value::from(stop.to_string()),
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
-        let cmd = CustomCommand::new_static("LRANGE", None, false);
-        let result: Value = client
-            .custom(
-                cmd,
-                vec![
-                    Value::from(key.to_string()),
-                    Value::from(start.to_string()),
-                    Value::from(stop.to_string()),
-                ],
-            )
-            .await
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
-
-        match result {
-            Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
-            _ => Ok(vec![]),
-        }
+            match result {
+                Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
+                _ => Ok(vec![]),
+            }
+        })
+        .await
     }
 
     /// Get a set value (all members)
     pub async fn get_set(&self, key: &str) -> Result<Vec<String>> {
-        let _guard = super::runtime_handle().enter();
+        let key = key.to_string();
+        self.with_connected_client(move |client| async move {
+            let cmd = CustomCommand::new_static("SMEMBERS", None, false);
+            let result: Value = client
+                .custom(cmd, vec![Value::from(key)])
+                .await
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
-        let cmd = CustomCommand::new_static("SMEMBERS", None, false);
-        let result: Value = client
-            .custom(cmd, vec![Value::from(key.to_string())])
-            .await
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
-
-        match result {
-            Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
-            _ => Ok(vec![]),
-        }
+            match result {
+                Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
+                _ => Ok(vec![]),
+            }
+        })
+        .await
     }
 
     /// Get a sorted set value (with scores, range)
     pub async fn get_zset(&self, key: &str, start: i64, stop: i64) -> Result<Vec<(String, f64)>> {
-        let _guard = super::runtime_handle().enter();
+        let key = key.to_string();
+        self.with_connected_client(move |client| async move {
+            let cmd = CustomCommand::new_static("ZRANGE", None, false);
+            let result: Value = client
+                .custom(
+                    cmd,
+                    vec![
+                        Value::from(key),
+                        Value::from(start.to_string()),
+                        Value::from(stop.to_string()),
+                        Value::from("WITHSCORES"),
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Connection {
+                    message: e.to_string(),
+                })?;
 
-        let guard = self.client.read().await;
-        let client = guard.as_ref().ok_or_else(|| Error::Connection {
-            message: "Not connected to Redis".to_string(),
-        })?;
-
-        let cmd = CustomCommand::new_static("ZRANGE", None, false);
-        let result: Value = client
-            .custom(
-                cmd,
-                vec![
-                    Value::from(key.to_string()),
-                    Value::from(start.to_string()),
-                    Value::from(stop.to_string()),
-                    Value::from("WITHSCORES"),
-                ],
-            )
-            .await
-            .map_err(|e| Error::Connection {
-                message: e.to_string(),
-            })?;
-
-        match result {
-            Value::Array(arr) => {
-                let mut pairs = Vec::new();
-                let mut iter = arr.into_iter();
-                while let (Some(member), Some(score)) = (iter.next(), iter.next()) {
-                    if let Some(member_str) = member.into_string() {
-                        let score_val = score
-                            .into_string()
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .unwrap_or(0.0);
-                        pairs.push((member_str, score_val));
+            match result {
+                Value::Array(arr) => {
+                    let mut pairs = Vec::new();
+                    let mut iter = arr.into_iter();
+                    while let (Some(member), Some(score)) = (iter.next(), iter.next()) {
+                        if let Some(member_str) = member.into_string() {
+                            let score_val = score
+                                .into_string()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            pairs.push((member_str, score_val));
+                        }
                     }
+                    Ok(pairs)
                 }
-                Ok(pairs)
+                _ => Ok(vec![]),
             }
-            _ => Ok(vec![]),
-        }
+        })
+        .await
     }
 
     /// Get key value based on its type
@@ -1539,6 +1541,12 @@ impl std::fmt::Debug for RedisRepo {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, sleep};
 
     #[test]
     fn parse_config_string_value_handles_json_and_plain() {
@@ -1571,9 +1579,6 @@ mod tests {
 
     #[test]
     fn build_output_iothub_topics_combines_agent_id() {
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let repo = RedisRepo::new(&RedisConfig::default(), tx).expect("repo");
-
         let config_json = json!([
             {
                 "guaranteeTopic": [
@@ -1596,11 +1601,64 @@ mod tests {
         ]);
 
         let agents = vec!["622".to_string()];
-        let topic_agents = repo.build_output_iothub_topic_agents(&config_json, &agents, 1);
+        let topic_agents = RedisRepo::build_output_iothub_topic_agents(&config_json, &agents, 1);
         assert_eq!(topic_agents.len(), 1);
         assert!(topic_agents[0].topics.len() >= 6);
         for topic in &topic_agents[0].topics {
             assert!(topic.path.contains("-622"));
         }
+    }
+
+    #[test]
+    fn switching_client_waits_for_inflight_request() {
+        crate::services::block_on(async {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            let repo = Arc::new(RedisRepo::new(&RedisConfig::default(), tx).expect("repo"));
+
+            {
+                let mut guard = repo.client.write().await;
+                *guard = Some(FredClient::default());
+            }
+
+            let (started_tx, started_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let request_repo = repo.clone();
+
+            let request_task = tokio::spawn(async move {
+                request_repo
+                    .with_connected_client(move |_client| async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok(())
+                    })
+                    .await
+            });
+
+            started_rx.await.expect("request started");
+
+            let swapped = Arc::new(AtomicBool::new(false));
+            let swapped_flag = swapped.clone();
+            let swap_repo = repo.clone();
+
+            let swap_task = tokio::spawn(async move {
+                let result = swap_repo
+                    .store_connected_client(FredClient::default(), "next", "test")
+                    .await;
+                swapped_flag.store(true, Ordering::SeqCst);
+                result
+            });
+
+            sleep(Duration::from_millis(50)).await;
+            assert!(!swapped.load(Ordering::SeqCst));
+
+            let _ = release_tx.send(());
+
+            request_task
+                .await
+                .expect("request join")
+                .expect("request ok");
+            swap_task.await.expect("swap join").expect("swap ok");
+            assert!(swapped.load(Ordering::SeqCst));
+        });
     }
 }

@@ -19,7 +19,7 @@ pub const STATUS_BAR_HEIGHT: f32 = 28.0;
 /// Default window dimensions
 pub const DEFAULT_WINDOW_WIDTH: f32 = 1200.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 750.0;
-pub const MIN_WINDOW_WIDTH: f32 = 800.0;
+pub const MIN_WINDOW_WIDTH: f32 = 1120.0;
 pub const MIN_WINDOW_HEIGHT: f32 = 500.0;
 
 /// Bounded cache capacities

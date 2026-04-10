@@ -8,13 +8,16 @@ use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, KeysState, PropRow, PropSortColumn, PropTableLoadState,
-    PropTableState, SortDirection,
+    ConfigState, DfcAppState, DfcGlobalStore, KeysState, PropRow, PropSortColumn,
+    PropTableLoadState, PropTableState, SortDirection,
 };
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
-use gpui::{Action, App, Context, Corner, Entity, StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{
+    Action, App, Context, Corner, Entity, StatefulInteractiveElement as _, Subscription, Task,
+    Window, div, prelude::*, px,
+};
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants, DropdownButton},
@@ -29,8 +32,8 @@ use prost::Message as _;
 use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -47,7 +50,9 @@ enum PropStreamEvent {
 }
 
 fn topic_display_name(topic_path: &str) -> String {
-    if topic_path.contains("thing_service-BZ-RESPONSE") && topic_path.contains("thing_service-BZ-REQUEST") {
+    if topic_path.contains("thing_service-BZ-RESPONSE")
+        && topic_path.contains("thing_service-BZ-REQUEST")
+    {
         return "service".to_string();
     }
 
@@ -67,7 +72,11 @@ fn topic_display_name(topic_path: &str) -> String {
         }
     }
 
-    let mut last = topic_path.rsplit('/').next().unwrap_or(topic_path).to_string();
+    let mut last = topic_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(topic_path)
+        .to_string();
     if let Some(last_dash) = last.rfind('-') {
         let tail = &last[last_dash + 1..];
         if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
@@ -357,42 +366,53 @@ impl ConfigView {
         let uid = self.prop_row_uid.clone();
 
         spawn_named_in_tokio("prop-topic-stream", async move {
-            run_prop_topic_stream(service_url, topic_path, token, cfgid, redis, stop_rx, tx, uid)
-                .await;
+            run_prop_topic_stream(
+                service_url,
+                topic_path,
+                token,
+                cfgid,
+                redis,
+                stop_rx,
+                tx,
+                uid,
+            )
+            .await;
         });
 
         let prop_state = self.prop_table_state.clone();
-        let task = cx.spawn(async move |_, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(120))
-                .await;
+        let task = cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
 
-            let mut rows: Vec<PropRow> = Vec::new();
-            let mut error: Option<String> = None;
+                let mut rows: Vec<PropRow> = Vec::new();
+                let mut error: Option<String> = None;
 
-            while let Ok(ev) = rx.try_recv() {
-                match ev {
-                    PropStreamEvent::Rows(mut batch) => rows.append(&mut batch),
-                    PropStreamEvent::Error(msg) => error = Some(msg),
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        PropStreamEvent::Rows(mut batch) => rows.append(&mut batch),
+                        PropStreamEvent::Error(msg) => error = Some(msg),
+                    }
                 }
-            }
 
-            if let Some(msg) = error {
+                if let Some(msg) = error {
+                    let _ = prop_state.update(cx, |state, cx| {
+                        state.set_error(msg);
+                        cx.notify();
+                    });
+                    continue;
+                }
+
+                if rows.is_empty() {
+                    continue;
+                }
+
                 let _ = prop_state.update(cx, |state, cx| {
-                    state.set_error(msg);
+                    state.push_rows_front(rows);
                     cx.notify();
                 });
-                continue;
             }
-
-            if rows.is_empty() {
-                continue;
-            }
-
-            let _ = prop_state.update(cx, |state, cx| {
-                state.push_rows_front(rows);
-                cx.notify();
-            });
         });
 
         self.prop_ingest_task = Some(task);
@@ -433,7 +453,11 @@ impl ConfigView {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Icon::new(IconName::CircleX).size_5().text_color(cx.theme().danger))
+                            .child(
+                                Icon::new(IconName::CircleX)
+                                    .size_5()
+                                    .text_color(cx.theme().danger),
+                            )
                             .child(Label::new(error_title).text_color(cx.theme().danger)),
                     )
                     .child(
@@ -540,41 +564,37 @@ impl ConfigView {
                     )
                     // Service URL column
                     .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(
-                                Label::new(config.service_url.clone())
-                                    .text_sm()
-                                    .text_ellipsis(),
-                            ),
+                        div().flex_1().overflow_hidden().child(
+                            Label::new(config.service_url.clone())
+                                .text_sm()
+                                .text_ellipsis(),
+                        ),
                     )
                     // Source column
                     .child(
-                        div()
-                            .w(px(250.0))
-                            .overflow_hidden()
-                            .child(
-                                Label::new(config.source.clone())
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .text_ellipsis(),
-                            ),
+                        div().w(px(250.0)).overflow_hidden().child(
+                            Label::new(config.source.clone())
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .text_ellipsis(),
+                        ),
                     )
                     // Topic count badge
                     .child(
-                        div()
-                            .w(px(80.0))
-                            .child(
-                                Label::new(format!("{} topics", topic_count))
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground),
-                            ),
+                        div().w(px(80.0)).child(
+                            Label::new(format!("{} topics", topic_count))
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground),
+                        ),
                     )
                     // Browse keys button
                     .child(browse_btn)
                     // Arrow icon
-                    .child(Icon::new(IconName::ChevronRight).size_4().text_color(cx.theme().muted_foreground)),
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size_4()
+                            .text_color(cx.theme().muted_foreground),
+                    ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.config_state.update(cx, |state, cx| {
@@ -596,40 +616,32 @@ impl ConfigView {
             .border_color(cx.theme().border)
             .gap_4()
             .child(
-                div()
-                    .w(px(60.0))
-                    .child(
-                        Label::new(t!("config.group_id", locale = &locale).to_string())
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                div().w(px(60.0)).child(
+                    Label::new(t!("config.group_id", locale = &locale).to_string())
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .child(
-                        Label::new(t!("config.service_url", locale = &locale).to_string())
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                div().flex_1().child(
+                    Label::new(t!("config.service_url", locale = &locale).to_string())
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
             .child(
-                div()
-                    .w(px(250.0))
-                    .child(
-                        Label::new(t!("config.source", locale = &locale).to_string())
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                div().w(px(250.0)).child(
+                    Label::new(t!("config.source", locale = &locale).to_string())
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
             .child(
-                div()
-                    .w(px(80.0))
-                    .child(
-                        Label::new(t!("config.topics", locale = &locale).to_string())
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground),
-                    ),
+                div().w(px(80.0)).child(
+                    Label::new(t!("config.topics", locale = &locale).to_string())
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
             .child(div().w(px(16.0))) // Spacer for arrow
     }
@@ -704,11 +716,7 @@ impl ConfigView {
             .border_1()
             .border_color(cx.theme().border)
             .when(!is_selected, |this| this.border_b_0())
-            .child(
-                Label::new(short_name)
-                    .text_sm()
-                    .text_color(text_color),
-            )
+            .child(Label::new(short_name).text_sm().text_color(text_color))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.config_state.update(cx, |state, cx| {
                     state.select_topic(Some(index), cx);
@@ -726,26 +734,42 @@ impl ConfigView {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Label::new("Path:").text_sm().text_color(cx.theme().muted_foreground))
+                        .child(
+                            Label::new("Path:")
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground),
+                        )
                         .child(Label::new(topic.path.clone()).text_sm()),
                 )
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Label::new("Visibility:").text_sm().text_color(cx.theme().muted_foreground))
-                        .child(Label::new(if topic.visibility { "Visible" } else { "Hidden" }).text_sm()),
+                        .child(
+                            Label::new("Visibility:")
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            Label::new(if topic.visibility {
+                                "Visible"
+                            } else {
+                                "Hidden"
+                            })
+                            .text_sm(),
+                        ),
                 )
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Label::new("Index:").text_sm().text_color(cx.theme().muted_foreground))
+                        .child(
+                            Label::new("Index:")
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground),
+                        )
                         .child(Label::new(format!("{}", topic.index)).text_sm()),
                 )
         } else {
-            v_flex().child(
-                Label::new("No topic selected")
-                    .text_color(cx.theme().muted_foreground),
-            )
+            v_flex().child(Label::new("No topic selected").text_color(cx.theme().muted_foreground))
         };
 
         div()
@@ -837,7 +861,9 @@ impl ConfigView {
 
             topic_agents
                 .iter()
-                .filter(|agent| query.is_empty() || self.agent_id_matches_query(&agent.agent_id, &query))
+                .filter(|agent| {
+                    query.is_empty() || self.agent_id_matches_query(&agent.agent_id, &query)
+                })
                 .enumerate()
                 .map(|(idx, agent)| {
                     let is_selected = selected_agent_id == Some(&agent.agent_id);
@@ -867,7 +893,12 @@ impl ConfigView {
         };
         let query_mode = self.agent_query_mode;
         let query_mode_dropdown = DropdownButton::new("agent-query-mode-dropdown")
-            .button(Button::new("agent-query-mode-btn").ghost().px_2().icon(icon))
+            .button(
+                Button::new("agent-query-mode-btn")
+                    .ghost()
+                    .px_2()
+                    .icon(icon),
+            )
             .dropdown_menu_with_anchor(Corner::TopLeft, move |menu, _, _| {
                 let query_mode_all_label = query_mode_all_label.clone();
                 let query_mode_prefix_label = query_mode_prefix_label.clone();
@@ -907,6 +938,7 @@ impl ConfigView {
             .cleanable(true);
 
         v_flex()
+            .flex_none()
             .w(px(AGENT_LIST_WIDTH))
             .h_full()
             .bg(secondary_bg)
@@ -932,7 +964,11 @@ impl ConfigView {
     }
 
     /// Render the right panel with topic tabs for selected agent
-    fn render_agent_topics(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_agent_topics(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let locale = self.locale(cx);
 
         // Collect data first to avoid borrow conflicts
@@ -961,14 +997,13 @@ impl ConfigView {
             let muted_fg = cx.theme().muted_foreground;
             return div()
                 .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    Label::new(no_agent_text)
-                        .text_color(muted_fg),
-                )
+                .child(Label::new(no_agent_text).text_color(muted_fg))
                 .into_any_element();
         }
 
@@ -979,7 +1014,8 @@ impl ConfigView {
         let secondary_bg = cx.theme().secondary;
         let no_topic_selected = t!("config.no_topic_selected", locale = &locale).to_string();
 
-        let selected_topic_index = selected_topic_index.filter(|idx| (*idx as usize) < topic_paths.len());
+        let selected_topic_index =
+            selected_topic_index.filter(|idx| (*idx as usize) < topic_paths.len());
         let selected_topic_path = selected_topic_index
             .and_then(|idx| topic_paths.get(idx as usize))
             .cloned();
@@ -998,10 +1034,14 @@ impl ConfigView {
 
         v_flex()
             .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
             .h_full()
+            .overflow_hidden()
             // Top bar spacer (align with left search bar)
             .child(
                 h_flex()
+                    .flex_none()
                     .w_full()
                     .h(px(PANEL_TOPBAR_HEIGHT))
                     .items_center()
@@ -1014,6 +1054,7 @@ impl ConfigView {
                         h_flex()
                             .id("agent-tabs-scroll")
                             .flex_1()
+                            .min_w(px(0.0))
                             .gap_2()
                             .flex_nowrap()
                             .justify_center()
@@ -1023,19 +1064,26 @@ impl ConfigView {
             )
             // Content area
             .child(
-                div()
+                v_flex()
                     .flex_1()
+                    .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .child(match (selected_topic_path.as_deref(), is_prop_topic) {
-                        (Some(topic_path), true) => self.render_prop_table(topic_path, cx).into_any_element(),
-                        (Some(topic_path), false) => self.render_unsupported_topic(topic_path, cx).into_any_element(),
+                        (Some(topic_path), true) => {
+                            self.render_prop_table(topic_path, cx).into_any_element()
+                        }
+                        (Some(topic_path), false) => self
+                            .render_unsupported_topic(topic_path, cx)
+                            .into_any_element(),
                         (None, _) => div().flex_1().into_any_element(),
                     }),
             )
             // Bottom status bar
             .child(
                 h_flex()
+                    .flex_none()
+                    .w_full()
                     .h(px(48.0))
                     .items_center()
                     .px_4()
@@ -1053,7 +1101,11 @@ impl ConfigView {
             .into_any_element()
     }
 
-    fn render_unsupported_topic(&self, topic_path: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_unsupported_topic(
+        &self,
+        topic_path: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let muted_fg = cx.theme().muted_foreground;
         let border = cx.theme().border;
 
@@ -1061,10 +1113,7 @@ impl ConfigView {
             .flex_1()
             .p_4()
             .gap_2()
-            .child(
-                Label::new("当前仅实现 prop_data Topic 的内容展示")
-                    .text_color(muted_fg),
-            )
+            .child(Label::new("当前仅实现 prop_data Topic 的内容展示").text_color(muted_fg))
             .child(
                 div()
                     .border_1()
@@ -1080,7 +1129,11 @@ impl ConfigView {
             )
     }
 
-    fn render_prop_table(&self, selected_topic_path: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_prop_table(
+        &self,
+        selected_topic_path: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let border = cx.theme().border;
         let header_bg = cx.theme().secondary;
         let muted_fg = cx.theme().muted_foreground;
@@ -1098,6 +1151,9 @@ impl ConfigView {
         if topic_path.as_deref() != Some(selected_topic_path) {
             return div()
                 .flex_1()
+                .h_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
                 .p_4()
                 .child(Label::new("正在切换 Topic…").text_color(muted_fg))
                 .into_any_element();
@@ -1107,6 +1163,9 @@ impl ConfigView {
             PropTableLoadState::Error(msg) => {
                 return div()
                     .flex_1()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
                     .p_4()
                     .child(Label::new(format!("加载失败: {msg}")).text_color(cx.theme().danger))
                     .into_any_element();
@@ -1114,6 +1173,9 @@ impl ConfigView {
             PropTableLoadState::Loading if total_rows == 0 => {
                 return div()
                     .flex_1()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
                     .p_4()
                     .child(Label::new("等待数据…").text_color(muted_fg))
                     .into_any_element();
@@ -1157,12 +1219,15 @@ impl ConfigView {
         // Horizontal scroll wrapper
         div()
             .flex_1()
+            .h_full()
+            .min_w(px(0.0))
             .min_h(px(0.0))
             .p_3()
             .child(
-                div()
+                v_flex()
                     .w_full()
                     .h_full()
+                    .min_w(px(0.0))
                     .min_h(px(0.0))
                     .rounded_md()
                     .border_1()
@@ -1172,6 +1237,7 @@ impl ConfigView {
                         div()
                             .id("prop-table-x-scroll")
                             .flex_1()
+                            .min_w(px(0.0))
                             .min_h(px(0.0))
                             .overflow_x_scroll()
                             .child(
@@ -1187,16 +1253,66 @@ impl ConfigView {
                                             .bg(header_bg)
                                             .border_b_1()
                                             .border_color(border)
-                                            .child(self.render_prop_header_cell_sortable(180.0, "全局UUID", PropSortColumn::GlobalUuid, cx))
-                                            .child(self.render_prop_header_cell_sortable(110.0, "设备号", PropSortColumn::Device, cx))
-                                            .child(self.render_prop_header_cell_sortable(320.0, "IMR", PropSortColumn::Imr, cx))
-                                            .child(self.render_prop_header_cell_sortable(90.0, "IMID", PropSortColumn::Imid, cx))
-                                            .child(self.render_prop_header_cell_sortable(120.0, "值", PropSortColumn::Value, cx))
-                                            .child(self.render_prop_header_cell_sortable(90.0, "数据质量", PropSortColumn::Quality, cx))
-                                            .child(self.render_prop_header_cell_sortable(140.0, "BCRID", PropSortColumn::Bcrid, cx))
-                                            .child(self.render_prop_header_cell_sortable(180.0, "数据时间", PropSortColumn::Time, cx))
-                                            .child(self.render_prop_header_cell_sortable(180.0, "报文时间", PropSortColumn::MessageTime, cx))
-                                            .child(self.render_prop_header_cell_sortable(240.0, "报文摘要", PropSortColumn::Summary, cx)),
+                                            .child(self.render_prop_header_cell_sortable(
+                                                180.0,
+                                                "全局UUID",
+                                                PropSortColumn::GlobalUuid,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                110.0,
+                                                "设备号",
+                                                PropSortColumn::Device,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                320.0,
+                                                "IMR",
+                                                PropSortColumn::Imr,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                90.0,
+                                                "IMID",
+                                                PropSortColumn::Imid,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                120.0,
+                                                "值",
+                                                PropSortColumn::Value,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                90.0,
+                                                "数据质量",
+                                                PropSortColumn::Quality,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                140.0,
+                                                "BCRID",
+                                                PropSortColumn::Bcrid,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                180.0,
+                                                "数据时间",
+                                                PropSortColumn::Time,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                180.0,
+                                                "报文时间",
+                                                PropSortColumn::MessageTime,
+                                                cx,
+                                            ))
+                                            .child(self.render_prop_header_cell_sortable(
+                                                240.0,
+                                                "报文摘要",
+                                                PropSortColumn::Summary,
+                                                cx,
+                                            )),
                                     )
                                     // Body
                                     .child(
@@ -1231,7 +1347,11 @@ impl ConfigView {
 
         let (active_dir, icon) = {
             let state = self.prop_table_state.read(cx);
-            match state.sort().filter(|s| s.column == column).map(|s| s.direction) {
+            match state
+                .sort()
+                .filter(|s| s.column == column)
+                .map(|s| s.direction)
+            {
                 Some(SortDirection::Asc) => (Some(SortDirection::Asc), IconName::ChevronUp),
                 Some(SortDirection::Desc) => (Some(SortDirection::Desc), IconName::ChevronDown),
                 None => (None, IconName::ChevronsUpDown),
@@ -1272,11 +1392,7 @@ impl ConfigView {
                             .text_color(muted)
                             .text_ellipsis(),
                     )
-                    .child(
-                        Icon::new(icon)
-                            .size_3()
-                            .text_color(icon_color),
-                    ),
+                    .child(Icon::new(icon).size_3().text_color(icon_color)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.prop_table_state.update(cx, |state, cx| {
@@ -1293,11 +1409,7 @@ impl ConfigView {
             .py_2()
             .border_r_1()
             .border_color(cx.theme().border)
-            .child(
-                Label::new(text.to_string())
-                    .text_sm()
-                    .text_ellipsis(),
-            )
+            .child(Label::new(text.to_string()).text_sm().text_ellipsis())
     }
 
     fn render_prop_pagination(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1384,42 +1496,53 @@ impl ConfigView {
         h_flex()
             .w_full()
             .items_center()
-            .gap_6()
+            .gap_4()
             .child(
-                h_flex()
-                    .flex_1()
+                div()
+                    .w(px(360.0))
                     .min_w(px(0.0))
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .child(
-                                Label::new(info)
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .text_ellipsis(),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Label::new("每页显示").text_xs().text_color(cx.theme().muted_foreground))
-                            .child(dropdown)
-                            .child(Label::new("条记录").text_xs().text_color(cx.theme().muted_foreground)),
-                    ),
+                    .flex_shrink()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(info),
             )
+            .child(div().flex_1())
             .child(
                 h_flex()
                     .flex_none()
                     .items_center()
-                    .gap_2()
-                    .child(prev_btn)
-                    .child(Label::new(page_label).text_xs().text_color(cx.theme().muted_foreground))
-                    .child(next_btn),
+                    .gap_6()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Label::new("每页显示")
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(dropdown)
+                            .child(
+                                Label::new("条记录")
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(prev_btn)
+                            .child(
+                                Label::new(page_label)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(next_btn),
+                    ),
             )
     }
 
@@ -1437,8 +1560,16 @@ impl ConfigView {
         } else {
             cx.theme().background
         };
-        let border_color = if is_selected { cx.theme().primary } else { cx.theme().border };
-        let text_color = if is_selected { cx.theme().foreground } else { cx.theme().muted_foreground };
+        let border_color = if is_selected {
+            cx.theme().primary
+        } else {
+            cx.theme().border
+        };
+        let text_color = if is_selected {
+            cx.theme().foreground
+        } else {
+            cx.theme().muted_foreground
+        };
         let tooltip_label = topic_path.to_string();
 
         div()
@@ -1451,11 +1582,7 @@ impl ConfigView {
             .rounded_md()
             .border_2()
             .border_color(border_color)
-            .child(
-                Label::new(label)
-                    .text_sm()
-                    .text_color(text_color),
-            )
+            .child(Label::new(label).text_sm().text_color(text_color))
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.config_state.update(cx, |state, cx| {
@@ -1490,10 +1617,7 @@ impl ConfigView {
                         .child(Label::new(topic_type).text_sm()),
                 )
         } else {
-            v_flex().child(
-                Label::new("No topic selected")
-                    .text_color(muted_fg),
-            )
+            v_flex().child(Label::new("No topic selected").text_color(muted_fg))
         };
 
         div()
@@ -1511,8 +1635,11 @@ impl ConfigView {
     fn render_split_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
             .child(self.render_agent_list(window, cx))
-            .child(div().w(px(2.0)).h_full().bg(cx.theme().border))
+            .child(div().flex_none().w(px(2.0)).h_full().bg(cx.theme().border))
             .child(self.render_agent_topics(window, cx))
     }
 
@@ -1546,10 +1673,7 @@ impl ConfigView {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(
-                        Label::new(config_info.0)
-                            .text_lg(),
-                    )
+                    .child(Label::new(config_info.0).text_lg())
                     .child(
                         Label::new(config_info.1)
                             .text_sm()
@@ -1574,7 +1698,10 @@ impl ConfigView {
         let load_state = self.config_state.read(cx).load_state().clone();
         let (has_configs, has_topic_agents) = {
             let config_state = self.config_state.read(cx);
-            (!config_state.configs().is_empty(), !config_state.topic_agents().is_empty())
+            (
+                !config_state.configs().is_empty(),
+                !config_state.topic_agents().is_empty(),
+            )
         };
 
         match load_state {
@@ -1762,7 +1889,9 @@ fn parse_prop_rows_from_payload(
                         .unwrap_or_else(|| "Unknown Imr".to_string());
                     (i32::try_from(*id).unwrap_or(0), imr)
                 }
-                Some(crate::proto::iothub::data_record::K::Imr(imr_ref)) => (0, imr_ref.path.clone()),
+                Some(crate::proto::iothub::data_record::K::Imr(imr_ref)) => {
+                    (0, imr_ref.path.clone())
+                }
                 None => (0, "Unknown Imr".to_string()),
             };
 
@@ -1976,19 +2105,27 @@ mod tests {
     #[test]
     fn topic_display_name_prop_data_rules() {
         assert_eq!(
-            topic_display_name("persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-626221420272574464"),
+            topic_display_name(
+                "persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-626221420272574464"
+            ),
             "GRID_Guarantee"
         );
         assert_eq!(
-            topic_display_name("non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee-626221420272574464"),
+            topic_display_name(
+                "non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee-626221420272574464"
+            ),
             "FAST_Guarantee"
         );
         assert_eq!(
-            topic_display_name("persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-60-626221420272574464"),
+            topic_display_name(
+                "persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-60-626221420272574464"
+            ),
             "GRID_SECTION_60"
         );
         assert_eq!(
-            topic_display_name("persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-WindPower-626221420272574464"),
+            topic_display_name(
+                "persistent://goldwind/iothub/prop_data-BZ-GRID_SECTION-realdev-WindPower-626221420272574464"
+            ),
             "GRID_SECTION_WindPower"
         );
     }
@@ -2016,6 +2153,9 @@ impl Render for ConfigView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
             .on_action(cx.listener(|this, mode: &AgentQueryMode, _window, cx| {
                 this.agent_query_mode = *mode;
                 this.clear_selected_agent_if_filtered_out(cx);
