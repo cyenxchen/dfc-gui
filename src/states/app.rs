@@ -5,9 +5,9 @@
 use crate::connection::{
     DfcServerConfig, EncryptedPresetCredential, PresetCredential, get_servers, save_servers,
 };
-use crate::helpers::{decrypt, encrypt};
 use crate::error::{Error, Result};
 use crate::helpers::get_or_create_config_dir;
+use crate::helpers::{decrypt, encrypt};
 use crate::services::ServiceHub;
 use crate::states::{ConfigState, FleetState, KeysState};
 use chrono::Local;
@@ -16,7 +16,9 @@ use gpui_component::ThemeMode;
 use locale_config::Locale;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -356,6 +358,7 @@ pub struct DfcGlobalStore {
     config_state: Entity<ConfigState>,
     keys_state: Entity<KeysState>,
     services: ServiceHub,
+    pending_context_server_id: Rc<RefCell<Option<String>>>,
 }
 
 impl DfcGlobalStore {
@@ -373,6 +376,7 @@ impl DfcGlobalStore {
             config_state,
             keys_state,
             services,
+            pending_context_server_id: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -418,6 +422,16 @@ impl DfcGlobalStore {
     /// Get a clone of current app state
     pub fn value(&self, cx: &App) -> DfcAppState {
         self.app_state.read(cx).clone()
+    }
+
+    /// Stash the server id selected from a context menu action.
+    pub fn set_pending_server(&self, server_id: impl Into<String>) {
+        *self.pending_context_server_id.borrow_mut() = Some(server_id.into());
+    }
+
+    /// Take the pending server id associated with the latest context menu action.
+    pub fn take_pending_server(&self) -> Option<String> {
+        self.pending_context_server_id.borrow_mut().take()
     }
 }
 

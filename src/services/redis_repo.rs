@@ -4,16 +4,16 @@
 //! stored in Redis. Handles one-time queries and caching.
 
 use crate::connection::{
-    ConfigItem, DetailItem, DfcServerConfig, RedisKeyItem, RedisKeyType, RedisKeyValue,
-    TopicAgentItem, TopicDetail, REDIS_KEY_PATTERNS,
+    ConfigItem, DetailItem, DfcServerConfig, REDIS_KEY_PATTERNS, RedisKeyItem, RedisKeyType,
+    RedisKeyValue, TopicAgentItem, TopicDetail,
 };
 use crate::error::{Error, Result};
 use crate::services::events::{DeviceId, DeviceMeta};
 use crossbeam_channel::Sender;
-use fred::prelude::*;
 use fred::clients::Client as FredClient;
-use fred::types::config::Config as FredConfig;
+use fred::prelude::*;
 use fred::types::CustomCommand;
+use fred::types::config::Config as FredConfig;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +79,12 @@ impl RedisRepo {
 
     /// Connect to a specific server configuration
     pub async fn connect_to_server(&self, server: &DfcServerConfig) -> Result<()> {
-        tracing::info!("Connecting to Redis server: {} ({}:{})", server.name, server.host, server.port);
+        tracing::info!(
+            "Connecting to Redis server: {} ({}:{})",
+            server.name,
+            server.host,
+            server.port
+        );
 
         // Build Redis config
         let mut redis_config = FredConfig::default();
@@ -99,7 +104,9 @@ impl RedisRepo {
                 config.connection_timeout = Duration::from_secs(10);
             })
             .build()
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
         // Enter tokio runtime context for fred client
         // Fred internally uses tokio::task::spawn which requires a tokio runtime
@@ -109,7 +116,9 @@ impl RedisRepo {
         client.connect();
         client.wait_for_connect().await.map_err(|e| {
             tracing::error!("Failed to connect to Redis: {}", e);
-            Error::Connection { message: e.to_string() }
+            Error::Connection {
+                message: e.to_string(),
+            }
         })?;
 
         // Store client
@@ -172,17 +181,19 @@ impl RedisRepo {
 
             // Use KEYS command for pattern matching
             let cmd = CustomCommand::new_static("KEYS", None, false);
-            let keys_result: Value = client.custom(cmd, vec![Value::from(scan_pattern.clone())]).await.map_err(|e: fred::error::Error| {
-                tracing::error!("Redis KEYS failed: {}", e);
-                Error::Connection { message: e.to_string() }
-            })?;
+            let keys_result: Value = client
+                .custom(cmd, vec![Value::from(scan_pattern.clone())])
+                .await
+                .map_err(|e: fred::error::Error| {
+                    tracing::error!("Redis KEYS failed: {}", e);
+                    Error::Connection {
+                        message: e.to_string(),
+                    }
+                })?;
 
             // Convert Value to Vec<String>
             let keys: Vec<String> = match keys_result {
-                Value::Array(arr) => arr
-                    .into_iter()
-                    .filter_map(|v| v.into_string())
-                    .collect(),
+                Value::Array(arr) => arr.into_iter().filter_map(|v| v.into_string()).collect(),
                 _ => vec![],
             };
 
@@ -219,9 +230,19 @@ impl RedisRepo {
                     if self.is_output_iothub_key(&key) {
                         self.build_output_iothub_topic_agents(&config_json, &agent_ids, group_id)
                     } else if self.is_input_iothub_key(&key) {
-                        self.build_input_iothub_topic_agents(&config_json, &agent_ids, &app_id, group_id)
+                        self.build_input_iothub_topic_agents(
+                            &config_json,
+                            &agent_ids,
+                            &app_id,
+                            group_id,
+                        )
                     } else if self.is_io_iothub_key(&key) {
-                        self.build_io_iothub_topic_agents(&config_json, &agent_ids, &app_id, group_id)
+                        self.build_io_iothub_topic_agents(
+                            &config_json,
+                            &agent_ids,
+                            &app_id,
+                            group_id,
+                        )
                     } else {
                         self.build_topic_agents_from_details(&agent_ids, &details, group_id)
                     }
@@ -301,7 +322,9 @@ impl RedisRepo {
                     .custom(cmd, vec![Value::from(key.to_string())])
                     .await
                     .unwrap_or(Value::Null);
-                result.into_string().map(|s| Self::parse_config_string_value(&s))
+                result
+                    .into_string()
+                    .map(|s| Self::parse_config_string_value(&s))
             }
             "list" => {
                 let cmd = CustomCommand::new_static("LRANGE", None, false);
@@ -317,7 +340,8 @@ impl RedisRepo {
                     .await
                     .unwrap_or(Value::Null);
                 if let Value::Array(arr) = result {
-                    let values: Vec<String> = arr.into_iter().filter_map(|v| v.into_string()).collect();
+                    let values: Vec<String> =
+                        arr.into_iter().filter_map(|v| v.into_string()).collect();
                     Some(Self::parse_list_values(values))
                 } else {
                     None
@@ -450,7 +474,8 @@ impl RedisRepo {
         };
 
         let infos: Vec<Info> = serde_json::from_value(json).unwrap_or_default();
-        let mut map: std::collections::HashMap<(String, u32), String> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<(String, u32), String> =
+            std::collections::HashMap::new();
 
         for info in infos {
             let uuid_base = match info.uuid.split('_').next() {
@@ -527,11 +552,10 @@ impl RedisRepo {
             return Vec::new();
         }
 
-        let mut topics_by_agent: std::collections::BTreeMap<String, Vec<TopicDetail>> =
-            agent_ids
-                .iter()
-                .map(|id| (id.clone(), Vec::new()))
-                .collect();
+        let mut topics_by_agent: std::collections::BTreeMap<String, Vec<TopicDetail>> = agent_ids
+            .iter()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect();
         let mut index_by_agent: std::collections::BTreeMap<String, i32> =
             agent_ids.iter().map(|id| (id.clone(), 0)).collect();
 
@@ -554,12 +578,8 @@ impl RedisRepo {
             let cmd_resp = Self::get_json_string(entry, "topicSvrResp");
 
             for agent_id in agent_ids {
-                let idx = index_by_agent
-                    .get_mut(agent_id)
-                    .expect("agent index");
-                let topics = topics_by_agent
-                    .get_mut(agent_id)
-                    .expect("agent topics");
+                let idx = index_by_agent.get_mut(agent_id).expect("agent index");
+                let topics = topics_by_agent.get_mut(agent_id).expect("agent topics");
 
                 let mut push_topic = |value: Option<String>| {
                     if let Some(path) = value.filter(|s| !s.is_empty()) {
@@ -669,12 +689,8 @@ impl RedisRepo {
                 let mut matched = false;
                 for agent_id in &effective_agents {
                     if Self::topic_matches_agent(&topic, agent_id) {
-                        let idx = index_by_agent
-                            .get_mut(agent_id)
-                            .expect("agent index");
-                        let list = topics_by_agent
-                            .get_mut(agent_id)
-                            .expect("agent list");
+                        let idx = index_by_agent.get_mut(agent_id).expect("agent index");
+                        let list = topics_by_agent.get_mut(agent_id).expect("agent list");
                         list.push(TopicDetail {
                             index: *idx,
                             path: topic.clone(),
@@ -688,12 +704,8 @@ impl RedisRepo {
 
                 if !matched {
                     for agent_id in &effective_agents {
-                        let idx = index_by_agent
-                            .get_mut(agent_id)
-                            .expect("agent index");
-                        let list = topics_by_agent
-                            .get_mut(agent_id)
-                            .expect("agent list");
+                        let idx = index_by_agent.get_mut(agent_id).expect("agent index");
+                        let list = topics_by_agent.get_mut(agent_id).expect("agent list");
                         list.push(TopicDetail {
                             index: *idx,
                             path: topic.clone(),
@@ -746,12 +758,8 @@ impl RedisRepo {
                 let mut matched = false;
                 for agent_id in agent_ids {
                     if Self::topic_matches_agent(&topic, agent_id) {
-                        let idx = index_by_agent
-                            .get_mut(agent_id)
-                            .expect("agent index");
-                        let list = topics_by_agent
-                            .get_mut(agent_id)
-                            .expect("agent list");
+                        let idx = index_by_agent.get_mut(agent_id).expect("agent index");
+                        let list = topics_by_agent.get_mut(agent_id).expect("agent list");
                         list.push(TopicDetail {
                             index: *idx,
                             path: topic.clone(),
@@ -770,12 +778,8 @@ impl RedisRepo {
                         Some(app_id.to_string())
                     };
                     if let Some(target_id) = target_id {
-                        let idx = index_by_agent
-                            .get_mut(&target_id)
-                            .expect("agent index");
-                        let list = topics_by_agent
-                            .get_mut(&target_id)
-                            .expect("agent list");
+                        let idx = index_by_agent.get_mut(&target_id).expect("agent index");
+                        let list = topics_by_agent.get_mut(&target_id).expect("agent list");
                         list.push(TopicDetail {
                             index: *idx,
                             path: topic.clone(),
@@ -855,10 +859,7 @@ impl RedisRepo {
     }
 
     fn pick_first_starting_with(values: &[String], prefix: &str) -> Option<String> {
-        values
-            .iter()
-            .find(|s| s.starts_with(prefix))
-            .cloned()
+        values.iter().find(|s| s.starts_with(prefix)).cloned()
     }
 
     fn pick_first_starting_with_and_ends(
@@ -906,7 +907,8 @@ impl RedisRepo {
                     index += 1;
                 } else if let Some(obj) = item.as_object() {
                     // Handle object with path/topic field
-                    let path = obj.get("path")
+                    let path = obj
+                        .get("path")
                         .or_else(|| obj.get("topic"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
@@ -918,7 +920,8 @@ impl RedisRepo {
                         .map(|v| v as i32)
                         .unwrap_or(index);
 
-                    let visibility = obj.get("visibility")
+                    let visibility = obj
+                        .get("visibility")
                         .or_else(|| obj.get("visible"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
@@ -968,7 +971,8 @@ impl RedisRepo {
     fn extract_service_url(&self, key: &str, value: &str) -> String {
         // Try to extract from JSON value first
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
-            if let Some(url) = json.get("url")
+            if let Some(url) = json
+                .get("url")
                 .or_else(|| json.get("serviceUrl"))
                 .or_else(|| json.get("service_url"))
                 .or_else(|| json.get("serviceurl"))
@@ -1019,7 +1023,10 @@ impl RedisRepo {
             "prop".to_string()
         } else if path.contains("/event/") || path.contains("/events/") {
             "event".to_string()
-        } else if path.contains("/cmd/") || path.contains("/command/") || path.contains("/commands/") {
+        } else if path.contains("/cmd/")
+            || path.contains("/command/")
+            || path.contains("/commands/")
+        {
             "cmd".to_string()
         } else if path.contains("/telemetry/") || path.contains("/tele/") {
             "telemetry".to_string()
@@ -1069,11 +1076,7 @@ impl RedisRepo {
     }
 
     /// Update device configuration in Redis
-    pub async fn update_device_config(
-        &self,
-        device_id: &DeviceId,
-        config: &str,
-    ) -> Result<()> {
+    pub async fn update_device_config(&self, device_id: &DeviceId, config: &str) -> Result<()> {
         // TODO: Implement actual Redis write
         tracing::info!("Updating config for device {}", device_id);
         Ok(())
@@ -1115,7 +1118,11 @@ impl RedisRepo {
             message: "Not connected to Redis".to_string(),
         })?;
 
-        tracing::debug!("Scanning keys with pattern: {}, cursor: {}", pattern, cursor);
+        tracing::debug!(
+            "Scanning keys with pattern: {}, cursor: {}",
+            pattern,
+            cursor
+        );
 
         // Build SCAN command: SCAN cursor [MATCH pattern] [COUNT count]
         let cmd = CustomCommand::new_static("SCAN", None, false);
@@ -1131,7 +1138,9 @@ impl RedisRepo {
 
         let result: Value = client.custom(cmd, args).await.map_err(|e| {
             tracing::error!("Redis SCAN failed: {}", e);
-            Error::Connection { message: e.to_string() }
+            Error::Connection {
+                message: e.to_string(),
+            }
         })?;
 
         // Parse SCAN result: [cursor, [key1, key2, ...]]
@@ -1225,7 +1234,9 @@ impl RedisRepo {
         let result: Value = client
             .custom(cmd, vec![Value::from(key.to_string())])
             .await
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
         result.into_string().ok_or_else(|| Error::Parse {
             message: "Failed to parse string value".to_string(),
@@ -1245,7 +1256,9 @@ impl RedisRepo {
         let result: Value = client
             .custom(cmd, vec![Value::from(key.to_string())])
             .await
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
         match result {
             Value::Array(arr) => {
@@ -1282,7 +1295,9 @@ impl RedisRepo {
                 ],
             )
             .await
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
         match result {
             Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
@@ -1303,7 +1318,9 @@ impl RedisRepo {
         let result: Value = client
             .custom(cmd, vec![Value::from(key.to_string())])
             .await
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
         match result {
             Value::Array(arr) => Ok(arr.into_iter().filter_map(|v| v.into_string()).collect()),
@@ -1332,7 +1349,9 @@ impl RedisRepo {
                 ],
             )
             .await
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
         match result {
             Value::Array(arr) => {
@@ -1412,10 +1431,8 @@ mod tests {
 
     #[test]
     fn parse_list_values_parses_each_item() {
-        let value = RedisRepo::parse_list_values(vec![
-            "{\"a\":1}".to_string(),
-            "plain".to_string(),
-        ]);
+        let value =
+            RedisRepo::parse_list_values(vec!["{\"a\":1}".to_string(), "plain".to_string()]);
         let arr = value.as_array().expect("array");
         assert!(arr[0].is_object());
         assert!(arr[1].is_string());

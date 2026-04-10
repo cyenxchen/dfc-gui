@@ -52,6 +52,15 @@ pub enum CommandAction {
     Cancel,
 }
 
+/// Sidebar server tab actions
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+pub enum ServerAction {
+    /// Edit the selected server
+    Edit,
+    /// Reconnect the selected server
+    Reconnect,
+}
+
 /// Convert a keystroke string to human-readable format
 ///
 /// Platform-specific formatting:
@@ -74,35 +83,55 @@ pub fn humanize_keystroke(keystroke: &str) -> String {
         let symbol = match part {
             "secondary" | "cmd" => {
                 #[cfg(target_os = "macos")]
-                { "⌘" }
+                {
+                    "⌘"
+                }
                 #[cfg(not(target_os = "macos"))]
-                { "Ctrl" }
+                {
+                    "Ctrl"
+                }
             }
             "ctrl" => {
                 #[cfg(target_os = "macos")]
-                { "⌃" }
+                {
+                    "⌃"
+                }
                 #[cfg(not(target_os = "macos"))]
-                { "Ctrl" }
+                {
+                    "Ctrl"
+                }
             }
             "alt" => {
                 #[cfg(target_os = "macos")]
-                { "⌥" }
+                {
+                    "⌥"
+                }
                 #[cfg(not(target_os = "macos"))]
-                { "Alt" }
+                {
+                    "Alt"
+                }
             }
             "shift" => {
                 #[cfg(target_os = "macos")]
-                { "⇧" }
+                {
+                    "⇧"
+                }
                 #[cfg(not(target_os = "macos"))]
-                { "Shift" }
+                {
+                    "Shift"
+                }
             }
             "enter" => "Enter",
             "space" => "Space",
             "backspace" => {
                 #[cfg(target_os = "macos")]
-                { "⌫" }
+                {
+                    "⌫"
+                }
                 #[cfg(not(target_os = "macos"))]
-                { "Backspace" }
+                {
+                    "Backspace"
+                }
             }
             "escape" => "Esc",
             c => {

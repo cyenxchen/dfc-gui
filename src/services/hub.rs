@@ -5,8 +5,8 @@
 
 use crate::error::Result;
 use crate::services::{
-    generate_correlation_id, DeviceId, DeviceMeta, PulsarBus, PulsarConfig, RedisConfig,
-    RedisRepo, RetryConfig, ServiceEvent, Supervisor,
+    DeviceId, DeviceMeta, PulsarBus, PulsarConfig, RedisConfig, RedisRepo, RetryConfig,
+    ServiceEvent, Supervisor, generate_correlation_id,
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::Arc;
@@ -44,16 +44,9 @@ impl ServiceHub {
         let (tx, rx) = crossbeam_channel::unbounded();
 
         // Create supervisors
-        let redis_supervisor = Arc::new(Supervisor::new(
-            "redis",
-            config.retry.clone(),
-            tx.clone(),
-        ));
-        let pulsar_supervisor = Arc::new(Supervisor::new(
-            "pulsar",
-            config.retry.clone(),
-            tx.clone(),
-        ));
+        let redis_supervisor = Arc::new(Supervisor::new("redis", config.retry.clone(), tx.clone()));
+        let pulsar_supervisor =
+            Arc::new(Supervisor::new("pulsar", config.retry.clone(), tx.clone()));
 
         // Create services
         let redis = Arc::new(RedisRepo::new(&config.redis, tx.clone())?);
@@ -115,14 +108,10 @@ impl ServiceHub {
     /// Send a command to a device
     ///
     /// Returns a correlation ID that can be used to track the command response.
-    pub fn send_command(
-        &self,
-        device: &DeviceId,
-        method: &str,
-        params: &str,
-    ) -> Result<Arc<str>> {
+    pub fn send_command(&self, device: &DeviceId, method: &str, params: &str) -> Result<Arc<str>> {
         let correlation_id = generate_correlation_id();
-        self.pulsar.send_command(device, method, params, &correlation_id)?;
+        self.pulsar
+            .send_command(device, method, params, &correlation_id)?;
         Ok(correlation_id)
     }
 

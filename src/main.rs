@@ -5,7 +5,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crate::constants::SIDEBAR_WIDTH;
-use crate::helpers::{DeviceAction, MenuAction, get_or_create_log_dir, is_development, new_key_bindings};
+use crate::helpers::{
+    DeviceAction, MenuAction, ServerAction, get_or_create_log_dir, is_development, new_key_bindings,
+};
 use crate::services::ServiceHub;
 use crate::states::{
     ConfigState, DfcAppState, DfcGlobalStore, FleetState, FontSize, FontSizeAction, KeysState,
@@ -141,7 +143,12 @@ impl Render for DfcApp {
         }
 
         // Apply font size
-        if let Some(font_size) = cx.global::<DfcGlobalStore>().read(cx).font_size().to_pixels() {
+        if let Some(font_size) = cx
+            .global::<DfcGlobalStore>()
+            .read(cx)
+            .font_size()
+            .to_pixels()
+        {
             window.set_rem_size(font_size);
         }
 
@@ -218,6 +225,29 @@ impl Render for DfcApp {
                     });
                 }
             }))
+            .on_action(cx.listener(|this, e: &ServerAction, window, cx| {
+                let store = cx.global::<DfcGlobalStore>().clone();
+                let Some(server_id) = store.take_pending_server() else {
+                    return;
+                };
+
+                match e {
+                    ServerAction::Edit => {
+                        let server = store.read(cx).server(&server_id).cloned();
+                        if let Some(server) = server {
+                            this.content.update(cx, |content, cx| {
+                                content.fill_inputs(window, cx, &server);
+                                content.open_server_dialog(window, cx);
+                            });
+                        }
+                    }
+                    ServerAction::Reconnect => {
+                        this.content.update(cx, |content, cx| {
+                            content.reconnect_server(&server_id, cx);
+                        });
+                    }
+                }
+            }))
     }
 }
 
@@ -245,18 +275,14 @@ fn init_logger() {
 
     // File layer - daily rotating logs
     let file_layer = if let Ok(log_dir) = get_or_create_log_dir() {
-        let file_appender = RollingFileAppender::new(
-            Rotation::DAILY,
-            &log_dir,
-            "dfc-gui.log",
-        );
+        let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, "dfc-gui.log");
 
         Some(
             fmt::layer()
                 .with_timer(timer)
                 .with_ansi(false)
                 .with_target(true)
-                .with_writer(file_appender)
+                .with_writer(file_appender),
         )
     } else {
         eprintln!("Warning: Could not create log directory, file logging disabled");
@@ -265,9 +291,7 @@ fn init_logger() {
 
     // Build subscriber with both layers
     let subscriber = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::filter::LevelFilter::from_level(level)
-        )
+        .with(tracing_subscriber::filter::LevelFilter::from_level(level))
         .with(console_layer)
         .with(file_layer);
 

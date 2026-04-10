@@ -7,11 +7,13 @@ use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credential
 use crate::constants::DEFAULT_PULSAR_TOKEN;
 use crate::helpers::DeviceAction;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, FleetState, KeysState, Route, UIEvent, i18n_common, i18n_servers,
-    i18n_settings, i18n_sidebar, update_app_state_and_save,
+    ConfigState, DfcAppState, DfcGlobalStore, FleetState, KeysState, Route, UIEvent, i18n_common,
+    i18n_servers, i18n_settings, i18n_sidebar, update_app_state_and_save,
 };
 use crate::views::{ConfigView, KeysBrowserView};
-use gpui::{App, Context, Entity, FocusHandle, SharedString, Subscription, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, FocusHandle, SharedString, Subscription, Window, div, prelude::*, px,
+};
 use gpui_component::{
     ActiveTheme, Colorize, Icon, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants},
@@ -94,13 +96,17 @@ impl DfcContent {
 
         // Create ConfigView
         let config_view = cx.new(|cx| {
-            ConfigView::new(app_state.clone(), config_state.clone(), keys_state.clone(), window, cx)
+            ConfigView::new(
+                app_state.clone(),
+                config_state.clone(),
+                keys_state.clone(),
+                window,
+                cx,
+            )
         });
 
         // Create KeysBrowserView
-        let keys_browser_view = cx.new(|cx| {
-            KeysBrowserView::new(keys_state.clone(), window, cx)
-        });
+        let keys_browser_view = cx.new(|cx| KeysBrowserView::new(keys_state.clone(), window, cx));
 
         // Create and focus the handle for keyboard shortcuts
         let focus_handle = cx.focus_handle();
@@ -134,11 +140,19 @@ impl DfcContent {
                     // TODO: Show notification
                     tracing::info!("Toast: {} (error: {})", message, is_error);
                 }
-                UIEvent::ConnectionStateChanged { service, connected, detail } => {
+                UIEvent::ConnectionStateChanged {
+                    service,
+                    connected,
+                    detail,
+                } => {
                     tracing::info!(
                         "Connection: {} - {} ({})",
                         service,
-                        if *connected { "connected" } else { "disconnected" },
+                        if *connected {
+                            "connected"
+                        } else {
+                            "disconnected"
+                        },
                         detail
                     );
                 }
@@ -202,32 +216,38 @@ impl DfcContent {
         });
 
         // Subscribe to preset credentials input for auto-save on blur
-        subscriptions.push(cx.subscribe(&preset_credentials_state, |this, state, event, cx| {
-            if matches!(event, InputEvent::Blur) {
-                let text = state.read(cx).value();
-                let credentials = text_to_credentials(&text);
-                update_app_state_and_save(cx, "set_preset_credentials", move |state, _| {
-                    state.set_preset_credentials(credentials.clone());
-                });
-            }
-        }));
+        subscriptions.push(
+            cx.subscribe(&preset_credentials_state, |this, state, event, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    let text = state.read(cx).value();
+                    let credentials = text_to_credentials(&text);
+                    update_app_state_and_save(cx, "set_preset_credentials", move |state, _| {
+                        state.set_preset_credentials(credentials.clone());
+                    });
+                }
+            }),
+        );
 
         // Subscribe to port input for stepping
-        subscriptions.push(cx.subscribe_in(&port_state, window, |_this, state, event, window, cx| {
-            let NumberInputEvent::Step(action) = event;
-            let Ok(current_val) = state.read(cx).value().parse::<u16>() else {
-                return;
-            };
-            let new_val = match action {
-                StepAction::Increment => current_val.saturating_add(1),
-                StepAction::Decrement => current_val.saturating_sub(1),
-            };
-            if new_val != current_val {
-                state.update(cx, |input, cx| {
-                    input.set_value(new_val.to_string(), window, cx);
-                });
-            }
-        }));
+        subscriptions.push(cx.subscribe_in(
+            &port_state,
+            window,
+            |_this, state, event, window, cx| {
+                let NumberInputEvent::Step(action) = event;
+                let Ok(current_val) = state.read(cx).value().parse::<u16>() else {
+                    return;
+                };
+                let new_val = match action {
+                    StepAction::Increment => current_val.saturating_add(1),
+                    StepAction::Decrement => current_val.saturating_sub(1),
+                };
+                if new_val != current_val {
+                    state.update(cx, |input, cx| {
+                        input.set_value(new_val.to_string(), window, cx);
+                    });
+                }
+            },
+        ));
 
         Self {
             current_route,
@@ -276,7 +296,12 @@ impl DfcContent {
     }
 
     /// Fill input fields with server data for editing
-    fn fill_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>, server: &DfcServerConfig) {
+    pub fn fill_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        server: &DfcServerConfig,
+    ) {
         self.editing_server_id = server.id.clone();
 
         self.name_state.update(cx, |state, cx| {
@@ -348,7 +373,12 @@ impl DfcContent {
         let server_id = server_id.to_string();
 
         window.open_dialog(cx, move |dialog, _, cx| {
-            let message = t!("servers.remove_prompt", server = &server_name, locale = &locale).to_string();
+            let message = t!(
+                "servers.remove_prompt",
+                server = &server_name,
+                locale = &locale
+            )
+            .to_string();
             let app_state = app_state.clone();
             let server_id = server_id.clone();
 
@@ -367,7 +397,7 @@ impl DfcContent {
     }
 
     /// Open add/edit server dialog
-    fn open_server_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_server_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app_state = self.app_state.clone();
         let name_state = self.name_state.clone();
         let host_state = self.host_state.clone();
@@ -483,10 +513,22 @@ impl DfcContent {
                     let form = v_form()
                         .child(field().label(name_label).child(Input::new(&name_state)))
                         .child(field().label(host_label).child(Input::new(&host_state)))
-                        .child(field().label(port_label).child(NumberInput::new(&port_state)))
-                        .child(field().label(password_label).child(Input::new(&password_state).mask_toggle()))
+                        .child(
+                            field()
+                                .label(port_label)
+                                .child(NumberInput::new(&port_state)),
+                        )
+                        .child(
+                            field()
+                                .label(password_label)
+                                .child(Input::new(&password_state).mask_toggle()),
+                        )
                         .child(field().label(cfgid_label).child(Input::new(&cfgid_state)))
-                        .child(field().label(device_filter_label).child(Input::new(&device_filter_state)))
+                        .child(
+                            field()
+                                .label(device_filter_label)
+                                .child(Input::new(&device_filter_state)),
+                        )
                         .child(
                             field()
                                 .label(pulsar_token_label)
@@ -515,21 +557,82 @@ impl DfcContent {
                                 .on_click(|_, window, cx| {
                                     window.close_dialog(cx);
                                 }),
-                            Button::new("ok")
-                                .primary()
-                                .label(submit_label)
-                                .on_click({
-                                    let handle = handle.clone();
-                                    move |_, window, cx| {
-                                        if handle.clone()(window, cx) {
-                                            window.close_dialog(cx);
-                                        }
+                            Button::new("ok").primary().label(submit_label).on_click({
+                                let handle = handle.clone();
+                                move |_, window, cx| {
+                                    if handle.clone()(window, cx) {
+                                        window.close_dialog(cx);
                                     }
-                                }),
+                                }
+                            }),
                         ]
                     }
                 })
         });
+    }
+
+    /// Reconnect a server and refresh its config list.
+    pub fn reconnect_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        let Some(server) = self.app_state.read(cx).server(server_id).cloned() else {
+            return;
+        };
+
+        let server_id = server_id.to_string();
+
+        self.keys_state.update(cx, |state, cx| {
+            if state.active_server_id() == Some(server_id.as_str()) {
+                state.clear_keys(cx);
+            } else {
+                state.set_active_server(Some(server_id.clone()), cx);
+            }
+        });
+
+        self.config_state.update(cx, |state, cx| {
+            state.set_loading(cx);
+            state.add_connected_server(server_id.clone(), cx);
+        });
+
+        self.app_state.update(cx, |state, cx| {
+            state.select_server(Some(server_id.clone()), cx);
+        });
+
+        cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
+            store.update(cx, |state, cx| {
+                state.go_to(Route::Home, cx);
+            });
+        });
+
+        let config_state = self.config_state.clone();
+        let store = cx.global::<DfcGlobalStore>().clone();
+
+        cx.spawn(async move |_, cx| {
+            let redis = store.services().redis();
+            let cfgid = server.cfgid.as_deref();
+
+            if let Err(e) = redis.connect_to_server(&server).await {
+                tracing::error!("Failed to connect to Redis: {}", e);
+                let _ = config_state.update(cx, |state, cx| {
+                    state.set_error(e.to_string(), cx);
+                });
+                return;
+            }
+
+            match redis.fetch_configs(cfgid).await {
+                Ok(configs) => {
+                    tracing::info!("Fetched {} configs", configs.len());
+                    let _ = config_state.update(cx, |state, cx| {
+                        state.set_configs(configs, cx);
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fetch configs: {}", e);
+                    let _ = config_state.update(cx, |state, cx| {
+                        state.set_error(e.to_string(), cx);
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     /// Render the bottom toolbar
@@ -646,57 +749,7 @@ impl DfcContent {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 tracing::info!("Server card clicked: {}", server_id);
-
-                // Get server config
-                let server = this.app_state.read(cx).server(&server_id).cloned();
-
-                if let Some(server) = server {
-                    // Set loading state in ConfigState and select the server
-                    this.config_state.update(cx, |state, cx| {
-                        state.set_loading(cx);
-                        state.set_connected_server(Some(server_id.clone()), cx);
-                    });
-
-                    // Select server in app state
-                    this.app_state.update(cx, |state, cx| {
-                        state.select_server(Some(server_id.clone()), cx);
-                    });
-
-                    // Start async task to connect and fetch configs
-                    let config_state = this.config_state.clone();
-                    let store = cx.global::<DfcGlobalStore>().clone();
-
-                    cx.spawn(async move |_, cx| {
-                        let redis = store.services().redis();
-                        let cfgid = server.cfgid.as_deref();
-
-                        // Connect to Redis
-                        if let Err(e) = redis.connect_to_server(&server).await {
-                            tracing::error!("Failed to connect to Redis: {}", e);
-                            let _ = config_state.update(cx, |state, cx| {
-                                state.set_error(e.to_string(), cx);
-                            });
-                            return;
-                        }
-
-                        // Fetch configs (uses REDIS_KEY_PATTERNS)
-                        match redis.fetch_configs(cfgid).await {
-                            Ok(configs) => {
-                                tracing::info!("Fetched {} configs", configs.len());
-                                let _ = config_state.update(cx, |state, cx| {
-                                    state.set_configs(configs, cx);
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to fetch configs: {}", e);
-                                let _ = config_state.update(cx, |state, cx| {
-                                    state.set_error(e.to_string(), cx);
-                                });
-                            }
-                        }
-                    })
-                    .detach();
-                }
+                this.reconnect_server(&server_id, cx);
             }))
     }
 
@@ -773,11 +826,10 @@ impl DfcContent {
             .p_4()
             .child(Label::new(i18n_common(cx, "properties")).text_xl())
             .child(
-                div()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(Label::new(i18n_common(cx, "select_device")).text_color(cx.theme().muted_foreground)),
+                div().flex_1().items_center().justify_center().child(
+                    Label::new(i18n_common(cx, "select_device"))
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
     }
 
@@ -787,13 +839,9 @@ impl DfcContent {
             .size_full()
             .p_4()
             .child(Label::new(i18n_common(cx, "events")).text_xl())
-            .child(
-                div()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(Label::new(i18n_common(cx, "no_events")).text_color(cx.theme().muted_foreground)),
-            )
+            .child(div().flex_1().items_center().justify_center().child(
+                Label::new(i18n_common(cx, "no_events")).text_color(cx.theme().muted_foreground),
+            ))
     }
 
     /// Render the commands view
@@ -803,11 +851,10 @@ impl DfcContent {
             .p_4()
             .child(Label::new(i18n_common(cx, "commands")).text_xl())
             .child(
-                div()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(Label::new(i18n_common(cx, "select_device")).text_color(cx.theme().muted_foreground)),
+                div().flex_1().items_center().justify_center().child(
+                    Label::new(i18n_common(cx, "select_device"))
+                        .text_color(cx.theme().muted_foreground),
+                ),
             )
     }
 
