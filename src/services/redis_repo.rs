@@ -77,7 +77,8 @@ impl RedisRepo {
         Ok(())
     }
 
-    /// Connect to a specific server configuration, trying preset credentials if needed
+    /// Connect to a specific server configuration, trying preset credentials if needed.
+    /// Auto-detects cluster mode on the first successful connection and reconnects if needed.
     pub async fn connect_to_server(
         &self,
         server: &DfcServerConfig,
@@ -90,16 +91,13 @@ impl RedisRepo {
             server.port
         );
 
-        // Detect cluster mode once before credential loop
-        let clustered = self.detect_cluster(&server.host, server.port).await;
-
         let mut last_error = None;
 
         // Try server's own password first
         if let Some(ref pwd) = server.password {
             if !pwd.is_empty() {
                 match self
-                    .build_and_connect(&server.host, server.port, None, Some(pwd), clustered)
+                    .try_connect(&server.host, server.port, None, Some(pwd))
                     .await
                 {
                     Ok(client) => {
@@ -116,12 +114,11 @@ impl RedisRepo {
         // Try each preset credential
         for cred in preset_credentials {
             match self
-                .build_and_connect(
+                .try_connect(
                     &server.host,
                     server.port,
                     cred.username.as_deref(),
                     Some(&cred.password),
-                    clustered,
                 )
                 .await
             {
@@ -137,7 +134,7 @@ impl RedisRepo {
 
         // No-auth fallback
         match self
-            .build_and_connect(&server.host, server.port, None, None, clustered)
+            .try_connect(&server.host, server.port, None, None)
             .await
         {
             Ok(client) => {
@@ -180,14 +177,17 @@ impl RedisRepo {
         Ok(())
     }
 
-    /// Detect whether the Redis server runs in cluster mode
-    async fn detect_cluster(&self, host: &str, port: u16) -> bool {
-        let Ok(client) = self
-            .build_and_connect(host, port, None, None, false)
-            .await
-        else {
-            return false;
-        };
+    /// Connect in centralized mode, detect cluster via INFO, and reconnect in cluster mode if needed
+    async fn try_connect(
+        &self,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<FredClient> {
+        let client = self
+            .build_and_connect(host, port, username, password, false)
+            .await?;
 
         let info_cmd = CustomCommand::new_static("INFO", None, false);
         let info: String = client
@@ -195,13 +195,15 @@ impl RedisRepo {
             .await
             .unwrap_or_default();
 
-        let _ = client.quit().await;
-
-        let is_cluster = info.contains("redis_mode:cluster");
-        if is_cluster {
-            tracing::info!("Detected Redis Cluster mode");
+        if info.contains("redis_mode:cluster") {
+            tracing::info!("Detected Redis Cluster mode, reconnecting...");
+            let _ = client.quit().await;
+            return self
+                .build_and_connect(host, port, username, password, true)
+                .await;
         }
-        is_cluster
+
+        Ok(client)
     }
 
     /// Build a fred client and connect
