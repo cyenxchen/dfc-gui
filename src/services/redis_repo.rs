@@ -155,7 +155,7 @@ impl RedisRepo {
         Err(err)
     }
 
-    /// Try connecting with specific credentials
+    /// Try connecting with specific credentials, auto-detecting cluster mode
     async fn try_connect(
         &self,
         host: &str,
@@ -163,9 +163,47 @@ impl RedisRepo {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<FredClient> {
+        // Connect in centralized mode first
+        let client = self
+            .build_and_connect(host, port, username, password, false)
+            .await?;
+
+        // Detect cluster mode via INFO server
+        let info_cmd = CustomCommand::new_static("INFO", None, false);
+        let info: String = client
+            .custom(info_cmd, vec![Value::from("server")])
+            .await
+            .unwrap_or_default();
+
+        if info.contains("redis_mode:cluster") {
+            tracing::info!("Detected Redis Cluster mode, reconnecting...");
+            let _ = client.quit().await;
+            return self
+                .build_and_connect(host, port, username, password, true)
+                .await;
+        }
+
+        Ok(client)
+    }
+
+    /// Build a fred client and connect
+    async fn build_and_connect(
+        &self,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+        clustered: bool,
+    ) -> Result<FredClient> {
+        let server = fred::prelude::Server::new(host.to_string(), port);
         let mut redis_config = FredConfig::default();
-        redis_config.server = ServerConfig::Centralized {
-            server: fred::prelude::Server::new(host.to_string(), port),
+        redis_config.server = if clustered {
+            ServerConfig::Clustered {
+                hosts: vec![server],
+                policy: fred::types::config::ClusterDiscoveryPolicy::ConfigEndpoint,
+            }
+        } else {
+            ServerConfig::Centralized { server }
         };
 
         if let Some(pwd) = password {
