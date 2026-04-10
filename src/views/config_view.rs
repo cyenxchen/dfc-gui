@@ -1950,11 +1950,36 @@ async fn run_prop_topic_stream(
         }
     };
 
-    // Use a Consumer (not Reader) so partitioned topics work correctly.
-    // The pulsar crate Reader only binds to one partition for partitioned topics.
-    //
-    // NOTE: We use `Shared` to avoid exclusive-subscription churn when the broker
-    // takes time to release a closed consumer during reconnects.
+    // Diagnostic: list broker topics to verify target exists.
+    if let Some(namespace) = topic_path.split("://").nth(1).and_then(|rest| {
+        let mut parts = rest.splitn(3, '/');
+        let tenant = parts.next()?;
+        let ns = parts.next()?;
+        Some(format!("{tenant}/{ns}"))
+    }) {
+        use pulsar::message::proto::command_get_topics_of_namespace::Mode;
+        let mode = if topic_path.starts_with("persistent://") {
+            Mode::Persistent
+        } else {
+            Mode::NonPersistent
+        };
+        match client
+            .get_topics_of_namespace(namespace.clone(), mode)
+            .await
+        {
+            Ok(topics) => {
+                let found = topics.iter().any(|t| *t == topic_path);
+                tracing::debug!(
+                    namespace = %namespace,
+                    total = topics.len(),
+                    target = %topic_path,
+                    found,
+                    "Topic namespace listing"
+                );
+            }
+            Err(e) => tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e),
+        }
+    }
     let subscription = format!("dfc-gui-prop-{}", uuid::Uuid::new_v4());
 
     let mut last_stats = Instant::now();
@@ -1968,6 +1993,16 @@ async fn run_prop_topic_stream(
 
     while !*stop.borrow() {
         connect_attempt += 1;
+
+        // Exponential backoff on reconnect (skip delay on first attempt)
+        if connect_attempt > 1 {
+            let backoff = Duration::from_secs((2u64.pow(connect_attempt.min(5) as u32)).min(30));
+            tracing::info!(backoff_secs = backoff.as_secs(), attempt = connect_attempt, "reconnecting after backoff");
+            tokio::time::sleep(backoff).await;
+            if *stop.borrow() {
+                return;
+            }
+        }
 
         let options = pulsar::ConsumerOptions::default()
             .durable(false)
@@ -1992,10 +2027,12 @@ async fn run_prop_topic_stream(
             .build()
             .await
         {
-            Ok(c) => c,
+            Ok(c) => {
+                connect_attempt = 0;
+                c
+            }
             Err(e) => {
                 let _ = tx.send(PropStreamEvent::Error(format!("创建 Consumer 失败: {e}")));
-                tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
