@@ -19,8 +19,8 @@ pub struct ConfigState {
     selected_config_id: Option<i32>,
     /// Currently selected topic index within the config
     selected_topic_index: Option<i32>,
-    /// ID of the connected server
-    connected_server_id: Option<String>,
+    /// IDs of all connected servers (supports multiple)
+    connected_server_ids: Vec<String>,
     /// Currently selected TopicAgentId
     selected_agent_id: Option<String>,
 }
@@ -34,7 +34,7 @@ impl ConfigState {
             load_state: ConfigLoadState::Idle,
             selected_config_id: None,
             selected_topic_index: None,
-            connected_server_id: None,
+            connected_server_ids: Vec::new(),
             selected_agent_id: None,
         }
     }
@@ -66,9 +66,9 @@ impl ConfigState {
         self.selected_topic_index
     }
 
-    /// Get the connected server ID
-    pub fn connected_server_id(&self) -> Option<&str> {
-        self.connected_server_id.as_deref()
+    /// Get all connected server IDs
+    pub fn connected_server_ids(&self) -> &[String] {
+        &self.connected_server_ids
     }
 
     /// Get the currently selected config item
@@ -97,9 +97,11 @@ impl ConfigState {
 
     /// Get the currently selected TopicAgentItem
     pub fn selected_agent(&self) -> Option<&TopicAgentItem> {
-        self.selected_agent_id
-            .as_ref()
-            .and_then(|aid| self.topic_agents_merged.iter().find(|ta| &ta.agent_id == aid))
+        self.selected_agent_id.as_ref().and_then(|aid| {
+            self.topic_agents_merged
+                .iter()
+                .find(|ta| &ta.agent_id == aid)
+        })
     }
 
     fn rebuild_topic_agents_merged(&mut self) {
@@ -239,9 +241,17 @@ impl ConfigState {
         cx.notify();
     }
 
-    /// Set the connected server ID
-    pub fn set_connected_server(&mut self, server_id: Option<String>, cx: &mut Context<Self>) {
-        self.connected_server_id = server_id;
+    /// Add a connected server (no duplicates)
+    pub fn add_connected_server(&mut self, server_id: String, cx: &mut Context<Self>) {
+        if !self.connected_server_ids.iter().any(|id| id == &server_id) {
+            self.connected_server_ids.push(server_id);
+        }
+        cx.notify();
+    }
+
+    /// Remove a connected server
+    pub fn remove_connected_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        self.connected_server_ids.retain(|id| id != server_id);
         cx.notify();
     }
 
@@ -252,7 +262,7 @@ impl ConfigState {
         self.load_state = ConfigLoadState::Idle;
         self.selected_config_id = None;
         self.selected_topic_index = None;
-        self.connected_server_id = None;
+        self.connected_server_ids.clear();
         self.selected_agent_id = None;
         cx.notify();
     }
@@ -311,16 +321,22 @@ mod tests {
         let mut state = ConfigState::new();
 
         let configs = vec![
-            make_config(1, vec![make_agent(
-                "A",
-                vec![(20, "/a/ccc", true, "prop"), (10, "/a/bbb", true, "event")],
+            make_config(
                 1,
-            )]),
-            make_config(2, vec![make_agent(
-                "A",
-                vec![(10, "/a/bbb", true, "event"), (30, "/a/aaa", true, "cmd")],
+                vec![make_agent(
+                    "A",
+                    vec![(20, "/a/ccc", true, "prop"), (10, "/a/bbb", true, "event")],
+                    1,
+                )],
+            ),
+            make_config(
                 2,
-            )]),
+                vec![make_agent(
+                    "A",
+                    vec![(10, "/a/bbb", true, "event"), (30, "/a/aaa", true, "cmd")],
+                    2,
+                )],
+            ),
         ];
 
         state.configs = configs;
@@ -339,8 +355,14 @@ mod tests {
         let mut state = ConfigState::new();
 
         let configs = vec![
-            make_config(1, vec![make_agent("A", vec![(2, "/a/x", false, "unknown")], 1)]),
-            make_config(2, vec![make_agent("A", vec![(1, "/a/x", true, "event")], 2)]),
+            make_config(
+                1,
+                vec![make_agent("A", vec![(2, "/a/x", false, "unknown")], 1)],
+            ),
+            make_config(
+                2,
+                vec![make_agent("A", vec![(1, "/a/x", true, "event")], 2)],
+            ),
         ];
 
         state.configs = configs;
@@ -359,8 +381,14 @@ mod tests {
         let mut state = ConfigState::new();
 
         let configs = vec![
-            make_config(1, vec![make_agent("B", vec![(0, "/b/x", true, "event")], 1)]),
-            make_config(2, vec![make_agent("A", vec![(0, "/a/x", true, "event")], 2)]),
+            make_config(
+                1,
+                vec![make_agent("B", vec![(0, "/b/x", true, "event")], 1)],
+            ),
+            make_config(
+                2,
+                vec![make_agent("A", vec![(0, "/a/x", true, "event")], 2)],
+            ),
         ];
 
         state.apply_configs(configs);

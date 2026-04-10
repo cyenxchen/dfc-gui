@@ -83,12 +83,7 @@ impl DfcTitleBar {
 impl Render for DfcTitleBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Right side actions
-        let right_actions = h_flex()
-            .items_center()
-            .justify_end()
-            .px_2()
-            .gap_2()
-            .mr_2();
+        let right_actions = h_flex().items_center().justify_end().px_2().gap_2().mr_2();
 
         TitleBar::new()
             // Left side - app name/logo placeholder
@@ -108,7 +103,9 @@ impl Render for DfcTitleBar {
                             .icon(IconName::Settings2)
                             .small()
                             .ghost()
-                            .dropdown_menu(move |menu, window, cx| Self::render_settings_menu(menu, window, cx))
+                            .dropdown_menu(move |menu, window, cx| {
+                                Self::render_settings_menu(menu, window, cx)
+                            })
                             .anchor(Corner::TopRight),
                     )
                     .child(

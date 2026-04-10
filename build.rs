@@ -5,7 +5,10 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/DataTypeCOMM.proto");
 
     prost_build::Config::new()
-        .compile_protos(&["proto/DataType.proto", "proto/DataTypeCOMM.proto"], &["proto"])
+        .compile_protos(
+            &["proto/DataType.proto", "proto/DataTypeCOMM.proto"],
+            &["proto"],
+        )
         .expect("Failed to compile protobuf definitions");
 
     #[cfg(target_os = "windows")]

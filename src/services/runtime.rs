@@ -27,9 +27,7 @@ static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// Get or initialize the global tokio runtime
 fn get_runtime() -> &'static Runtime {
-    TOKIO_RUNTIME.get_or_init(|| {
-        Runtime::new().expect("Failed to create tokio runtime")
-    })
+    TOKIO_RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create tokio runtime"))
 }
 
 /// Execute a future in the tokio runtime and wait for the result
@@ -111,8 +109,8 @@ mod tests {
 
     #[test]
     fn test_spawn_in_tokio() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let flag = Arc::new(AtomicBool::new(false));
         let flag_clone = flag.clone();

@@ -94,9 +94,11 @@ pub fn decrypt(cipher_text: &str) -> Result<String> {
     let ciphertext = &data[12..];
 
     // Decrypt and verify authenticity
-    let plaintext_bytes = cipher.decrypt(nonce, ciphertext).map_err(|e| Error::Invalid {
-        message: format!("Decryption failed: {e}"),
-    })?;
+    let plaintext_bytes = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| Error::Invalid {
+            message: format!("Decryption failed: {e}"),
+        })?;
 
     // Convert decrypted bytes to UTF-8 string
     String::from_utf8(plaintext_bytes).map_err(|e| Error::Invalid {

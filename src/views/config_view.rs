@@ -7,7 +7,10 @@
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
 use crate::services::spawn_named_in_tokio;
-use crate::states::{ConfigState, DfcAppState, DfcGlobalStore, KeysState, PropRow, PropTableLoadState, PropTableState};
+use crate::states::{
+    ConfigState, DfcAppState, DfcGlobalStore, KeysState, PropRow, PropSortColumn, PropTableLoadState,
+    PropTableState, SortDirection,
+};
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
@@ -18,6 +21,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
@@ -1021,6 +1025,8 @@ impl ConfigView {
             .child(
                 div()
                     .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
                     .child(match (selected_topic_path.as_deref(), is_prop_topic) {
                         (Some(topic_path), true) => self.render_prop_table(topic_path, cx).into_any_element(),
                         (Some(topic_path), false) => self.render_unsupported_topic(topic_path, cx).into_any_element(),
@@ -1084,7 +1090,7 @@ impl ConfigView {
             (
                 state.topic_path().map(|s| s.to_string()),
                 state.load_state().clone(),
-                state.page_rows().cloned().collect::<Vec<PropRow>>(),
+                state.page_rows_owned(),
                 state.rows_len(),
             )
         };
@@ -1151,11 +1157,13 @@ impl ConfigView {
         // Horizontal scroll wrapper
         div()
             .flex_1()
+            .min_h(px(0.0))
             .p_3()
             .child(
                 div()
                     .w_full()
                     .h_full()
+                    .min_h(px(0.0))
                     .rounded_md()
                     .border_1()
                     .border_color(border)
@@ -1164,11 +1172,14 @@ impl ConfigView {
                         div()
                             .id("prop-table-x-scroll")
                             .flex_1()
+                            .min_h(px(0.0))
                             .overflow_x_scroll()
                             .child(
                                 v_flex()
                                     .min_w(px(1_650.0))
                                     .w(px(1_650.0))
+                                    .h_full()
+                                    .min_h(px(0.0))
                                     // Header
                                     .child(
                                         h_flex()
@@ -1176,23 +1187,24 @@ impl ConfigView {
                                             .bg(header_bg)
                                             .border_b_1()
                                             .border_color(border)
-                                            .child(self.render_prop_header_cell(180.0, "全局UUID", cx))
-                                            .child(self.render_prop_header_cell(110.0, "设备号", cx))
-                                            .child(self.render_prop_header_cell(320.0, "IMR", cx))
-                                            .child(self.render_prop_header_cell(90.0, "IMID", cx))
-                                            .child(self.render_prop_header_cell(120.0, "值", cx))
-                                            .child(self.render_prop_header_cell(90.0, "数据质量", cx))
-                                            .child(self.render_prop_header_cell(140.0, "BCRID", cx))
-                                            .child(self.render_prop_header_cell(180.0, "数据时间", cx))
-                                            .child(self.render_prop_header_cell(180.0, "报文时间", cx))
-                                            .child(self.render_prop_header_cell(240.0, "报文摘要", cx)),
+                                            .child(self.render_prop_header_cell_sortable(180.0, "全局UUID", PropSortColumn::GlobalUuid, cx))
+                                            .child(self.render_prop_header_cell_sortable(110.0, "设备号", PropSortColumn::Device, cx))
+                                            .child(self.render_prop_header_cell_sortable(320.0, "IMR", PropSortColumn::Imr, cx))
+                                            .child(self.render_prop_header_cell_sortable(90.0, "IMID", PropSortColumn::Imid, cx))
+                                            .child(self.render_prop_header_cell_sortable(120.0, "值", PropSortColumn::Value, cx))
+                                            .child(self.render_prop_header_cell_sortable(90.0, "数据质量", PropSortColumn::Quality, cx))
+                                            .child(self.render_prop_header_cell_sortable(140.0, "BCRID", PropSortColumn::Bcrid, cx))
+                                            .child(self.render_prop_header_cell_sortable(180.0, "数据时间", PropSortColumn::Time, cx))
+                                            .child(self.render_prop_header_cell_sortable(180.0, "报文时间", PropSortColumn::MessageTime, cx))
+                                            .child(self.render_prop_header_cell_sortable(240.0, "报文摘要", PropSortColumn::Summary, cx)),
                                     )
                                     // Body
                                     .child(
                                         div()
                                             .id("prop-table-y-scroll")
                                             .flex_1()
-                                            .overflow_y_scroll()
+                                            .min_h(px(0.0))
+                                            .overflow_y_scrollbar()
                                             .children(rows),
                                     ),
                             ),
@@ -1201,19 +1213,77 @@ impl ConfigView {
             .into_any_element()
     }
 
-    fn render_prop_header_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_prop_header_cell_sortable(
+        &self,
+        w: f32,
+        text: &str,
+        column: PropSortColumn,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let hover_bg = if cx.theme().is_dark() {
+            cx.theme().secondary.lighten(0.04)
+        } else {
+            cx.theme().secondary.darken(0.02)
+        };
+
+        let (active_dir, icon) = {
+            let state = self.prop_table_state.read(cx);
+            match state.sort().filter(|s| s.column == column).map(|s| s.direction) {
+                Some(SortDirection::Asc) => (Some(SortDirection::Asc), IconName::ChevronUp),
+                Some(SortDirection::Desc) => (Some(SortDirection::Desc), IconName::ChevronDown),
+                None => (None, IconName::ChevronsUpDown),
+            }
+        };
+
+        let icon_color = if active_dir.is_some() { fg } else { muted };
+
+        let column_id = match column {
+            PropSortColumn::GlobalUuid => 0usize,
+            PropSortColumn::Device => 1usize,
+            PropSortColumn::Imr => 2usize,
+            PropSortColumn::Imid => 3usize,
+            PropSortColumn::Value => 4usize,
+            PropSortColumn::Quality => 5usize,
+            PropSortColumn::Bcrid => 6usize,
+            PropSortColumn::Time => 7usize,
+            PropSortColumn::MessageTime => 8usize,
+            PropSortColumn::Summary => 9usize,
+        };
+
         div()
+            .id(("prop-header", column_id))
             .w(px(w))
             .px_2()
             .py_2()
             .border_r_1()
-            .border_color(cx.theme().border)
+            .border_color(border)
+            .cursor_pointer()
+            .hover(move |this| this.bg(hover_bg))
             .child(
-                Label::new(text.to_string())
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .text_ellipsis(),
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Label::new(text.to_string())
+                            .text_sm()
+                            .text_color(muted)
+                            .text_ellipsis(),
+                    )
+                    .child(
+                        Icon::new(icon)
+                            .size_3()
+                            .text_color(icon_color),
+                    ),
             )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.prop_table_state.update(cx, |state, cx| {
+                    state.toggle_sort(column);
+                    cx.notify();
+                });
+            }))
     }
 
     fn render_prop_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1314,12 +1384,25 @@ impl ConfigView {
         h_flex()
             .w_full()
             .items_center()
-            .justify_between()
+            .gap_6()
             .child(
                 h_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .items_center()
                     .gap_3()
-                    .child(Label::new(info).text_xs().text_color(cx.theme().muted_foreground))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(
+                                Label::new(info)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_ellipsis(),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .items_center()
@@ -1331,6 +1414,7 @@ impl ConfigView {
             )
             .child(
                 h_flex()
+                    .flex_none()
                     .items_center()
                     .gap_2()
                     .child(prev_btn)
