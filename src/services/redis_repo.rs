@@ -4,8 +4,8 @@
 //! stored in Redis. Handles one-time queries and caching.
 
 use crate::connection::{
-    ConfigItem, DetailItem, DfcServerConfig, RedisKeyItem, RedisKeyType, RedisKeyValue,
-    TopicAgentItem, TopicDetail, REDIS_KEY_PATTERNS,
+    ConfigItem, DetailItem, DfcServerConfig, PresetCredential, RedisKeyItem, RedisKeyType,
+    RedisKeyValue, TopicAgentItem, TopicDetail, REDIS_KEY_PATTERNS,
 };
 use crate::error::{Error, Result};
 use crate::services::events::{DeviceId, DeviceMeta};
@@ -77,54 +77,127 @@ impl RedisRepo {
         Ok(())
     }
 
-    /// Connect to a specific server configuration
-    pub async fn connect_to_server(&self, server: &DfcServerConfig) -> Result<()> {
-        tracing::info!("Connecting to Redis server: {} ({}:{})", server.name, server.host, server.port);
+    /// Connect to a specific server configuration, trying preset credentials if needed
+    pub async fn connect_to_server(
+        &self,
+        server: &DfcServerConfig,
+        preset_credentials: &[PresetCredential],
+    ) -> Result<()> {
+        tracing::info!(
+            "Connecting to Redis server: {} ({}:{})",
+            server.name,
+            server.host,
+            server.port
+        );
 
-        // Build Redis config
-        let mut redis_config = FredConfig::default();
-        redis_config.server = ServerConfig::Centralized {
-            server: fred::prelude::Server::new(server.host.clone(), server.port),
-        };
+        // Build list of (username, password, label) attempts
+        let mut attempts: Vec<(Option<String>, Option<String>, &str)> = Vec::new();
 
-        if let Some(ref password) = server.password {
-            if !password.is_empty() {
-                redis_config.password = Some(password.clone());
+        // 1. Server's own password
+        if let Some(ref pwd) = server.password {
+            if !pwd.is_empty() {
+                attempts.push((None, Some(pwd.clone()), "server password"));
             }
         }
 
-        // Create client with connection config
+        // 2. Each preset credential
+        for cred in preset_credentials {
+            attempts.push((
+                cred.username.clone(),
+                Some(cred.password.clone()),
+                "preset credential",
+            ));
+        }
+
+        // 3. No-auth fallback
+        attempts.push((None, None, "no auth"));
+
+        let mut last_error = None;
+
+        for (username, password, label) in &attempts {
+            match self
+                .try_connect(
+                    &server.host,
+                    server.port,
+                    username.as_deref(),
+                    password.as_deref(),
+                )
+                .await
+            {
+                Ok(client) => {
+                    let mut guard = self.client.write().await;
+                    *guard = Some(client);
+
+                    let _ = self.tx.send(ServiceEvent::ConnectionState {
+                        service: "redis".into(),
+                        connected: true,
+                        detail: format!("Connected to {}", server.name).into(),
+                    });
+
+                    tracing::info!(
+                        "Successfully connected to Redis server: {} (via {})",
+                        server.name,
+                        label
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("Auth attempt failed ({}): {}", label, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let err = last_error.unwrap_or_else(|| Error::Connection {
+            message: format!("Failed to connect to {}", server.display_name()),
+        });
+        tracing::error!("Failed to connect to Redis: {}", err);
+        Err(err)
+    }
+
+    /// Try connecting with specific credentials
+    async fn try_connect(
+        &self,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<FredClient> {
+        let mut redis_config = FredConfig::default();
+        redis_config.server = ServerConfig::Centralized {
+            server: fred::prelude::Server::new(host.to_string(), port),
+        };
+
+        if let Some(pwd) = password {
+            if !pwd.is_empty() {
+                redis_config.password = Some(pwd.to_string());
+            }
+        }
+        if let Some(user) = username {
+            if !user.is_empty() {
+                redis_config.username = Some(user.to_string());
+            }
+        }
+
         let client = Builder::from_config(redis_config)
             .with_connection_config(|config| {
                 config.connection_timeout = Duration::from_secs(10);
             })
             .build()
-            .map_err(|e| Error::Connection { message: e.to_string() })?;
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
-        // Enter tokio runtime context for fred client
-        // Fred internally uses tokio::task::spawn which requires a tokio runtime
         let _guard = super::runtime_handle().enter();
-
-        // Connect
         client.connect();
-        client.wait_for_connect().await.map_err(|e| {
-            tracing::error!("Failed to connect to Redis: {}", e);
-            Error::Connection { message: e.to_string() }
-        })?;
+        client
+            .wait_for_connect()
+            .await
+            .map_err(|e| Error::Connection {
+                message: e.to_string(),
+            })?;
 
-        // Store client
-        let mut guard = self.client.write().await;
-        *guard = Some(client);
-
-        // Notify connection state
-        let _ = self.tx.send(ServiceEvent::ConnectionState {
-            service: "redis".into(),
-            connected: true,
-            detail: format!("Connected to {}", server.name).into(),
-        });
-
-        tracing::info!("Successfully connected to Redis server: {}", server.name);
-        Ok(())
+        Ok(client)
     }
 
     /// Disconnect from current server

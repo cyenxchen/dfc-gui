@@ -647,8 +647,9 @@ impl DfcContent {
             .on_click(cx.listener(move |this, _, _, cx| {
                 tracing::info!("Server card clicked: {}", server_id);
 
-                // Get server config
+                // Get server config and preset credentials
                 let server = this.app_state.read(cx).server(&server_id).cloned();
+                let credentials = this.app_state.read(cx).preset_credentials();
 
                 if let Some(server) = server {
                     // Set loading state in ConfigState and select the server
@@ -670,8 +671,8 @@ impl DfcContent {
                         let redis = store.services().redis();
                         let cfgid = server.cfgid.as_deref();
 
-                        // Connect to Redis
-                        if let Err(e) = redis.connect_to_server(&server).await {
+                        // Connect to Redis (tries server password, then preset credentials)
+                        if let Err(e) = redis.connect_to_server(&server, &credentials).await {
                             tracing::error!("Failed to connect to Redis: {}", e);
                             let _ = config_state.update(cx, |state, cx| {
                                 state.set_error(e.to_string(), cx);
