@@ -24,7 +24,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
-    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
@@ -1066,6 +1065,7 @@ impl ConfigView {
             .child(
                 v_flex()
                     .flex_1()
+                    .h_0()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden()
@@ -1151,7 +1151,7 @@ impl ConfigView {
         if topic_path.as_deref() != Some(selected_topic_path) {
             return div()
                 .flex_1()
-                .h_full()
+                .h_0()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
                 .p_4()
@@ -1163,7 +1163,7 @@ impl ConfigView {
             PropTableLoadState::Error(msg) => {
                 return div()
                     .flex_1()
-                    .h_full()
+                    .h_0()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .p_4()
@@ -1173,7 +1173,7 @@ impl ConfigView {
             PropTableLoadState::Loading if total_rows == 0 => {
                 return div()
                     .flex_1()
-                    .h_full()
+                    .h_0()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .p_4()
@@ -1217,16 +1217,17 @@ impl ConfigView {
         }
 
         // Horizontal scroll wrapper
-        div()
+        v_flex()
             .flex_1()
-            .h_full()
+            .h_0()
             .min_w(px(0.0))
             .min_h(px(0.0))
             .p_3()
             .child(
                 v_flex()
                     .w_full()
-                    .h_full()
+                    .flex_1()
+                    .h_0()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .rounded_md()
@@ -1237,6 +1238,7 @@ impl ConfigView {
                         div()
                             .id("prop-table-x-scroll")
                             .flex_1()
+                            .h_0()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .overflow_x_scroll()
@@ -1320,7 +1322,7 @@ impl ConfigView {
                                             .id("prop-table-y-scroll")
                                             .flex_1()
                                             .min_h(px(0.0))
-                                            .overflow_y_scrollbar()
+                                            .overflow_y_scroll()
                                             .children(rows),
                                     ),
                             ),
@@ -1977,7 +1979,9 @@ async fn run_prop_topic_stream(
                     "Topic namespace listing"
                 );
             }
-            Err(e) => tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e),
+            Err(e) => {
+                tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e)
+            }
         }
     }
     let subscription = format!("dfc-gui-prop-{}", uuid::Uuid::new_v4());
@@ -1997,7 +2001,11 @@ async fn run_prop_topic_stream(
         // Exponential backoff on reconnect (skip delay on first attempt)
         if connect_attempt > 1 {
             let backoff = Duration::from_secs((2u64.pow(connect_attempt.min(5) as u32)).min(30));
-            tracing::info!(backoff_secs = backoff.as_secs(), attempt = connect_attempt, "reconnecting after backoff");
+            tracing::info!(
+                backoff_secs = backoff.as_secs(),
+                attempt = connect_attempt,
+                "reconnecting after backoff"
+            );
             tokio::time::sleep(backoff).await;
             if *stop.borrow() {
                 return;
