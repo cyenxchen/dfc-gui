@@ -2,9 +2,9 @@
 //!
 //! Holds parsed rows from iothub `prop_data` topics and UI pagination state.
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortDirection {
