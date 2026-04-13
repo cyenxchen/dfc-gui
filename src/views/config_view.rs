@@ -15,8 +15,8 @@ use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
 use gpui::{
-    Action, App, Context, Corner, Entity, StatefulInteractiveElement as _, Subscription, Task,
-    Window, div, prelude::*, px,
+    Action, App, Context, Corner, Entity, ScrollHandle, ScrollWheelEvent,
+    StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
@@ -24,6 +24,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    scroll::{Scrollbar, ScrollbarShow},
     tooltip::Tooltip,
     v_flex,
 };
@@ -139,6 +140,10 @@ pub struct ConfigView {
     agent_query_mode: AgentQueryMode,
     /// Prop topic table state (for `prop_data` topics)
     prop_table_state: Entity<PropTableState>,
+    /// Scroll handle for the visible body scrollbar in the prop table
+    prop_table_scroll_handle: ScrollHandle,
+    /// Shared horizontal scroll handle for the prop table header and body
+    prop_table_horizontal_scroll_handle: ScrollHandle,
     /// Active prop topic path (to avoid restarting streams on every notify)
     active_prop_topic: Option<String>,
     /// Stop signal for the active prop topic stream (tokio)
@@ -231,6 +236,8 @@ impl ConfigView {
             agent_search_state,
             agent_query_mode: AgentQueryMode::default(),
             prop_table_state,
+            prop_table_scroll_handle: ScrollHandle::default(),
+            prop_table_horizontal_scroll_handle: ScrollHandle::default(),
             active_prop_topic: None,
             prop_stream_stop: None,
             prop_ingest_task: None,
@@ -1236,99 +1243,154 @@ impl ConfigView {
                     .overflow_hidden()
                     .child(
                         div()
-                            .id("prop-table-x-scroll")
+                            .id("prop-table-header-x-scroll")
+                            .w_full()
+                            .flex_none()
+                            .min_w(px(0.0))
+                            .overflow_x_scroll()
+                            .track_scroll(&self.prop_table_horizontal_scroll_handle)
+                            .child(
+                                h_flex()
+                                    .min_w(px(1_650.0))
+                                    .w(px(1_650.0))
+                                    .bg(header_bg)
+                                    .border_b_1()
+                                    .border_color(border)
+                                    .child(self.render_prop_header_cell_sortable(
+                                        180.0,
+                                        "全局UUID",
+                                        PropSortColumn::GlobalUuid,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        110.0,
+                                        "设备号",
+                                        PropSortColumn::Device,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        320.0,
+                                        "IMR",
+                                        PropSortColumn::Imr,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        90.0,
+                                        "IMID",
+                                        PropSortColumn::Imid,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        120.0,
+                                        "值",
+                                        PropSortColumn::Value,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        90.0,
+                                        "数据质量",
+                                        PropSortColumn::Quality,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        140.0,
+                                        "BCRID",
+                                        PropSortColumn::Bcrid,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        180.0,
+                                        "数据时间",
+                                        PropSortColumn::Time,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        180.0,
+                                        "报文时间",
+                                        PropSortColumn::MessageTime,
+                                        cx,
+                                    ))
+                                    .child(self.render_prop_header_cell_sortable(
+                                        240.0,
+                                        "报文摘要",
+                                        PropSortColumn::Summary,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("prop-table-body")
                             .flex_1()
                             .h_0()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .overflow_x_scroll()
+                            .relative()
+                            .overflow_hidden()
                             .child(
-                                v_flex()
-                                    .min_w(px(1_650.0))
-                                    .w(px(1_650.0))
-                                    .h_full()
-                                    .min_h(px(0.0))
-                                    // Header
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .bg(header_bg)
-                                            .border_b_1()
-                                            .border_color(border)
-                                            .child(self.render_prop_header_cell_sortable(
-                                                180.0,
-                                                "全局UUID",
-                                                PropSortColumn::GlobalUuid,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                110.0,
-                                                "设备号",
-                                                PropSortColumn::Device,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                320.0,
-                                                "IMR",
-                                                PropSortColumn::Imr,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                90.0,
-                                                "IMID",
-                                                PropSortColumn::Imid,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                120.0,
-                                                "值",
-                                                PropSortColumn::Value,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                90.0,
-                                                "数据质量",
-                                                PropSortColumn::Quality,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                140.0,
-                                                "BCRID",
-                                                PropSortColumn::Bcrid,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                180.0,
-                                                "数据时间",
-                                                PropSortColumn::Time,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                180.0,
-                                                "报文时间",
-                                                PropSortColumn::MessageTime,
-                                                cx,
-                                            ))
-                                            .child(self.render_prop_header_cell_sortable(
-                                                240.0,
-                                                "报文摘要",
-                                                PropSortColumn::Summary,
-                                                cx,
-                                            )),
-                                    )
-                                    // Body
+                                div()
+                                    .id("prop-table-body-x-scroll")
+                                    .size_full()
+                                    .min_w(px(0.0))
+                                    .overflow_x_scroll()
+                                    .track_scroll(&self.prop_table_horizontal_scroll_handle)
                                     .child(
                                         div()
                                             .id("prop-table-y-scroll")
-                                            .flex_1()
+                                            .min_w(px(1_650.0))
+                                            .w(px(1_650.0))
+                                            .h_full()
                                             .min_h(px(0.0))
-                                            .overflow_y_scroll()
+                                            .track_scroll(&self.prop_table_scroll_handle)
+                                            .on_scroll_wheel(
+                                                cx.listener(
+                                                    Self::handle_prop_table_vertical_scroll,
+                                                ),
+                                            )
                                             .children(rows),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(16.0))
+                                    .on_scroll_wheel(
+                                        cx.listener(Self::handle_prop_table_vertical_scroll),
+                                    )
+                                    .child(
+                                        Scrollbar::vertical(&self.prop_table_scroll_handle)
+                                            .scrollbar_show(ScrollbarShow::Always),
                                     ),
                             ),
                     ),
             )
             .into_any_element()
+    }
+
+    fn handle_prop_table_vertical_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        if delta.y.abs() < delta.x.abs() || delta.y == px(0.0) {
+            return;
+        }
+
+        let mut offset = self.prop_table_scroll_handle.offset();
+        let max_y = self.prop_table_scroll_handle.max_offset().height;
+        let next_y = (offset.y + delta.y).clamp(-max_y, px(0.0));
+
+        if next_y != offset.y {
+            offset.y = next_y;
+            self.prop_table_scroll_handle.set_offset(offset);
+            cx.notify();
+        }
+        cx.stop_propagation();
     }
 
     fn render_prop_header_cell_sortable(
