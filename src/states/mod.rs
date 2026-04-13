@@ -9,6 +9,7 @@
 
 mod app;
 mod config;
+mod event_table;
 mod fleet;
 mod i18n;
 mod keys;
@@ -17,6 +18,7 @@ mod ui_event;
 
 pub use app::*;
 pub use config::*;
+pub use event_table::*;
 pub use fleet::*;
 pub use i18n::*;
 pub use keys::*;

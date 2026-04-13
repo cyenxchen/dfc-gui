@@ -8,8 +8,8 @@ use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, KeysState, PropRow, PropSortColumn,
-    PropTableLoadState, PropTableState, SortDirection,
+    ConfigState, DfcAppState, DfcGlobalStore, EventRow, EventTableLoadState, EventTableState,
+    KeysState, PropRow, PropSortColumn, PropTableLoadState, PropTableState, SortDirection,
 };
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
@@ -28,7 +28,6 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
-use prost::Message as _;
 use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -46,6 +45,12 @@ const PANEL_TOPBAR_HEIGHT: f32 = 48.0;
 #[derive(Debug)]
 enum PropStreamEvent {
     Rows(Vec<PropRow>),
+    Error(String),
+}
+
+#[derive(Debug)]
+enum EventStreamEvent {
+    Rows(Vec<EventRow>),
     Error(String),
 }
 
@@ -144,14 +149,28 @@ pub struct ConfigView {
     prop_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the prop table header and body
     prop_table_horizontal_scroll_handle: ScrollHandle,
+    /// Event topic table state (for `thing_event` topics)
+    event_table_state: Entity<EventTableState>,
+    /// Scroll handle for the visible body scrollbar in the event table
+    event_table_scroll_handle: ScrollHandle,
+    /// Shared horizontal scroll handle for the event table header and body
+    event_table_horizontal_scroll_handle: ScrollHandle,
     /// Active prop topic path (to avoid restarting streams on every notify)
     active_prop_topic: Option<String>,
     /// Stop signal for the active prop topic stream (tokio)
     prop_stream_stop: Option<watch::Sender<bool>>,
     /// UI-side ingest task draining prop rows from channel
     prop_ingest_task: Option<Task<()>>,
+    /// Active event topic path (to avoid restarting streams on every notify)
+    active_event_topic: Option<String>,
+    /// Stop signal for the active event topic stream (tokio)
+    event_stream_stop: Option<watch::Sender<bool>>,
+    /// UI-side ingest task draining event rows from channel
+    event_ingest_task: Option<Task<()>>,
     /// Monotonic row id generator
     prop_row_uid: Arc<AtomicU64>,
+    /// Monotonic event row id generator
+    event_row_uid: Arc<AtomicU64>,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
 }
@@ -179,8 +198,13 @@ impl ConfigView {
         // Prop topic table state
         let prop_table_state = cx.new(|_| PropTableState::new());
         let prop_row_uid = Arc::new(AtomicU64::new(1));
+        let event_table_state = cx.new(|_| EventTableState::new());
+        let event_row_uid = Arc::new(AtomicU64::new(1));
 
         subscriptions.push(cx.observe(&prop_table_state, |_this, _model, cx| {
+            cx.notify();
+        }));
+        subscriptions.push(cx.observe(&event_table_state, |_this, _model, cx| {
             cx.notify();
         }));
 
@@ -201,7 +225,7 @@ impl ConfigView {
                     }
                 }
             }
-            this.sync_prop_stream_with_selection(cx);
+            this.sync_topic_stream_with_selection(cx);
             cx.notify();
         }));
 
@@ -238,10 +262,17 @@ impl ConfigView {
             prop_table_state,
             prop_table_scroll_handle: ScrollHandle::default(),
             prop_table_horizontal_scroll_handle: ScrollHandle::default(),
+            event_table_state,
+            event_table_scroll_handle: ScrollHandle::default(),
+            event_table_horizontal_scroll_handle: ScrollHandle::default(),
             active_prop_topic: None,
             prop_stream_stop: None,
             prop_ingest_task: None,
+            active_event_topic: None,
+            event_stream_stop: None,
+            event_ingest_task: None,
             prop_row_uid,
+            event_row_uid,
             _subscriptions: subscriptions,
         }
     }
@@ -289,11 +320,27 @@ impl ConfigView {
         self.active_prop_topic = None;
     }
 
+    fn stop_event_stream(&mut self) {
+        if let Some(stop) = self.event_stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = self.event_ingest_task.take() {
+            drop(task);
+        }
+        self.active_event_topic = None;
+    }
+
     fn is_prop_topic_path(topic_path: &str) -> bool {
         topic_path.contains("prop_data-BZ-")
     }
 
-    fn sync_prop_stream_with_selection(&mut self, cx: &mut Context<Self>) {
+    fn is_event_topic_path(topic_path: &str) -> bool {
+        topic_path.contains("thing_event-BZ")
+            || topic_path.contains("/event/")
+            || topic_path.contains("/events/")
+    }
+
+    fn sync_topic_stream_with_selection(&mut self, cx: &mut Context<Self>) {
         let selected_topic_path: Option<String> = {
             let state = self.config_state.read(cx);
             match (state.selected_agent(), state.selected_topic_index()) {
@@ -307,52 +354,108 @@ impl ConfigView {
             .filter(|path| Self::is_prop_topic_path(path))
             .map(|s| s.to_string());
 
-        if self.active_prop_topic == selected_prop_topic {
+        let selected_event_topic = selected_topic_path
+            .as_deref()
+            .filter(|path| Self::is_event_topic_path(path))
+            .map(|s| s.to_string());
+
+        if self.active_prop_topic == selected_prop_topic
+            && self.active_event_topic == selected_event_topic
+        {
             return;
         }
 
         // Stop any existing stream and reset state if needed.
         self.stop_prop_stream();
+        self.stop_event_stream();
 
-        let Some(topic_path) = selected_prop_topic else {
+        if let Some(topic_path) = selected_prop_topic {
+            let _ = self.event_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(None);
+                cx.notify();
+            });
+
+            // Locate the Pulsar service URL + cfgid for this topic.
+            let (service_url, cfgid) = {
+                let config_state = self.config_state.read(cx);
+                match find_topic_origin(config_state.configs(), &topic_path) {
+                    Some(v) => v,
+                    None => {
+                        let _ = self.prop_table_state.update(cx, |state, cx| {
+                            state.reset_for_topic(Some(topic_path.clone()));
+                            state.set_error("无法定位该 Topic 对应的 service_url/cfgid");
+                            cx.notify();
+                        });
+                        return;
+                    }
+                }
+            };
+
+            let token = cx
+                .global::<DfcGlobalStore>()
+                .read(cx)
+                .selected_server()
+                .and_then(|s| s.pulsar_token.clone())
+                .filter(|t| !t.trim().is_empty());
+
+            self.active_prop_topic = Some(topic_path.clone());
+
+            let _ = self.prop_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(Some(topic_path.clone()));
+                cx.notify();
+            });
+
+            self.start_prop_stream(service_url, cfgid, topic_path, token, cx);
+            return;
+        }
+
+        if let Some(topic_path) = selected_event_topic {
             let _ = self.prop_table_state.update(cx, |state, cx| {
                 state.reset_for_topic(None);
                 cx.notify();
             });
-            return;
-        };
-
-        // Locate the Pulsar service URL + cfgid for this topic.
-        let (service_url, cfgid) = {
-            let config_state = self.config_state.read(cx);
-            match find_topic_origin(config_state.configs(), &topic_path) {
-                Some(v) => v,
-                None => {
-                    let _ = self.prop_table_state.update(cx, |state, cx| {
-                        state.reset_for_topic(Some(topic_path.clone()));
-                        state.set_error("无法定位该 Topic 对应的 service_url/cfgid");
-                        cx.notify();
-                    });
-                    return;
+            // Locate the Pulsar service URL for this topic.
+            let service_url = {
+                let config_state = self.config_state.read(cx);
+                match find_topic_service_url(config_state.configs(), &topic_path) {
+                    Some(service_url) => service_url,
+                    None => {
+                        let _ = self.event_table_state.update(cx, |state, cx| {
+                            state.reset_for_topic(Some(topic_path.clone()));
+                            state.set_error("无法定位该 Topic 对应的 service_url");
+                            cx.notify();
+                        });
+                        return;
+                    }
                 }
-            }
-        };
+            };
 
-        let token = cx
-            .global::<DfcGlobalStore>()
-            .read(cx)
-            .selected_server()
-            .and_then(|s| s.pulsar_token.clone())
-            .filter(|t| !t.trim().is_empty());
+            let token = cx
+                .global::<DfcGlobalStore>()
+                .read(cx)
+                .selected_server()
+                .and_then(|s| s.pulsar_token.clone())
+                .filter(|t| !t.trim().is_empty());
 
-        self.active_prop_topic = Some(topic_path.clone());
+            self.active_event_topic = Some(topic_path.clone());
+
+            let _ = self.event_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(Some(topic_path.clone()));
+                cx.notify();
+            });
+
+            self.start_event_stream(service_url, topic_path, token, cx);
+            return;
+        }
 
         let _ = self.prop_table_state.update(cx, |state, cx| {
-            state.reset_for_topic(Some(topic_path.clone()));
+            state.reset_for_topic(None);
             cx.notify();
         });
-
-        self.start_prop_stream(service_url, cfgid, topic_path, token, cx);
+        let _ = self.event_table_state.update(cx, |state, cx| {
+            state.reset_for_topic(None);
+            cx.notify();
+        });
     }
 
     fn start_prop_stream(
@@ -422,6 +525,63 @@ impl ConfigView {
         });
 
         self.prop_ingest_task = Some(task);
+    }
+
+    fn start_event_stream(
+        &mut self,
+        service_url: String,
+        topic_path: String,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, rx): (Sender<EventStreamEvent>, Receiver<EventStreamEvent>) =
+            crossbeam_channel::unbounded();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        self.event_stream_stop = Some(stop_tx);
+
+        let uid = self.event_row_uid.clone();
+
+        spawn_named_in_tokio("event-topic-stream", async move {
+            run_event_topic_stream(service_url, topic_path, token, stop_rx, tx, uid).await;
+        });
+
+        let event_state = self.event_table_state.clone();
+        let task = cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+
+                let mut rows: Vec<EventRow> = Vec::new();
+                let mut error: Option<String> = None;
+
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        EventStreamEvent::Rows(mut batch) => rows.append(&mut batch),
+                        EventStreamEvent::Error(msg) => error = Some(msg),
+                    }
+                }
+
+                if let Some(msg) = error {
+                    let _ = event_state.update(cx, |state, cx| {
+                        state.set_error(msg);
+                        cx.notify();
+                    });
+                    continue;
+                }
+
+                if rows.is_empty() {
+                    continue;
+                }
+
+                let _ = event_state.update(cx, |state, cx| {
+                    state.push_rows_front(rows);
+                    cx.notify();
+                });
+            }
+        });
+
+        self.event_ingest_task = Some(task);
     }
 
     /// Render loading state
@@ -1029,6 +1189,10 @@ impl ConfigView {
             .as_deref()
             .map(Self::is_prop_topic_path)
             .unwrap_or(false);
+        let is_event_topic = selected_topic_path
+            .as_deref()
+            .map(Self::is_event_topic_path)
+            .unwrap_or(false);
 
         // Build tab buttons
         let mut tabs = Vec::new();
@@ -1076,14 +1240,17 @@ impl ConfigView {
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .child(match (selected_topic_path.as_deref(), is_prop_topic) {
-                        (Some(topic_path), true) => {
+                    .child(match selected_topic_path.as_deref() {
+                        Some(topic_path) if is_prop_topic => {
                             self.render_prop_table(topic_path, cx).into_any_element()
                         }
-                        (Some(topic_path), false) => self
+                        Some(topic_path) if is_event_topic => {
+                            self.render_event_table(topic_path, cx).into_any_element()
+                        }
+                        Some(topic_path) => self
                             .render_unsupported_topic(topic_path, cx)
                             .into_any_element(),
-                        (None, _) => div().flex_1().into_any_element(),
+                        None => div().flex_1().into_any_element(),
                     }),
             )
             // Bottom status bar
@@ -1099,6 +1266,8 @@ impl ConfigView {
                     .bg(secondary_bg)
                     .child(if is_prop_topic {
                         self.render_prop_pagination(cx).into_any_element()
+                    } else if is_event_topic {
+                        self.render_event_pagination(cx).into_any_element()
                     } else {
                         Label::new(no_topic_selected)
                             .text_color(muted_fg)
@@ -1120,7 +1289,10 @@ impl ConfigView {
             .flex_1()
             .p_4()
             .gap_2()
-            .child(Label::new("当前仅实现 prop_data Topic 的内容展示").text_color(muted_fg))
+            .child(
+                Label::new("当前仅实现 prop_data 和 thing_event Topic 的内容展示")
+                    .text_color(muted_fg),
+            )
             .child(
                 div()
                     .border_1()
@@ -1370,8 +1542,215 @@ impl ConfigView {
             .into_any_element()
     }
 
+    fn render_event_table(
+        &self,
+        selected_topic_path: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let border = cx.theme().border;
+        let header_bg = cx.theme().secondary;
+        let muted_fg = cx.theme().muted_foreground;
+        let table_width = 2_540.0;
+
+        let (topic_path, load_state, page_rows, total_rows) = {
+            let state = self.event_table_state.read(cx);
+            (
+                state.topic_path().map(|s| s.to_string()),
+                state.load_state().clone(),
+                state.page_rows_owned(),
+                state.rows_len(),
+            )
+        };
+
+        if topic_path.as_deref() != Some(selected_topic_path) {
+            return div()
+                .flex_1()
+                .h_0()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .p_4()
+                .child(Label::new("正在切换 Topic…").text_color(muted_fg))
+                .into_any_element();
+        }
+
+        match &load_state {
+            EventTableLoadState::Error(msg) => {
+                return div()
+                    .flex_1()
+                    .h_0()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .p_4()
+                    .child(Label::new(format!("加载失败: {msg}")).text_color(cx.theme().danger))
+                    .into_any_element();
+            }
+            EventTableLoadState::Loading if total_rows == 0 => {
+                return div()
+                    .flex_1()
+                    .h_0()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .p_4()
+                    .child(Label::new("等待数据…").text_color(muted_fg))
+                    .into_any_element();
+            }
+            _ => {}
+        }
+
+        let mut rows = Vec::new();
+        for (idx, row) in page_rows.iter().enumerate() {
+            let bg = if idx % 2 == 0 {
+                if cx.theme().is_dark() {
+                    cx.theme().background.lighten(0.3)
+                } else {
+                    cx.theme().background.darken(0.01)
+                }
+            } else {
+                cx.theme().background
+            };
+
+            rows.push(
+                h_flex()
+                    .id(("event-row", row.uid as usize))
+                    .w_full()
+                    .bg(bg)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(self.render_prop_cell(220.0, &row.uuid, cx))
+                    .child(self.render_prop_cell(110.0, &row.device, cx))
+                    .child(self.render_prop_cell(320.0, &row.imr, cx))
+                    .child(self.render_prop_cell(140.0, &row.event_type, cx))
+                    .child(self.render_prop_cell(90.0, &row.level, cx))
+                    .child(self.render_prop_cell(160.0, &row.tags, cx))
+                    .child(self.render_prop_cell(140.0, &row.codes, cx))
+                    .child(self.render_prop_cell(160.0, &row.str_codes, cx))
+                    .child(self.render_prop_cell(180.0, &row.happened_time, cx))
+                    .child(self.render_prop_cell(180.0, &row.record_time, cx))
+                    .child(self.render_prop_cell(140.0, &row.bcr_id, cx))
+                    .child(self.render_prop_cell(260.0, &row.context, cx))
+                    .child(self.render_prop_cell(240.0, &row.summary, cx)),
+            );
+        }
+
+        v_flex()
+            .flex_1()
+            .h_0()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .p_3()
+            .child(
+                v_flex()
+                    .w_full()
+                    .flex_1()
+                    .h_0()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("event-table-header-x-scroll")
+                            .w_full()
+                            .flex_none()
+                            .min_w(px(0.0))
+                            .overflow_x_scroll()
+                            .track_scroll(&self.event_table_horizontal_scroll_handle)
+                            .child(
+                                h_flex()
+                                    .min_w(px(table_width))
+                                    .w(px(table_width))
+                                    .bg(header_bg)
+                                    .border_b_1()
+                                    .border_color(border)
+                                    .child(self.render_event_header_cell(220.0, "UUID", cx))
+                                    .child(self.render_event_header_cell(110.0, "设备", cx))
+                                    .child(self.render_event_header_cell(320.0, "IMR", cx))
+                                    .child(self.render_event_header_cell(140.0, "事件类型", cx))
+                                    .child(self.render_event_header_cell(90.0, "事件级别", cx))
+                                    .child(self.render_event_header_cell(160.0, "标签", cx))
+                                    .child(self.render_event_header_cell(140.0, "事件码(数字)", cx))
+                                    .child(self.render_event_header_cell(160.0, "事件码(KKS)", cx))
+                                    .child(self.render_event_header_cell(180.0, "发生时间", cx))
+                                    .child(self.render_event_header_cell(180.0, "记录时间", cx))
+                                    .child(self.render_event_header_cell(140.0, "BCRID", cx))
+                                    .child(self.render_event_header_cell(260.0, "事件上下文", cx))
+                                    .child(self.render_event_header_cell(240.0, "报文摘要", cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("event-table-body")
+                            .flex_1()
+                            .h_0()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .relative()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("event-table-body-x-scroll")
+                                    .size_full()
+                                    .min_w(px(0.0))
+                                    .overflow_x_scroll()
+                                    .track_scroll(&self.event_table_horizontal_scroll_handle)
+                                    .child(
+                                        div()
+                                            .id("event-table-y-scroll")
+                                            .min_w(px(table_width))
+                                            .w(px(table_width))
+                                            .h_full()
+                                            .min_h(px(0.0))
+                                            .track_scroll(&self.event_table_scroll_handle)
+                                            .on_scroll_wheel(
+                                                cx.listener(
+                                                    Self::handle_event_table_vertical_scroll,
+                                                ),
+                                            )
+                                            .children(rows),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(16.0))
+                                    .on_scroll_wheel(
+                                        cx.listener(Self::handle_event_table_vertical_scroll),
+                                    )
+                                    .child(
+                                        Scrollbar::vertical(&self.event_table_scroll_handle)
+                                            .scrollbar_show(ScrollbarShow::Always),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn handle_prop_table_vertical_scroll(
         &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        Self::handle_table_vertical_scroll(&self.prop_table_scroll_handle, event, window, cx);
+    }
+
+    fn handle_event_table_vertical_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        Self::handle_table_vertical_scroll(&self.event_table_scroll_handle, event, window, cx);
+    }
+
+    fn handle_table_vertical_scroll(
+        scroll_handle: &ScrollHandle,
         event: &ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1381,13 +1760,13 @@ impl ConfigView {
             return;
         }
 
-        let mut offset = self.prop_table_scroll_handle.offset();
-        let max_y = self.prop_table_scroll_handle.max_offset().height;
+        let mut offset = scroll_handle.offset();
+        let max_y = scroll_handle.max_offset().height;
         let next_y = (offset.y + delta.y).clamp(-max_y, px(0.0));
 
         if next_y != offset.y {
             offset.y = next_y;
-            self.prop_table_scroll_handle.set_offset(offset);
+            scroll_handle.set_offset(offset);
             cx.notify();
         }
         cx.stop_propagation();
@@ -1464,6 +1843,26 @@ impl ConfigView {
                     cx.notify();
                 });
             }))
+    }
+
+    fn render_event_header_cell(
+        &self,
+        w: f32,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .w(px(w))
+            .px_2()
+            .py_2()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                Label::new(text.to_string())
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .text_ellipsis(),
+            )
     }
 
     fn render_prop_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1551,6 +1950,140 @@ impl ConfigView {
             .disabled(next_disabled)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.prop_table_state.update(cx, |state, cx| {
+                    let current = state.page_index();
+                    state.set_page_index(current + 1);
+                    cx.notify();
+                });
+            }));
+
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_4()
+            .child(
+                div()
+                    .w(px(360.0))
+                    .min_w(px(0.0))
+                    .flex_shrink()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(info),
+            )
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_6()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Label::new("每页显示")
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(dropdown)
+                            .child(
+                                Label::new("条记录")
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .child(prev_btn)
+                            .child(
+                                Label::new(page_label)
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(next_btn),
+                    ),
+            )
+    }
+
+    fn render_event_pagination(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (total, start, end, pages, page_index, page_size) = {
+            let state = self.event_table_state.read(cx);
+            let total = state.rows_len();
+            let (start, end) = state.page_range();
+            (
+                total,
+                start,
+                end,
+                state.total_pages(),
+                state.page_index(),
+                state.page_size(),
+            )
+        };
+
+        let display_start = if total == 0 { 0 } else { start + 1 };
+        let display_end = if total == 0 { 0 } else { end };
+
+        let info = format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total} 条记录");
+        let page_label = format!("第 {} / {} 页", page_index + 1, pages);
+
+        let current_size = PropPageSize::from_value(page_size);
+        let dropdown = DropdownButton::new("event-page-size-dropdown")
+            .button(
+                Button::new("event-page-size-btn")
+                    .ghost()
+                    .compact()
+                    .label(format!("{page_size}")),
+            )
+            .dropdown_menu_with_anchor(Corner::TopLeft, move |menu, _, _| {
+                let menu = menu
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S10,
+                        Box::new(PropPageSize::S10),
+                        move |_, _cx| Label::new("10").ml_2().text_xs(),
+                    )
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S20,
+                        Box::new(PropPageSize::S20),
+                        move |_, _cx| Label::new("20").ml_2().text_xs(),
+                    )
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S50,
+                        Box::new(PropPageSize::S50),
+                        move |_, _cx| Label::new("50").ml_2().text_xs(),
+                    )
+                    .menu_element_with_check(
+                        current_size == PropPageSize::S100,
+                        Box::new(PropPageSize::S100),
+                        move |_, _cx| Label::new("100").ml_2().text_xs(),
+                    );
+                menu
+            });
+
+        let prev_disabled = page_index == 0;
+        let next_disabled = page_index + 1 >= pages;
+
+        let prev_btn = Button::new("event-page-prev")
+            .ghost()
+            .icon(IconName::ChevronLeft)
+            .disabled(prev_disabled)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.event_table_state.update(cx, |state, cx| {
+                    let current = state.page_index();
+                    state.set_page_index(current.saturating_sub(1));
+                    cx.notify();
+                });
+            }));
+
+        let next_btn = Button::new("event-page-next")
+            .ghost()
+            .icon(IconName::ChevronRight)
+            .disabled(next_disabled)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.event_table_state.update(cx, |state, cx| {
                     let current = state.page_index();
                     state.set_page_index(current + 1);
                     cx.notify();
@@ -1809,6 +2342,19 @@ fn find_topic_origin(configs: &[ConfigItem], topic_path: &str) -> Option<(String
     None
 }
 
+fn find_topic_service_url(configs: &[ConfigItem], topic_path: &str) -> Option<String> {
+    for config in configs {
+        for agent in &config.topic_agents {
+            for topic in &agent.topics {
+                if topic.path == topic_path {
+                    return Some(config.service_url.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn extract_cfgid_from_source(source: &str) -> Option<String> {
     if !source.starts_with("CMC_") {
         return None;
@@ -1834,11 +2380,14 @@ fn extract_cfgid_from_source(source: &str) -> Option<String> {
     None
 }
 
-fn decode_data_frame(payload: &[u8]) -> Option<(String, crate::proto::iothub::DataFrame)> {
-    fn try_with_summary_len_at(
-        payload: &[u8],
+fn decode_framed_iothub_message<T>(payload: &[u8]) -> Option<(String, T)>
+where
+    T: prost::Message + Default,
+{
+    fn try_with_summary_len_at<'a>(
+        payload: &'a [u8],
         summary_len_index: usize,
-    ) -> Option<(String, crate::proto::iothub::DataFrame)> {
+    ) -> Option<(String, &'a [u8])> {
         if payload.len() <= summary_len_index {
             return None;
         }
@@ -1857,26 +2406,41 @@ fn decode_data_frame(payload: &[u8]) -> Option<(String, crate::proto::iothub::Da
         };
 
         let proto = &payload[summary_end..];
-        let df = crate::proto::iothub::DataFrame::decode(proto).ok()?;
-        Some((summary, df))
+        Some((summary, proto))
     }
 
     // Most common (DFC): payload[2] is summary length, summary starts at payload[3]
-    if let Some(v) = try_with_summary_len_at(payload, 2) {
-        return Some(v);
+    if let Some((summary, proto)) = try_with_summary_len_at(payload, 2) {
+        if let Ok(message) = T::decode(proto) {
+            return Some((summary, message));
+        }
     }
     // Some producers omit the 2-byte prefix: summary length at payload[0] or payload[1]
-    if let Some(v) = try_with_summary_len_at(payload, 0) {
-        return Some(v);
+    if let Some((summary, proto)) = try_with_summary_len_at(payload, 0) {
+        if let Ok(message) = T::decode(proto) {
+            return Some((summary, message));
+        }
     }
-    if let Some(v) = try_with_summary_len_at(payload, 1) {
-        return Some(v);
+    if let Some((summary, proto)) = try_with_summary_len_at(payload, 1) {
+        if let Ok(message) = T::decode(proto) {
+            return Some((summary, message));
+        }
     }
 
     // Fallback: no summary framing, payload is raw protobuf
-    crate::proto::iothub::DataFrame::decode(payload)
+    T::decode(payload)
         .ok()
-        .map(|df| (String::new(), df))
+        .map(|message| (String::new(), message))
+}
+
+fn decode_data_frame(payload: &[u8]) -> Option<(String, crate::proto::iothub::DataFrame)> {
+    decode_framed_iothub_message(payload)
+}
+
+fn decode_event_record_list(
+    payload: &[u8],
+) -> Option<(String, crate::proto::iothub::EventRecordList)> {
+    decode_framed_iothub_message(payload)
 }
 
 fn format_clock_time(clock: Option<&crate::proto::iothub::ClockTime>) -> String {
@@ -1886,6 +2450,23 @@ fn format_clock_time(clock: Option<&crate::proto::iothub::ClockTime>) -> String 
 
     let secs = i64::from(clock.t);
     let Some(dt_utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) else {
+        return String::new();
+    };
+
+    dt_utc
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
+}
+
+fn format_hi_clock_time(clock: Option<&crate::proto::iothub::HiClockTime>) -> String {
+    let Some(clock) = clock else {
+        return String::new();
+    };
+
+    let secs = i64::from(clock.t);
+    let nanos = clock.nano.min(999_999_999);
+    let Some(dt_utc) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos) else {
         return String::new();
     };
 
@@ -1922,6 +2503,27 @@ fn any_value_to_string(v: Option<&crate::proto::iothub::AnyValue>) -> String {
         Some(V::MsgPackV(b)) => format!("msgpack {} bytes", b.len()),
         None => String::new(),
     }
+}
+
+fn enum_value_to_string(v: &crate::proto::iothub::EnumValue) -> String {
+    use crate::proto::iothub::enum_value::V;
+    match v.v.as_ref() {
+        Some(V::Uint64V(x)) => x.to_string(),
+        Some(V::BoolV(x)) => x.to_string(),
+        Some(V::StringV(s)) => s.clone(),
+        None => String::new(),
+    }
+}
+
+fn event_context_to_string(
+    context: &std::collections::HashMap<String, crate::proto::iothub::AnyValue>,
+) -> String {
+    let mut entries: Vec<_> = context
+        .iter()
+        .map(|(key, value)| format!("{key}={}", any_value_to_string(Some(value))))
+        .collect();
+    entries.sort();
+    entries.join(", ")
 }
 
 fn parse_prop_rows_from_payload(
@@ -1975,6 +2577,55 @@ fn parse_prop_rows_from_payload(
                 summary: summary.clone(),
             });
         }
+    }
+
+    (out, true)
+}
+
+fn parse_event_rows_from_payload(payload: &[u8], uid: &AtomicU64) -> (Vec<EventRow>, bool) {
+    let Some((summary, list)) = decode_event_record_list(payload) else {
+        return (Vec::new(), false);
+    };
+
+    let mut out = Vec::new();
+    for event in list.event_array {
+        let codes: Vec<String> = event
+            .code
+            .iter()
+            .filter_map(|code| match code.v.as_ref() {
+                Some(crate::proto::iothub::enum_value::V::Uint64V(_)) => {
+                    Some(enum_value_to_string(code))
+                }
+                _ => None,
+            })
+            .collect();
+        let str_codes: Vec<String> = event
+            .code
+            .iter()
+            .filter_map(|code| match code.v.as_ref() {
+                Some(crate::proto::iothub::enum_value::V::StringV(_)) => {
+                    Some(enum_value_to_string(code))
+                }
+                _ => None,
+            })
+            .collect();
+
+        out.push(EventRow {
+            uid: uid.fetch_add(1, Ordering::Relaxed),
+            uuid: event.evt_uuid,
+            device: event.src,
+            imr: event.imr,
+            event_type: event.r#type,
+            level: event.level.to_string(),
+            tags: event.tags.join(","),
+            codes: codes.join(","),
+            str_codes: str_codes.join(","),
+            happened_time: format_hi_clock_time(event.happened_time.as_ref()),
+            record_time: format_clock_time(event.record_time.as_ref()),
+            bcr_id: event.bcr_uuid,
+            context: event_context_to_string(&event.context),
+            summary: summary.clone(),
+        });
     }
 
     (out, true)
@@ -2205,9 +2856,223 @@ async fn run_prop_topic_stream(
     }
 }
 
+async fn run_event_topic_stream(
+    service_url: String,
+    topic_path: String,
+    token: Option<String>,
+    mut stop: watch::Receiver<bool>,
+    tx: Sender<EventStreamEvent>,
+    uid: Arc<AtomicU64>,
+) {
+    let mut builder = pulsar::Pulsar::builder(service_url.clone(), pulsar::TokioExecutor);
+    if let Some(token) = token {
+        builder = builder.with_auth(pulsar::Authentication {
+            name: "token".to_string(),
+            data: token.into_bytes(),
+        });
+    }
+
+    let client: pulsar::Pulsar<_> = match builder.build().await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(EventStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
+            return;
+        }
+    };
+
+    if let Some(namespace) = topic_path.split("://").nth(1).and_then(|rest| {
+        let mut parts = rest.splitn(3, '/');
+        let tenant = parts.next()?;
+        let ns = parts.next()?;
+        Some(format!("{tenant}/{ns}"))
+    }) {
+        use pulsar::message::proto::command_get_topics_of_namespace::Mode;
+        let mode = if topic_path.starts_with("persistent://") {
+            Mode::Persistent
+        } else {
+            Mode::NonPersistent
+        };
+        match client
+            .get_topics_of_namespace(namespace.clone(), mode)
+            .await
+        {
+            Ok(topics) => {
+                let found = topics.iter().any(|t| *t == topic_path);
+                tracing::debug!(
+                    namespace = %namespace,
+                    total = topics.len(),
+                    target = %topic_path,
+                    found,
+                    "Topic namespace listing"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e)
+            }
+        }
+    }
+    let subscription = format!("dfc-gui-event-{}", uuid::Uuid::new_v4());
+
+    let mut last_stats = Instant::now();
+    let mut received_messages: u64 = 0;
+    let mut decoded_messages: u64 = 0;
+    let mut decode_failures: u64 = 0;
+    let mut emitted_rows: u64 = 0;
+
+    let mut connect_attempt: u64 = 0;
+    let mut seek_done = false;
+
+    while !*stop.borrow() {
+        connect_attempt += 1;
+
+        if connect_attempt > 1 {
+            let backoff = Duration::from_secs((2u64.pow(connect_attempt.min(5) as u32)).min(30));
+            tracing::info!(
+                backoff_secs = backoff.as_secs(),
+                attempt = connect_attempt,
+                "reconnecting after backoff"
+            );
+            tokio::time::sleep(backoff).await;
+            if *stop.borrow() {
+                return;
+            }
+        }
+
+        let options = pulsar::ConsumerOptions::default()
+            .durable(false)
+            .with_receiver_queue_size(1000);
+        let consumer_name = format!("dfc-gui-event-consumer-{}", uuid::Uuid::new_v4());
+
+        tracing::info!(
+            topic = %topic_path,
+            subscription = %subscription,
+            consumer_name = %consumer_name,
+            attempt = connect_attempt,
+            "connecting event topic consumer"
+        );
+
+        let mut consumer: pulsar::Consumer<Vec<u8>, _> = match client
+            .consumer()
+            .with_topic(&topic_path)
+            .with_subscription(subscription.clone())
+            .with_subscription_type(pulsar::SubType::Shared)
+            .with_consumer_name(consumer_name)
+            .with_options(options)
+            .build()
+            .await
+        {
+            Ok(c) => {
+                connect_attempt = 0;
+                c
+            }
+            Err(e) => {
+                let _ = tx.send(EventStreamEvent::Error(format!("创建 Consumer 失败: {e}")));
+                continue;
+            }
+        };
+
+        if !seek_done && topic_path.starts_with("persistent://") {
+            if let Ok(parts) = client.lookup_partitioned_topic(topic_path.clone()).await {
+                if parts.len() == 1 {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    if now_ms > 0 {
+                        let seek_ms = now_ms.saturating_sub(20 * 60 * 1000) as u64;
+                        let _ = consumer
+                            .seek(None, None, Some(seek_ms), client.clone())
+                            .await;
+                    }
+                    seek_done = true;
+                } else {
+                    tracing::debug!(
+                        topic = %topic_path,
+                        partitions = parts.len(),
+                        "event topic is partitioned; skipping seek"
+                    );
+                    seek_done = true;
+                }
+            }
+        }
+
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+
+            tokio::select! {
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    tracing::debug!(
+                        topic = %topic_path,
+                        received_messages,
+                        decoded_messages,
+                        decode_failures,
+                        emitted_rows,
+                        consumer_received = consumer.messages_received(),
+                        "event topic consumer heartbeat"
+                    );
+                }
+                msg = consumer.next() => {
+                    match msg {
+                        Some(Ok(message)) => {
+                            received_messages += 1;
+
+                            let data = message.deserialize();
+                            let (rows, decoded) = parse_event_rows_from_payload(&data, &uid);
+                            if decoded {
+                                decoded_messages += 1;
+                            } else {
+                                decode_failures += 1;
+                            }
+                            if !rows.is_empty() {
+                                emitted_rows += rows.len() as u64;
+                                let _ = tx.send(EventStreamEvent::Rows(rows));
+                            }
+
+                            let _ = consumer.ack(&message).await;
+
+                            if last_stats.elapsed() >= Duration::from_secs(10) {
+                                tracing::info!(
+                                    topic = %topic_path,
+                                    received_messages,
+                                    decoded_messages,
+                                    decode_failures,
+                                    emitted_rows,
+                                    "event topic stream stats"
+                                );
+                                last_stats = Instant::now();
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = tx.send(EventStreamEvent::Error(format!("读取消息失败: {e}")));
+                            break;
+                        }
+                        None => {
+                            let _ = tx.send(EventStreamEvent::Error("Consumer 数据流意外结束，正在重连…".to_string()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::topic_display_name;
+    use super::{parse_event_rows_from_payload, topic_display_name};
+    use crate::proto::iothub::{
+        ClockTime, EnumValue, EventRecord, EventRecordList, HiClockTime, enum_value,
+    };
+    use prost::Message as _;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn topic_display_name_prop_data_rules() {
@@ -2254,6 +3119,61 @@ mod tests {
             "thing_event-BZ"
         );
     }
+
+    #[test]
+    fn parse_event_rows_uses_dfc_event_record_list_frame() {
+        let list = EventRecordList {
+            event_array: vec![EventRecord {
+                evt_uuid: "evt-1".to_string(),
+                r#type: "状态变化".to_string(),
+                tags: vec!["tag-a".to_string(), "tag-b".to_string()],
+                src: "100852277".to_string(),
+                im_global_uuid: "705537041061273601".to_string(),
+                imr: "Turbine/WTUR/Event/TurbineFault".to_string(),
+                happened_time: Some(HiClockTime {
+                    t: 1_711_111_111,
+                    nano: 123_000_000,
+                    zone_info: 0,
+                }),
+                record_time: Some(ClockTime {
+                    t: 1_711_111_112,
+                    zone_info: 0,
+                }),
+                level: 2,
+                code: vec![
+                    EnumValue {
+                        v: Some(enum_value::V::Uint64V(42)),
+                    },
+                    EnumValue {
+                        v: Some(enum_value::V::StringV("KKS-A".to_string())),
+                    },
+                ],
+                dict_name: "dict".to_string(),
+                bcr_uuid: "bcr-1".to_string(),
+                context: Default::default(),
+            }],
+        };
+
+        let mut proto = Vec::new();
+        list.encode(&mut proto).expect("encode test event list");
+
+        let summary = b"per";
+        let mut payload = vec![0x20, 0x02, summary.len() as u8];
+        payload.extend_from_slice(summary);
+        payload.extend_from_slice(&proto);
+
+        let uid = AtomicU64::new(1);
+        let (rows, decoded) = parse_event_rows_from_payload(&payload, &uid);
+
+        assert!(decoded);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].uuid, "evt-1");
+        assert_eq!(rows[0].device, "100852277");
+        assert_eq!(rows[0].event_type, "状态变化");
+        assert_eq!(rows[0].codes, "42");
+        assert_eq!(rows[0].str_codes, "KKS-A");
+        assert_eq!(rows[0].summary, "per");
+    }
 }
 
 impl Render for ConfigView {
@@ -2271,6 +3191,10 @@ impl Render for ConfigView {
             .on_action(cx.listener(|this, size: &PropPageSize, _window, cx| {
                 let page_size = size.value();
                 this.prop_table_state.update(cx, |state, cx| {
+                    state.set_page_size(page_size);
+                    cx.notify();
+                });
+                this.event_table_state.update(cx, |state, cx| {
                     state.set_page_size(page_size);
                     cx.notify();
                 });

@@ -1,5 +1,6 @@
 /**
- * 通信协议2.0（最小子集），用于解码 iothub prop_data topic 中的 DataFrame。
+ * 通信协议2.0（最小子集），用于解码 iothub prop_data topic 中的 DataFrame，
+ * 以及 thing_event topic 中的 EventRecordList。
  *
  * Source of truth/reference: DFC project `DataTypeCOMM.proto` (protobuf v3).
  */
@@ -41,3 +42,7 @@ message DataFrame {
   repeated DataRecordSet frame = 1;
 }
 
+/* 事件记录数组，用于序列化和反序列化。 */
+message EventRecordList {
+  repeated EventRecord eventArray = 1;
+}

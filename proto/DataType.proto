@@ -1,6 +1,7 @@
 /**
  * Minimal subset of IM2 DataType definitions required for decoding iothub
- * prop_data payloads (DataFrame/DataRecordSet).
+ * prop_data payloads (DataFrame/DataRecordSet) and thing_event payloads
+ * (EventRecordList/EventRecord).
  *
  * Source of truth/reference: DFC project `DataType.proto` (protobuf v3).
  */
@@ -39,6 +40,13 @@ message AnyValue {
   }
 }
 
+/* 时间纳秒类型 */
+message HiClockTime {
+  uint32 t = 1;
+  uint32 nano = 2;
+  int32 zoneInfo = 3;
+}
+
 /* 时间类型（unix seconds） */
 message ClockTime {
   uint32 t = 1;
@@ -50,3 +58,28 @@ message IMRRef {
   string path = 1;
 }
 
+/* 枚举数值，可能是字符串或者整型数字 */
+message EnumValue {
+  oneof v {
+    uint64 uint64V = 1;
+    bool boolV = 2;
+    string stringV = 3;
+  }
+}
+
+/* 事件记录定义 */
+message EventRecord {
+  string evtUUID = 1;
+  string type = 3;
+  repeated string tags = 4;
+  string src = 5;
+  string imGlobalUUID = 6;
+  string imr = 7;
+  HiClockTime happenedTime = 8;
+  ClockTime recordTime = 9;
+  uint32 level = 10;
+  repeated EnumValue code = 11;
+  string dictName = 12;
+  string bcrUUID = 13;
+  map<string, AnyValue> context = 14;
+}
