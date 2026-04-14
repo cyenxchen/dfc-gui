@@ -14,6 +14,7 @@ mod fleet;
 mod i18n;
 mod keys;
 mod prop_table;
+mod service_table;
 mod ui_event;
 
 pub use app::*;
@@ -23,4 +24,5 @@ pub use fleet::*;
 pub use i18n::*;
 pub use keys::*;
 pub use prop_table::*;
+pub use service_table::*;
 pub use ui_event::*;

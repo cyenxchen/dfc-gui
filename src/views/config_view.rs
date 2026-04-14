@@ -4,12 +4,17 @@
 //! - Left panel: TopicAgentId list
 //! - Right panel: Topic tabs for selected TopicAgentId
 
+use super::service_panel::{
+    self, CUSTOM_TYPE_INDEX, REQUEST_TYPES, ServicePublishRequest, ServiceStreamEvent,
+    run_service_topic_stream,
+};
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
     ConfigState, DfcAppState, DfcGlobalStore, EventRow, EventTableLoadState, EventTableState,
-    KeysState, PropRow, PropSortColumn, PropTableLoadState, PropTableState, SortDirection,
+    KeysState, PropRow, PropSortColumn, PropTableLoadState, PropTableState, ServiceRequestRow,
+    ServiceTableLoadState, ServiceTableState, SortDirection,
 };
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
@@ -21,9 +26,11 @@ use gpui::{
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants, DropdownButton},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    radio::Radio,
     scroll::{Scrollbar, ScrollbarShow},
     tooltip::Tooltip,
     v_flex,
@@ -132,6 +139,18 @@ impl Default for AgentQueryMode {
     }
 }
 
+/// Form-level state for the service request panel.
+pub struct ServiceFormState {
+    pub devices_input: Entity<InputState>,
+    pub timeout_input: Entity<InputState>,
+    pub manual_imr_input: Entity<InputState>,
+    pub requester_input: Entity<InputState>,
+    pub args_input: Entity<InputState>,
+    pub is_test: bool,
+    pub selected_type_idx: usize,
+    pub error_message: Option<String>,
+}
+
 /// Configuration view component
 pub struct ConfigView {
     /// App state entity
@@ -155,6 +174,16 @@ pub struct ConfigView {
     event_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the event table header and body
     event_table_horizontal_scroll_handle: ScrollHandle,
+    /// Service topic state (for `thing_service` REQUEST/RESPONSE topic pair)
+    service_table_state: Entity<ServiceTableState>,
+    service_form: ServiceFormState,
+    service_table_horizontal_scroll_handle: ScrollHandle,
+    service_response_horizontal_scroll_handle: ScrollHandle,
+    active_service_topic: Option<String>,
+    service_stream_stop: Option<watch::Sender<bool>>,
+    service_publish_tx: Option<Sender<ServicePublishRequest>>,
+    service_ingest_task: Option<Task<()>>,
+    service_row_uid: Arc<AtomicU64>,
     /// Active prop topic path (to avoid restarting streams on every notify)
     active_prop_topic: Option<String>,
     /// Stop signal for the active prop topic stream (tokio)
@@ -200,11 +229,52 @@ impl ConfigView {
         let prop_row_uid = Arc::new(AtomicU64::new(1));
         let event_table_state = cx.new(|_| EventTableState::new());
         let event_row_uid = Arc::new(AtomicU64::new(1));
+        let service_table_state = cx.new(|_| ServiceTableState::new());
+        let service_row_uid = Arc::new(AtomicU64::new(1));
+
+        let devices_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 6)
+                .placeholder("请输入设备号, 每行一个 ...")
+        });
+        let timeout_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("超时时间(毫秒)");
+            state.set_value("5000".to_string(), window, cx);
+            state
+        });
+        let manual_imr_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("WindTurbine/SERVICE/..."));
+        let requester_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("请求者");
+            state.set_value("V8Test".to_string(), window, cx);
+            state
+        });
+        let args_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 6)
+                .placeholder("请输入参数 (JSON 格式)")
+        });
+
+        let service_form = ServiceFormState {
+            devices_input,
+            timeout_input,
+            manual_imr_input,
+            requester_input,
+            args_input,
+            is_test: false,
+            selected_type_idx: CUSTOM_TYPE_INDEX,
+            error_message: None,
+        };
 
         subscriptions.push(cx.observe(&prop_table_state, |_this, _model, cx| {
             cx.notify();
         }));
         subscriptions.push(cx.observe(&event_table_state, |_this, _model, cx| {
+            cx.notify();
+        }));
+        subscriptions.push(cx.observe(&service_table_state, |_this, _model, cx| {
             cx.notify();
         }));
 
@@ -265,6 +335,15 @@ impl ConfigView {
             event_table_state,
             event_table_scroll_handle: ScrollHandle::default(),
             event_table_horizontal_scroll_handle: ScrollHandle::default(),
+            service_table_state,
+            service_form,
+            service_table_horizontal_scroll_handle: ScrollHandle::default(),
+            service_response_horizontal_scroll_handle: ScrollHandle::default(),
+            active_service_topic: None,
+            service_stream_stop: None,
+            service_publish_tx: None,
+            service_ingest_task: None,
+            service_row_uid,
             active_prop_topic: None,
             prop_stream_stop: None,
             prop_ingest_task: None,
@@ -330,14 +409,57 @@ impl ConfigView {
         self.active_event_topic = None;
     }
 
+    fn stop_service_stream(&mut self) {
+        if let Some(stop) = self.service_stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = self.service_ingest_task.take() {
+            drop(task);
+        }
+        self.active_service_topic = None;
+        self.service_publish_tx = None;
+    }
+
     fn is_prop_topic_path(topic_path: &str) -> bool {
         topic_path.contains("prop_data-BZ-")
     }
 
     fn is_event_topic_path(topic_path: &str) -> bool {
+        // Service topic paths contain `thing_service-BZ` and a comma; treat them
+        // as the service topic, not an event topic, so they don't get matched here.
+        if Self::is_service_topic_path(topic_path) {
+            return false;
+        }
         topic_path.contains("thing_event-BZ")
             || topic_path.contains("/event/")
             || topic_path.contains("/events/")
+    }
+
+    fn is_service_topic_path(topic_path: &str) -> bool {
+        topic_path.contains(',')
+            && topic_path.contains("thing_service-BZ-REQUEST")
+            && topic_path.contains("thing_service-BZ-RESPONSE")
+    }
+
+    /// Returns `(request_topic, response_topic)` extracted from the comma-pair path.
+    fn split_service_topic_path(topic_path: &str) -> Option<(String, String)> {
+        let mut parts = topic_path.split(',').map(|s| s.trim().to_string());
+        let first = parts.next()?;
+        let second = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let (req, resp) = if first.contains("thing_service-BZ-REQUEST") {
+            (first, second)
+        } else if second.contains("thing_service-BZ-REQUEST") {
+            (second, first)
+        } else {
+            return None;
+        };
+        if !resp.contains("thing_service-BZ-RESPONSE") {
+            return None;
+        }
+        Some((req, resp))
     }
 
     fn sync_topic_stream_with_selection(&mut self, cx: &mut Context<Self>) {
@@ -359,8 +481,14 @@ impl ConfigView {
             .filter(|path| Self::is_event_topic_path(path))
             .map(|s| s.to_string());
 
+        let selected_service_topic = selected_topic_path
+            .as_deref()
+            .filter(|path| Self::is_service_topic_path(path))
+            .map(|s| s.to_string());
+
         if self.active_prop_topic == selected_prop_topic
             && self.active_event_topic == selected_event_topic
+            && self.active_service_topic == selected_service_topic
         {
             return;
         }
@@ -368,6 +496,7 @@ impl ConfigView {
         // Stop any existing stream and reset state if needed.
         self.stop_prop_stream();
         self.stop_event_stream();
+        self.stop_service_stream();
 
         if let Some(topic_path) = selected_prop_topic {
             let _ = self.event_table_state.update(cx, |state, cx| {
@@ -448,11 +577,68 @@ impl ConfigView {
             return;
         }
 
+        if let Some(topic_path) = selected_service_topic {
+            let _ = self.prop_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(None);
+                cx.notify();
+            });
+            let _ = self.event_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(None);
+                cx.notify();
+            });
+
+            let Some((request_topic, response_topic)) = Self::split_service_topic_path(&topic_path)
+            else {
+                let _ = self.service_table_state.update(cx, |state, cx| {
+                    state.reset_for_topic(Some(topic_path.clone()));
+                    state.set_error("无法解析 service topic 路径");
+                    cx.notify();
+                });
+                return;
+            };
+
+            let service_url = {
+                let config_state = self.config_state.read(cx);
+                match find_topic_service_url(config_state.configs(), &topic_path) {
+                    Some(url) => url,
+                    None => {
+                        let _ = self.service_table_state.update(cx, |state, cx| {
+                            state.reset_for_topic(Some(topic_path.clone()));
+                            state.set_error("无法定位该 Topic 对应的 service_url");
+                            cx.notify();
+                        });
+                        return;
+                    }
+                }
+            };
+
+            let token = cx
+                .global::<DfcGlobalStore>()
+                .read(cx)
+                .selected_server()
+                .and_then(|s| s.pulsar_token.clone())
+                .filter(|t| !t.trim().is_empty());
+
+            self.active_service_topic = Some(topic_path.clone());
+
+            let _ = self.service_table_state.update(cx, |state, cx| {
+                state.reset_for_topic(Some(topic_path.clone()));
+                cx.notify();
+            });
+
+            self.start_service_stream(service_url, request_topic, response_topic, token, cx);
+            return;
+        }
+
         let _ = self.prop_table_state.update(cx, |state, cx| {
             state.reset_for_topic(None);
             cx.notify();
         });
         let _ = self.event_table_state.update(cx, |state, cx| {
+            state.reset_for_topic(None);
+            cx.notify();
+        });
+        let _ = self.service_table_state.update(cx, |state, cx| {
             state.reset_for_topic(None);
             cx.notify();
         });
@@ -582,6 +768,237 @@ impl ConfigView {
         });
 
         self.event_ingest_task = Some(task);
+    }
+
+    fn start_service_stream(
+        &mut self,
+        service_url: String,
+        request_topic: String,
+        response_topic: String,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (event_tx, event_rx): (Sender<ServiceStreamEvent>, Receiver<ServiceStreamEvent>) =
+            crossbeam_channel::unbounded();
+        let (publish_tx, publish_rx): (
+            Sender<ServicePublishRequest>,
+            Receiver<ServicePublishRequest>,
+        ) = crossbeam_channel::unbounded();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        self.service_stream_stop = Some(stop_tx);
+        self.service_publish_tx = Some(publish_tx);
+
+        let uid = self.service_row_uid.clone();
+
+        spawn_named_in_tokio("service-topic-stream", async move {
+            run_service_topic_stream(
+                service_url,
+                request_topic,
+                response_topic,
+                token,
+                stop_rx,
+                publish_rx,
+                event_tx,
+                uid,
+            )
+            .await;
+        });
+
+        let service_state = self.service_table_state.clone();
+        let task = cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+
+                let mut responses = Vec::new();
+                let mut error: Option<String> = None;
+
+                while let Ok(ev) = event_rx.try_recv() {
+                    match ev {
+                        ServiceStreamEvent::Response(row) => responses.push(row),
+                        ServiceStreamEvent::Error(msg) => error = Some(msg),
+                    }
+                }
+
+                if let Some(msg) = error {
+                    let _ = service_state.update(cx, |state, cx| {
+                        state.set_error(msg);
+                        cx.notify();
+                    });
+                    continue;
+                }
+
+                if responses.is_empty() {
+                    continue;
+                }
+
+                let _ = service_state.update(cx, |state, cx| {
+                    for row in responses {
+                        state.push_response_front(row);
+                    }
+                    cx.notify();
+                });
+            }
+        });
+
+        self.service_ingest_task = Some(task);
+    }
+
+    fn on_submit_service_request(&mut self, cx: &mut Context<Self>) {
+        let devices_raw = self.service_form.devices_input.read(cx).value().to_string();
+        let devices: Vec<String> = devices_raw
+            .split('\n')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if devices.is_empty() {
+            self.service_form.error_message = Some("请至少输入一个设备号".to_string());
+            cx.notify();
+            return;
+        }
+
+        let timeout_raw = self.service_form.timeout_input.read(cx).value().to_string();
+        let timeout_ms = match timeout_raw.trim().parse::<u32>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                self.service_form.error_message = Some("超时毫秒数必须是正整数".to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        let preset_imr = REQUEST_TYPES
+            .get(self.service_form.selected_type_idx)
+            .map(|(_, imr)| imr.to_string())
+            .unwrap_or_default();
+        let manual_imr = self
+            .service_form
+            .manual_imr_input
+            .read(cx)
+            .value()
+            .to_string();
+        let imr = if !preset_imr.is_empty() {
+            preset_imr
+        } else {
+            manual_imr.trim().to_string()
+        };
+        if imr.is_empty() {
+            self.service_form.error_message =
+                Some("请选择预设请求类型或填写自定义服务 IMR".to_string());
+            cx.notify();
+            return;
+        }
+
+        let requester = self
+            .service_form
+            .requester_input
+            .read(cx)
+            .value()
+            .to_string()
+            .trim()
+            .to_string();
+        let requester = if requester.is_empty() {
+            "V8Test".to_string()
+        } else {
+            requester
+        };
+
+        let args_raw = self.service_form.args_input.read(cx).value().to_string();
+        let args_trimmed = args_raw.trim();
+        let parsed_args: std::collections::HashMap<String, crate::proto::iothub::AnyValue> =
+            if args_trimmed.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                    args_trimmed,
+                ) {
+                    Ok(map) => map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), service_panel::json_value_to_any_value(v)))
+                        .collect(),
+                    Err(e) => {
+                        self.service_form.error_message =
+                            Some(format!("请求参数 JSON 解析失败: {e}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            };
+
+        let args_summary = if args_trimmed.is_empty() {
+            String::new()
+        } else {
+            args_trimmed.to_string()
+        };
+
+        self.service_form.error_message = None;
+
+        let is_test = self.service_form.is_test;
+        let now_local = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+
+        let Some(publish_tx) = self.service_publish_tx.clone() else {
+            self.service_form.error_message =
+                Some("服务流尚未就绪,请先选中 service Topic".to_string());
+            cx.notify();
+            return;
+        };
+
+        for device in devices {
+            let req_uuid = uuid::Uuid::new_v4().to_string();
+            let record = crate::proto::iothub::SvrReqRecord {
+                req_serial_uuid: req_uuid.clone(),
+                req_date_time: Some(service_panel::now_clock_time()),
+                time_out: timeout_ms,
+                requester: requester.clone(),
+                imr: imr.clone(),
+                args: parsed_args.clone(),
+                is_test_request: is_test,
+            };
+
+            let row = ServiceRequestRow {
+                uid: self.service_row_uid.fetch_add(1, Ordering::Relaxed),
+                device: device.clone(),
+                imr: imr.clone(),
+                request_time: now_local.clone(),
+                timeout_ms,
+                is_test,
+                requester: requester.clone(),
+                args_json: args_summary.clone(),
+                uuid: req_uuid,
+                response_time: String::new(),
+                response_code_hex: String::new(),
+                responser: String::new(),
+                summary: String::new(),
+            };
+
+            let _ = self.service_table_state.update(cx, |state, cx| {
+                state.push_request_front(row);
+                cx.notify();
+            });
+
+            if let Err(e) = publish_tx.send(ServicePublishRequest {
+                device: device.clone(),
+                record,
+            }) {
+                self.service_form.error_message = Some(format!("发送请求队列失败 ({device}): {e}"));
+                cx.notify();
+                return;
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn on_clear_service_records(&mut self, cx: &mut Context<Self>) {
+        let _ = self.service_table_state.update(cx, |state, cx| {
+            state.clear_records();
+            cx.notify();
+        });
+        self.service_form.error_message = None;
     }
 
     /// Render loading state
@@ -1193,6 +1610,10 @@ impl ConfigView {
             .as_deref()
             .map(Self::is_event_topic_path)
             .unwrap_or(false);
+        let is_service_topic = selected_topic_path
+            .as_deref()
+            .map(Self::is_service_topic_path)
+            .unwrap_or(false);
 
         // Build tab buttons
         let mut tabs = Vec::new();
@@ -1246,6 +1667,9 @@ impl ConfigView {
                         }
                         Some(topic_path) if is_event_topic => {
                             self.render_event_table(topic_path, cx).into_any_element()
+                        }
+                        Some(_) if is_service_topic => {
+                            self.render_service_panel(cx).into_any_element()
                         }
                         Some(topic_path) => self
                             .render_unsupported_topic(topic_path, cx)
@@ -1729,6 +2153,386 @@ impl ConfigView {
                     ),
             )
             .into_any_element()
+    }
+
+    fn render_service_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let muted_fg = cx.theme().muted_foreground;
+        let secondary_bg = cx.theme().secondary;
+
+        let (request_rows, response_rows, total_requests, total_responses, load_state) = {
+            let state = self.service_table_state.read(cx);
+            (
+                state.req_page_rows_owned(),
+                state.resp_page_rows_owned(),
+                state.requests_len(),
+                state.responses_len(),
+                state.load_state().clone(),
+            )
+        };
+
+        let error_banner = if let ServiceTableLoadState::Error(msg) = &load_state {
+            Some(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_1()
+                    .border_color(cx.theme().danger)
+                    .rounded_md()
+                    .child(
+                        Label::new(format!("加载失败: {msg}"))
+                            .text_sm()
+                            .text_color(cx.theme().danger),
+                    ),
+            )
+        } else {
+            None
+        };
+
+        let form_error = self.service_form.error_message.as_ref().map(|msg| {
+            div()
+                .px_3()
+                .py_2()
+                .border_1()
+                .border_color(cx.theme().danger)
+                .rounded_md()
+                .child(
+                    Label::new(msg.clone())
+                        .text_sm()
+                        .text_color(cx.theme().danger),
+                )
+        });
+
+        let mut radios = Vec::new();
+        for (idx, (label, _imr)) in REQUEST_TYPES.iter().enumerate() {
+            let selected = self.service_form.selected_type_idx == idx;
+            radios.push(
+                Radio::new(("svc-radio", idx))
+                    .label((*label).to_string())
+                    .checked(selected)
+                    .on_click(cx.listener(move |this, _checked: &bool, _, cx| {
+                        this.service_form.selected_type_idx = idx;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let form = v_flex()
+            .gap_3()
+            .p_3()
+            .border_1()
+            .border_color(border)
+            .rounded_md()
+            .bg(secondary_bg)
+            .child(self.render_service_form_row(
+                "设备号",
+                Input::new(&self.service_form.devices_input).into_any_element(),
+                cx,
+            ))
+            .child(self.render_service_form_row(
+                "超时毫秒数",
+                Input::new(&self.service_form.timeout_input).into_any_element(),
+                cx,
+            ))
+            .child(
+                self.render_service_form_row(
+                    "是否为测试",
+                    Checkbox::new("svc-is-test")
+                        .checked(self.service_form.is_test)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.service_form.is_test = *checked;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    cx,
+                ),
+            )
+            .child(
+                self.render_service_form_row(
+                    "请求类型",
+                    h_flex()
+                        .flex_wrap()
+                        .gap_x_3()
+                        .gap_y_2()
+                        .children(radios)
+                        .into_any_element(),
+                    cx,
+                ),
+            )
+            .child(self.render_service_form_row(
+                "自定义服务IMR",
+                Input::new(&self.service_form.manual_imr_input).into_any_element(),
+                cx,
+            ))
+            .child(self.render_service_form_row(
+                "请求者",
+                Input::new(&self.service_form.requester_input).into_any_element(),
+                cx,
+            ))
+            .child(self.render_service_form_row(
+                "请求参数(JSON)",
+                Input::new(&self.service_form.args_input).into_any_element(),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("svc-submit")
+                            .primary()
+                            .label("发起请求")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.on_submit_service_request(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("svc-clear")
+                            .danger()
+                            .label("清除记录")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.on_clear_service_records(cx);
+                            })),
+                    ),
+            );
+
+        let request_table_width = 1_960.0;
+        let response_table_width = 1_540.0;
+
+        let mut request_body_rows = Vec::new();
+        for (idx, row) in request_rows.iter().enumerate() {
+            let bg = if idx % 2 == 0 {
+                if cx.theme().is_dark() {
+                    cx.theme().background.lighten(0.3)
+                } else {
+                    cx.theme().background.darken(0.01)
+                }
+            } else {
+                cx.theme().background
+            };
+            let is_test_text = if row.is_test { "是" } else { "否" };
+            request_body_rows.push(
+                h_flex()
+                    .id(("svc-req-row", row.uid as usize))
+                    .w_full()
+                    .bg(bg)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(self.render_prop_cell(140.0, &row.device, cx))
+                    .child(self.render_prop_cell(280.0, &row.imr, cx))
+                    .child(self.render_prop_cell(180.0, &row.request_time, cx))
+                    .child(self.render_prop_cell(110.0, &row.timeout_ms.to_string(), cx))
+                    .child(self.render_prop_cell(90.0, is_test_text, cx))
+                    .child(self.render_prop_cell(110.0, &row.requester, cx))
+                    .child(self.render_prop_cell(220.0, &row.args_json, cx))
+                    .child(self.render_prop_cell(280.0, &row.uuid, cx))
+                    .child(self.render_prop_cell(180.0, &row.response_time, cx))
+                    .child(self.render_prop_cell(140.0, &row.response_code_hex, cx))
+                    .child(self.render_prop_cell(110.0, &row.responser, cx))
+                    .child(self.render_prop_cell(120.0, &row.summary, cx)),
+            );
+        }
+
+        let request_table = v_flex()
+            .w_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(secondary_bg)
+                    .child(
+                        Label::new("请求记录")
+                            .text_sm()
+                            .text_color(cx.theme().foreground),
+                    )
+                    .child(
+                        Label::new(format!("(共 {total_requests} 条)"))
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .ml_2(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("svc-req-header-x-scroll")
+                    .w_full()
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.service_table_horizontal_scroll_handle)
+                    .child(
+                        h_flex()
+                            .min_w(px(request_table_width))
+                            .w(px(request_table_width))
+                            .bg(cx.theme().secondary.opacity(0.6))
+                            .border_b_1()
+                            .border_color(border)
+                            .child(self.render_event_header_cell(140.0, "设备号", cx))
+                            .child(self.render_event_header_cell(280.0, "IMR", cx))
+                            .child(self.render_event_header_cell(180.0, "请求时间", cx))
+                            .child(self.render_event_header_cell(110.0, "超时(ms)", cx))
+                            .child(self.render_event_header_cell(90.0, "测试", cx))
+                            .child(self.render_event_header_cell(110.0, "请求者", cx))
+                            .child(self.render_event_header_cell(220.0, "其他参数", cx))
+                            .child(self.render_event_header_cell(280.0, "UUID", cx))
+                            .child(self.render_event_header_cell(180.0, "响应时间", cx))
+                            .child(self.render_event_header_cell(140.0, "响应码(hex)", cx))
+                            .child(self.render_event_header_cell(110.0, "响应人", cx))
+                            .child(self.render_event_header_cell(120.0, "报文摘要", cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("svc-req-body-x-scroll")
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.service_table_horizontal_scroll_handle)
+                    .child(
+                        div()
+                            .min_w(px(request_table_width))
+                            .w(px(request_table_width))
+                            .children(request_body_rows),
+                    ),
+            );
+
+        let mut response_body_rows = Vec::new();
+        for (idx, row) in response_rows.iter().enumerate() {
+            let bg = if idx % 2 == 0 {
+                if cx.theme().is_dark() {
+                    cx.theme().background.lighten(0.3)
+                } else {
+                    cx.theme().background.darken(0.01)
+                }
+            } else {
+                cx.theme().background
+            };
+            response_body_rows.push(
+                h_flex()
+                    .id(("svc-resp-row", row.uid as usize))
+                    .w_full()
+                    .bg(bg)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(self.render_prop_cell(280.0, &row.request_uuid, cx))
+                    .child(self.render_prop_cell(280.0, &row.response_uuid, cx))
+                    .child(self.render_prop_cell(180.0, &row.response_time, cx))
+                    .child(self.render_prop_cell(140.0, &row.response_code_hex, cx))
+                    .child(self.render_prop_cell(110.0, &row.responser, cx))
+                    .child(self.render_prop_cell(180.0, &row.receive_time, cx))
+                    .child(self.render_prop_cell(370.0, &row.summary, cx)),
+            );
+        }
+
+        let response_table = v_flex()
+            .w_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(secondary_bg)
+                    .child(
+                        Label::new("响应记录")
+                            .text_sm()
+                            .text_color(cx.theme().foreground),
+                    )
+                    .child(
+                        Label::new(format!("(共 {total_responses} 条)"))
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .ml_2(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("svc-resp-header-x-scroll")
+                    .w_full()
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.service_response_horizontal_scroll_handle)
+                    .child(
+                        h_flex()
+                            .min_w(px(response_table_width))
+                            .w(px(response_table_width))
+                            .bg(cx.theme().secondary.opacity(0.6))
+                            .border_b_1()
+                            .border_color(border)
+                            .child(self.render_event_header_cell(280.0, "请求的UUID", cx))
+                            .child(self.render_event_header_cell(280.0, "响应的UUID", cx))
+                            .child(self.render_event_header_cell(180.0, "响应时间", cx))
+                            .child(self.render_event_header_cell(140.0, "响应码(hex)", cx))
+                            .child(self.render_event_header_cell(110.0, "响应人", cx))
+                            .child(self.render_event_header_cell(180.0, "实际接收时间", cx))
+                            .child(self.render_event_header_cell(370.0, "报文摘要", cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("svc-resp-body-x-scroll")
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.service_response_horizontal_scroll_handle)
+                    .child(
+                        div()
+                            .min_w(px(response_table_width))
+                            .w(px(response_table_width))
+                            .children(response_body_rows),
+                    ),
+            );
+
+        v_flex()
+            .flex_1()
+            .h_0()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .p_3()
+            .gap_3()
+            .id("svc-panel-scroll")
+            .overflow_y_scroll()
+            .children(error_banner)
+            .children(form_error)
+            .child(form)
+            .child(request_table)
+            .child(response_table)
+            .into_any_element()
+    }
+
+    fn render_service_form_row(
+        &self,
+        label: &str,
+        content: gpui::AnyElement,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let muted_fg = cx.theme().muted_foreground;
+        h_flex()
+            .w_full()
+            .gap_3()
+            .items_start()
+            .child(
+                div()
+                    .w(px(110.0))
+                    .pt(px(6.0))
+                    .child(Label::new(label.to_string()).text_sm().text_color(muted_fg)),
+            )
+            .child(div().flex_1().min_w(px(0.0)).child(content))
     }
 
     fn handle_prop_table_vertical_scroll(
@@ -2380,7 +3184,7 @@ fn extract_cfgid_from_source(source: &str) -> Option<String> {
     None
 }
 
-fn decode_framed_iothub_message<T>(payload: &[u8]) -> Option<(String, T)>
+pub(super) fn decode_framed_iothub_message<T>(payload: &[u8]) -> Option<(String, T)>
 where
     T: prost::Message + Default,
 {
@@ -2443,7 +3247,7 @@ fn decode_event_record_list(
     decode_framed_iothub_message(payload)
 }
 
-fn format_clock_time(clock: Option<&crate::proto::iothub::ClockTime>) -> String {
+pub(super) fn format_clock_time(clock: Option<&crate::proto::iothub::ClockTime>) -> String {
     let Some(clock) = clock else {
         return String::new();
     };

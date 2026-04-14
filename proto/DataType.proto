@@ -83,3 +83,29 @@ message EventRecord {
   string bcrUUID = 13;
   map<string, AnyValue> context = 14;
 }
+
+/** 服务请求记录定义
+ * 不会单独传输,而是作为 EventRecord.context 中 key 为 "svrReq" 的项传输。
+ */
+message SvrReqRecord {
+  string reqSerialUUID = 1;       /* 请求序列号 */
+  ClockTime reqDateTime = 2;      /* 请求下发时间 */
+  uint32 timeOut = 3;             /* 超时时间(毫秒),默认 5000 */
+  string requester = 4;           /* 服务请求者 */
+  string imr = 5;                 /* 服务的 IMR */
+  map<string, AnyValue> args = 6; /* 服务请求参数 */
+  bool isTestRequest = 7;         /* 是否测试请求 */
+}
+
+/* 服务响应记录定义
+ * 不会单独传输,而是作为 EventRecord.context 中 key 为 "svrResp" 的项传输。
+ */
+message SvrRespRecord {
+  string reqSerialUUID = 1;       /* 请求序列号 */
+  uint32 respCode = 2;            /* 响应码,参考 OPC UA StatusCode */
+  ClockTime respDateTime = 3;     /* 响应发出时间 */
+  string requester = 4;           /* 服务请求者 */
+  string imr = 5;                 /* 服务的 IMR */
+  map<string, AnyValue> args = 6; /* 服务响应参数 */
+  string responser = 7;           /* 服务响应者 */
+}

@@ -23,6 +23,7 @@
 mod config_view;
 mod content;
 mod keys_browser;
+mod service_panel;
 mod sidebar;
 mod title_bar;
 
