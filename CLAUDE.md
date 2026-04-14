@@ -24,6 +24,11 @@ cargo fmt                    # Format code
 cargo clean                  # Clean build artifacts
 ```
 
+### Build Notes
+
+- `build.rs` compiles `proto/DataType.proto` and `proto/DataTypeCOMM.proto` via `prost-build`; `protoc` is supplied by `protoc-bin-vendored`, so no system protoc is needed. Rerun `cargo build` after editing any `.proto`.
+- **No automated test suite** — there is no `tests/` directory and no `#[cfg(test)]` modules. `cargo test` is effectively a no-op, so do not rely on it for verification. Verify changes with `cargo check`, `cargo clippy`, and manual `cargo run`.
+
 ## Architecture Overview
 
 DFC-GUI is a native desktop application for device fleet control, built with **GPUI** (Rust GUI framework) and follows a **unidirectional data flow** architecture.
@@ -81,7 +86,7 @@ UI Action → State Mutation → Service Call → ServiceEvent (crossbeam) → S
 
 ### Constants (src/constants.rs)
 
-- Window: 1200x750 default, 800x500 minimum
+- Window: 1200x750 default, 1120x500 minimum
 - Sidebar: 80px width
 - Bounded caches: 200 events/alarms, 1000 telemetry, 5000 logs
 - Command timeout: 30 seconds
@@ -135,3 +140,7 @@ tail -f ~/Library/Logs/com.goldwind.dfc-gui/dfc-gui.log.$(date +%Y-%m-%d)
 - Use `tracing::debug!` for temporary debugging (not committed as `info!`)
 - Use `tracing::info!` only for significant events (startup, connections, errors)
 - Include context in log messages: `tracing::debug!("Processing key: {}", key)`
+
+### Release
+
+Pushing any git tag triggers `.github/workflows/release.yml`, which builds and publishes binaries to a GitHub Release. Only two targets are built: **macOS arm64** (`aarch64-apple-darwin`) and **Windows i686** (`i686-pc-windows-msvc`). No Linux release artifact is produced, and there is no CI lint/test job — the workflow only runs on tag push.
