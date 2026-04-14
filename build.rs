@@ -1,5 +1,3 @@
-use std::path::Path;
-
 fn main() {
     // Generate protobuf types for iothub payload decoding.
     // Note: proto files are intentionally minimal (see `proto/`).
@@ -23,7 +21,7 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
-        if Path::new("assets/icon.ico").exists() {
+        if std::path::Path::new("assets/icon.ico").exists() {
             let mut res = winres::WindowsResource::new();
             res.set_icon("assets/icon.ico");
             res.compile().expect("Failed to compile Windows resources");

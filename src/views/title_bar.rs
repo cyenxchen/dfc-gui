@@ -4,8 +4,9 @@
 
 use crate::states::{
     DfcGlobalStore, FontSize, FontSizeAction, LocaleAction, SettingsAction, ThemeAction,
-    i18n_sidebar,
+    i18n_sidebar, i18n_update,
 };
+use crate::{helpers::MenuAction, helpers::supports_auto_update};
 use gpui::{App, Context, Corner, Window, prelude::*};
 use gpui_component::{
     Icon, IconName, Sizable, ThemeMode, TitleBar,
@@ -29,7 +30,7 @@ impl DfcTitleBar {
         let store = cx.global::<DfcGlobalStore>().read(cx);
         let (font_size, locale, theme) = (store.font_size(), store.locale(), store.theme());
 
-        menu
+        let mut menu = menu
             // Font size section
             .label(i18n_sidebar(cx, "font_size"))
             .menu_with_check(
@@ -69,14 +70,21 @@ impl DfcTitleBar {
                 i18n_sidebar(cx, "system"),
                 theme.is_none(),
                 Box::new(ThemeAction::System),
-            )
-            .separator()
-            // Other settings
-            .menu_element_with_icon(
-                Icon::new(IconName::Settings2),
-                Box::new(SettingsAction::Open),
-                move |_window, cx| Label::new(i18n_sidebar(cx, "settings")),
-            )
+            );
+
+        if supports_auto_update() {
+            menu = menu.separator().menu_element_with_icon(
+                Icon::new(IconName::Globe),
+                Box::new(MenuAction::CheckForUpdates),
+                move |_window, cx| Label::new(i18n_update(cx, "check_for_updates")),
+            );
+        }
+
+        menu.separator().menu_element_with_icon(
+            Icon::new(IconName::Settings2),
+            Box::new(SettingsAction::Open),
+            move |_window, cx| Label::new(i18n_sidebar(cx, "settings")),
+        )
     }
 }
 

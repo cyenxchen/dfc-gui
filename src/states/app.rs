@@ -5,7 +5,7 @@
 use crate::connection::{
     DfcServerConfig, EncryptedPresetCredential, PresetCredential, get_servers, save_servers,
 };
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::helpers::get_or_create_config_dir;
 use crate::helpers::{decrypt, encrypt};
 use crate::services::ServiceHub;
@@ -127,6 +127,12 @@ pub struct DfcAppState {
     /// Preset credentials (encrypted)
     #[serde(default)]
     preset_credentials: Vec<EncryptedPresetCredential>,
+    /// Version tag skipped by the user
+    #[serde(default)]
+    skipped_version: Option<String>,
+    /// Last successful update check timestamp in RFC3339
+    #[serde(default)]
+    last_update_check: Option<String>,
     /// Server configurations (loaded separately, not serialized here)
     #[serde(skip)]
     servers: Vec<DfcServerConfig>,
@@ -203,6 +209,14 @@ impl DfcAppState {
         self.selected_device.as_deref()
     }
 
+    pub fn skipped_version(&self) -> Option<&str> {
+        self.skipped_version.as_deref()
+    }
+
+    pub fn last_update_check(&self) -> Option<&str> {
+        self.last_update_check.as_deref()
+    }
+
     /// Get preset credentials (decrypted)
     pub fn preset_credentials(&self) -> Vec<PresetCredential> {
         self.preset_credentials
@@ -252,6 +266,14 @@ impl DfcAppState {
 
     pub fn set_selected_device(&mut self, device_id: Option<String>) {
         self.selected_device = device_id;
+    }
+
+    pub fn set_skipped_version(&mut self, version: Option<String>) {
+        self.skipped_version = version;
+    }
+
+    pub fn set_last_update_check(&mut self, ts: String) {
+        self.last_update_check = Some(ts);
     }
 
     /// Set preset credentials (will be encrypted)

@@ -353,7 +353,6 @@ impl DfcSidebar {
             .children(items)
             .into_any_element()
     }
-
 }
 
 impl Render for DfcSidebar {
