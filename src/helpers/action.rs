@@ -57,6 +57,10 @@ pub enum CommandAction {
 pub enum ServerAction {
     /// Edit the selected server
     Edit,
+    /// Copy the selected server configuration
+    Copy,
+    /// Delete the selected server
+    Delete,
     /// Reconnect the selected server
     Reconnect,
 }

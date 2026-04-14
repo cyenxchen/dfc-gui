@@ -8,7 +8,7 @@ use crate::constants::DEFAULT_PULSAR_TOKEN;
 use crate::helpers::DeviceAction;
 use crate::states::{
     ConfigState, DfcAppState, DfcGlobalStore, FleetState, KeysState, Route, UIEvent, i18n_common,
-    i18n_servers, i18n_settings, i18n_sidebar, update_app_state_and_save,
+    i18n_format, i18n_servers, i18n_settings, i18n_sidebar, update_app_state_and_save,
 };
 use crate::views::{ConfigView, KeysBrowserView};
 use gpui::{
@@ -21,10 +21,10 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     label::Label,
+    menu::{ContextMenuExt, PopupMenuItem},
     scroll::ScrollableElement,
     v_flex,
 };
-use rust_i18n::t;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -333,6 +333,17 @@ impl DfcContent {
         });
     }
 
+    /// Fill input fields for copying an existing server as a new item
+    pub fn fill_inputs_for_copy(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        server: &DfcServerConfig,
+    ) {
+        self.fill_inputs(window, cx, server);
+        self.editing_server_id.clear();
+    }
+
     /// Clear all input fields
     fn clear_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_server_id = String::new();
@@ -360,7 +371,7 @@ impl DfcContent {
     }
 
     /// Remove server with confirmation dialog
-    fn remove_server(&mut self, window: &mut Window, cx: &mut Context<Self>, server_id: &str) {
+    pub fn remove_server(&mut self, window: &mut Window, cx: &mut Context<Self>, server_id: &str) {
         let server_name = self
             .app_state
             .read(cx)
@@ -368,17 +379,11 @@ impl DfcContent {
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "--".to_string());
 
-        let locale = cx.global::<DfcGlobalStore>().read(cx).locale().to_string();
         let app_state = self.app_state.clone();
         let server_id = server_id.to_string();
 
         window.open_dialog(cx, move |dialog, _, cx| {
-            let message = t!(
-                "servers.remove_prompt",
-                server = &server_name,
-                locale = &locale
-            )
-            .to_string();
+            let message = i18n_format(cx, "servers.remove_prompt", &[("server", &server_name)]);
             let app_state = app_state.clone();
             let server_id = server_id.clone();
 
@@ -420,16 +425,16 @@ impl DfcContent {
         let app_state_clone = app_state.clone();
         let server_id_clone = server_id.clone();
 
-        let handle_submit = Rc::new(move |_window: &mut Window, cx: &mut App| {
-            let name = name_state_clone.read(cx).value();
-            let host = host_state_clone.read(cx).value();
+        let handle_submit = Rc::new(move |window: &mut Window, cx: &mut App| {
+            let name = name_state_clone.read(cx).value().to_string();
+            let host = host_state_clone.read(cx).value().to_string();
             let port = port_state_clone
                 .read(cx)
                 .value()
                 .parse::<u16>()
                 .unwrap_or(DEFAULT_REDIS_PORT);
 
-            if name.is_empty() || host.is_empty() {
+            if name.trim().is_empty() || host.trim().is_empty() {
                 return false;
             }
 
@@ -461,21 +466,54 @@ impl DfcContent {
                 Some(pulsar_token_val.to_string())
             };
 
+            let candidate = DfcServerConfig {
+                id: server_id_clone.clone(),
+                name: name.to_string(),
+                host: host.to_string(),
+                port,
+                password,
+                cfgid,
+                device_filter,
+                pulsar_token,
+                updated_at: None,
+            };
+
+            if server_id_clone.is_empty() {
+                let duplicate_server = app_state_clone
+                    .read(cx)
+                    .servers()
+                    .iter()
+                    .find(|existing| existing.same_config_for_uniqueness(&candidate))
+                    .cloned();
+
+                if let Some(duplicate_server) = duplicate_server {
+                    let duplicate_name = if duplicate_server.name.trim().is_empty() {
+                        duplicate_server.display_name()
+                    } else {
+                        duplicate_server.name.clone()
+                    };
+                    let duplicate_message = i18n_format(
+                        cx,
+                        "servers.duplicate_prompt",
+                        &[("server", &duplicate_name)],
+                    );
+
+                    window.open_dialog(cx, move |dialog, _, cx| {
+                        let duplicate_message = duplicate_message.clone();
+
+                        dialog
+                            .confirm()
+                            .title(i18n_servers(cx, "duplicate_title"))
+                            .child(duplicate_message)
+                            .on_ok(move |_, _, _| true)
+                    });
+
+                    return false;
+                }
+            }
+
             app_state_clone.update(cx, |state, cx| {
-                state.upsert_server(
-                    DfcServerConfig {
-                        id: server_id_clone.clone(),
-                        name: name.to_string(),
-                        host: host.to_string(),
-                        port,
-                        password,
-                        cfgid,
-                        device_filter,
-                        pulsar_token,
-                        updated_at: None, // Will be set by upsert_server
-                    },
-                    cx,
-                );
+                state.upsert_server(candidate.clone(), cx);
             });
 
             true
@@ -678,10 +716,14 @@ impl DfcContent {
         server: &DfcServerConfig,
         bg: gpui::Hsla,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> gpui::AnyElement {
         let server_id = server.id.clone();
         let update_server = server.clone();
         let remove_server_id = server.id.clone();
+        let menu_server_id_for_edit = server.id.clone();
+        let menu_server_id_for_copy = server.id.clone();
+        let menu_server_id_for_delete = server.id.clone();
+        let store = cx.global::<DfcGlobalStore>().clone();
 
         let updated_at = server
             .updated_at
@@ -690,6 +732,9 @@ impl DfcContent {
             .unwrap_or_default();
 
         let title = format!("{} ({}:{})", server.name, server.host, server.port);
+        let edit_label = i18n_common(cx, "edit");
+        let copy_label = i18n_common(cx, "copy");
+        let delete_label = i18n_common(cx, "delete");
 
         let edit_btn = Button::new(("server-edit", index))
             .ghost()
@@ -721,6 +766,48 @@ impl DfcContent {
             .bg(bg)
             .cursor_pointer()
             .hover(|this| this.border_color(cx.theme().primary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                tracing::info!("Server card clicked: {}", server_id);
+                this.reconnect_server(&server_id, cx);
+            }))
+            .context_menu(move |menu, _, _| {
+                let store_for_edit = store.clone();
+                let store_for_copy = store.clone();
+                let store_for_delete = store.clone();
+                let sid_edit = menu_server_id_for_edit.clone();
+                let sid_copy = menu_server_id_for_copy.clone();
+                let sid_delete = menu_server_id_for_delete.clone();
+
+                menu.item(
+                    PopupMenuItem::new(edit_label.clone())
+                        .icon(Icon::from(CustomIconName::FilePenLine))
+                        .on_click(move |_, window, cx| {
+                            store_for_edit.set_pending_server(sid_edit.clone());
+                            window
+                                .dispatch_action(Box::new(crate::helpers::ServerAction::Edit), cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(copy_label.clone())
+                        .icon(Icon::from(CustomIconName::FilePlusCorner))
+                        .on_click(move |_, window, cx| {
+                            store_for_copy.set_pending_server(sid_copy.clone());
+                            window
+                                .dispatch_action(Box::new(crate::helpers::ServerAction::Copy), cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(delete_label.clone())
+                        .icon(Icon::from(CustomIconName::FileXCorner))
+                        .on_click(move |_, window, cx| {
+                            store_for_delete.set_pending_server(sid_delete.clone());
+                            window.dispatch_action(
+                                Box::new(crate::helpers::ServerAction::Delete),
+                                cx,
+                            );
+                        }),
+                )
+            })
             .child(
                 v_flex()
                     .gap_2()
@@ -748,10 +835,7 @@ impl DfcContent {
                         )
                     }),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                tracing::info!("Server card clicked: {}", server_id);
-                this.reconnect_server(&server_id, cx);
-            }))
+            .into_any_element()
     }
 
     /// Render the home view with server cards, config view, or keys browser
