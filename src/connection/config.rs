@@ -11,6 +11,10 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use tracing::info;
 
+fn normalize_optional(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
 /// DFC Server configuration
 #[derive(Debug, Default, Deserialize, Clone, Serialize, Hash, Eq, PartialEq)]
 pub struct DfcServerConfig {
@@ -65,6 +69,18 @@ impl DfcServerConfig {
         } else {
             format!("{} ({}:{})", self.name, self.host, self.port)
         }
+    }
+
+    /// Compare server configurations by uniqueness fields only.
+    pub fn same_config_for_uniqueness(&self, other: &Self) -> bool {
+        self.host.trim() == other.host.trim()
+            && self.port == other.port
+            && normalize_optional(self.cfgid.as_deref())
+                == normalize_optional(other.cfgid.as_deref())
+            && normalize_optional(self.device_filter.as_deref())
+                == normalize_optional(other.device_filter.as_deref())
+            && normalize_optional(self.pulsar_token.as_deref())
+                == normalize_optional(other.pulsar_token.as_deref())
     }
 }
 
@@ -140,4 +156,45 @@ pub fn get_server_by_id(id: &str) -> Result<DfcServerConfig> {
         .ok_or_else(|| Error::Invalid {
             message: format!("Server not found: {id}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DfcServerConfig;
+
+    fn sample_server() -> DfcServerConfig {
+        DfcServerConfig {
+            id: "server-a".to_string(),
+            name: "121开发".to_string(),
+            host: "10.15.200.121".to_string(),
+            port: 15000,
+            password: Some("secret-a".to_string()),
+            cfgid: Some("{DCC0007}".to_string()),
+            device_filter: None,
+            pulsar_token: Some("token-a".to_string()),
+            updated_at: Some("2026-04-14T12:00:00+08:00".to_string()),
+        }
+    }
+
+    #[test]
+    fn same_config_for_uniqueness_ignores_name_password_and_metadata() {
+        let left = sample_server();
+        let mut right = sample_server();
+        right.id = "server-b".to_string();
+        right.password = Some("secret-b".to_string());
+        right.updated_at = Some("2026-04-15T12:00:00+08:00".to_string());
+        right.name = "121开发-副本".to_string();
+        right.cfgid = Some(" {DCC0007} ".to_string());
+
+        assert!(left.same_config_for_uniqueness(&right));
+    }
+
+    #[test]
+    fn same_config_for_uniqueness_detects_non_password_changes() {
+        let left = sample_server();
+        let mut right = sample_server();
+        right.pulsar_token = Some("token-b".to_string());
+
+        assert!(!left.same_config_for_uniqueness(&right));
+    }
 }

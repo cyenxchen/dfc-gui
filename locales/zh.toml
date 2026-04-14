@@ -12,6 +12,7 @@ timeout = "超时"
 refresh = "刷新"
 delete = "删除"
 edit = "编辑"
+copy = "复制"
 add = "添加"
 close = "关闭"
 submit = "提交"
@@ -155,15 +156,17 @@ pulsar_token_placeholder = "Pulsar 认证令牌"
 add_title = "添加服务器"
 edit_title = "编辑服务器"
 remove_title = "删除服务器"
+duplicate_title = "配置已存在"
 
 # 按钮和提示
 add_tooltip = "添加新服务器"
 edit_tooltip = "编辑服务器"
 delete_tooltip = "删除服务器"
-save_config = "收藏配置"
+save_config = "添加配置"
 
 # 消息
 remove_prompt = "确定要删除服务器 \"{server}\" 吗？"
+duplicate_prompt = "已存在相同配置：\"{server}\"。请调整后再添加。"
 
 [config]
 loading = "正在加载配置..."

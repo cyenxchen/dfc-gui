@@ -12,6 +12,7 @@ timeout = "Timeout"
 refresh = "Refresh"
 delete = "Delete"
 edit = "Edit"
+copy = "Copy"
 add = "Add"
 close = "Close"
 submit = "Submit"
@@ -155,15 +156,17 @@ pulsar_token_placeholder = "Pulsar authentication token"
 add_title = "Add Server"
 edit_title = "Edit Server"
 remove_title = "Remove Server"
+duplicate_title = "Configuration Already Exists"
 
 # Buttons and tooltips
 add_tooltip = "Add new server"
 edit_tooltip = "Edit server"
 delete_tooltip = "Delete server"
-save_config = "Save Configuration"
+save_config = "Add Configuration"
 
 # Messages
 remove_prompt = "Are you sure you want to remove server \"{server}\"?"
+duplicate_prompt = "An identical configuration already exists: \"{server}\". Please adjust it before adding."
 
 [config]
 loading = "Loading configuration..."

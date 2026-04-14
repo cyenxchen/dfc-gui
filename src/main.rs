@@ -241,6 +241,20 @@ impl Render for DfcApp {
                             });
                         }
                     }
+                    ServerAction::Copy => {
+                        let server = store.read(cx).server(&server_id).cloned();
+                        if let Some(server) = server {
+                            this.content.update(cx, |content, cx| {
+                                content.fill_inputs_for_copy(window, cx, &server);
+                                content.open_server_dialog(window, cx);
+                            });
+                        }
+                    }
+                    ServerAction::Delete => {
+                        this.content.update(cx, |content, cx| {
+                            content.remove_server(window, cx, &server_id);
+                        });
+                    }
                     ServerAction::Reconnect => {
                         this.content.update(cx, |content, cx| {
                             content.reconnect_server(&server_id, cx);
