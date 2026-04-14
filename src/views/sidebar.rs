@@ -354,45 +354,6 @@ impl DfcSidebar {
             .into_any_element()
     }
 
-    /// Render the settings button at the bottom
-    fn render_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_active = self.current_route == Route::Settings;
-        let label = i18n_sidebar(cx, "settings");
-        let tooltip_label = label.clone();
-        let border_color = cx.theme().border;
-        let list_active = cx.theme().list_active;
-        let list_active_border = cx.theme().list_active_border;
-
-        let btn = Button::new("settings-nav")
-            .ghost()
-            .w_full()
-            .h(px(48.0))
-            .child(
-                v_flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(IconName::Settings)),
-            )
-            .on_click(move |_, _, cx| {
-                cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
-                    store.update(cx, |state, cx| {
-                        state.go_to(Route::Settings, cx);
-                    });
-                });
-            });
-
-        div()
-            .id("nav-settings")
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
-            .border_t_1()
-            .border_color(border_color)
-            .when(is_active, |this| {
-                this.bg(list_active)
-                    .border_r_2()
-                    .border_color(list_active_border)
-            })
-            .child(btn)
-    }
 }
 
 impl Render for DfcSidebar {
@@ -424,7 +385,5 @@ impl Render for DfcSidebar {
                     // Connected servers
                     .child(self.render_connected_servers(cx)),
             )
-            // Settings button at bottom
-            .child(self.render_settings_button(cx))
     }
 }
