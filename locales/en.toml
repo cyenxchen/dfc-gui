@@ -162,6 +162,8 @@ duplicate_title = "Configuration Already Exists"
 add_tooltip = "Add new server"
 edit_tooltip = "Edit server"
 delete_tooltip = "Delete server"
+switch_to_grid_tooltip = "Switch to grid view"
+switch_to_list_tooltip = "Switch to list view"
 save_config = "Add Configuration"
 
 # Messages

@@ -58,6 +58,15 @@ impl FontSize {
     }
 }
 
+/// Home page server layout mode
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeLayoutMode {
+    #[default]
+    Grid,
+    List,
+}
+
 // ==================== Actions ====================
 
 /// Theme selection action
@@ -111,6 +120,8 @@ pub struct DfcAppState {
     bounds: Option<Bounds<Pixels>>,
     theme: Option<String>,
     font_size: Option<FontSize>,
+    #[serde(default)]
+    home_layout_mode: HomeLayoutMode,
     /// Selected device ID
     selected_device: Option<String>,
     /// Preset credentials (encrypted)
@@ -172,6 +183,10 @@ impl DfcAppState {
         self.font_size.unwrap_or(FontSize::Medium)
     }
 
+    pub fn home_layout_mode(&self) -> HomeLayoutMode {
+        self.home_layout_mode
+    }
+
     pub fn theme(&self) -> Option<ThemeMode> {
         match self.theme.as_deref() {
             Some(LIGHT_THEME_MODE) => Some(ThemeMode::Light),
@@ -229,6 +244,10 @@ impl DfcAppState {
 
     pub fn set_font_size(&mut self, font_size: Option<FontSize>) {
         self.font_size = font_size;
+    }
+
+    pub fn set_home_layout_mode(&mut self, home_layout_mode: HomeLayoutMode) {
+        self.home_layout_mode = home_layout_mode;
     }
 
     pub fn set_selected_device(&mut self, device_id: Option<String>) {

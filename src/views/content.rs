@@ -7,15 +7,16 @@ use crate::connection::{DfcServerConfig, credentials_to_text, text_to_credential
 use crate::constants::DEFAULT_PULSAR_TOKEN;
 use crate::helpers::DeviceAction;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, FleetState, KeysState, Route, UIEvent, i18n_common,
-    i18n_format, i18n_servers, i18n_settings, i18n_sidebar, update_app_state_and_save,
+    ConfigState, DfcAppState, DfcGlobalStore, FleetState, HomeLayoutMode, KeysState, Route,
+    UIEvent, i18n_common, i18n_format, i18n_servers, i18n_settings, i18n_sidebar,
+    update_app_state_and_save,
 };
 use crate::views::{ConfigView, KeysBrowserView};
 use gpui::{
     App, Context, Entity, FocusHandle, SharedString, Subscription, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme, Colorize, Icon, IconName, Sizable, WindowExt,
+    ActiveTheme, Colorize, Icon, IconName, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     form::{field, v_form},
     h_flex,
@@ -46,6 +47,8 @@ const THEME_DARKEN_AMOUNT_LIGHT: f32 = 0.02;
 pub struct DfcContent {
     /// Current route
     current_route: Route,
+    /// Current home layout mode
+    current_home_layout_mode: HomeLayoutMode,
     /// Fleet state entity
     fleet_state: Entity<FleetState>,
     /// App state entity
@@ -89,6 +92,7 @@ impl DfcContent {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = cx.global::<DfcGlobalStore>();
         let current_route = store.read(cx).route();
+        let current_home_layout_mode = store.read(cx).home_layout_mode();
         let fleet_state = store.fleet_state();
         let app_state = store.app_state();
         let config_state = store.config_state();
@@ -114,11 +118,14 @@ impl DfcContent {
 
         let mut subscriptions = Vec::new();
 
-        // Subscribe to route changes
+        // Subscribe to route and home layout changes
         subscriptions.push(cx.observe(&app_state, |this, model, cx| {
-            let route = model.read(cx).route();
-            if this.current_route != route {
+            let state = model.read(cx);
+            let route = state.route();
+            let home_layout_mode = state.home_layout_mode();
+            if this.current_route != route || this.current_home_layout_mode != home_layout_mode {
                 this.current_route = route;
+                this.current_home_layout_mode = home_layout_mode;
                 cx.notify();
             }
         }));
@@ -251,6 +258,7 @@ impl DfcContent {
 
         Self {
             current_route,
+            current_home_layout_mode,
             fleet_state,
             app_state,
             config_state,
@@ -293,6 +301,14 @@ impl DfcContent {
             .as_ref()
             .is_some_and(|c| c.to_lowercase().contains(&keyword));
         name_matches || host_matches || cfgid_matches
+    }
+
+    fn server_updated_at(&self, server: &DfcServerConfig) -> String {
+        server
+            .updated_at
+            .as_ref()
+            .map(|s| s.chars().take(10).collect::<String>())
+            .unwrap_or_default()
     }
 
     /// Fill input fields with server data for editing
@@ -709,6 +725,55 @@ impl DfcContent {
             )
     }
 
+    fn render_layout_switcher(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let home_layout_mode = self.app_state.read(cx).home_layout_mode();
+        let is_grid_active = home_layout_mode == HomeLayoutMode::Grid;
+        let is_list_active = home_layout_mode == HomeLayoutMode::List;
+
+        let grid_btn = Button::new("home-layout-grid")
+            .ghost()
+            .small()
+            .outline()
+            .selected(is_grid_active)
+            .icon(IconName::LayoutDashboard)
+            .tooltip(i18n_servers(cx, "switch_to_grid_tooltip"))
+            .on_click(move |_, _, cx| {
+                if is_grid_active {
+                    return;
+                }
+                update_app_state_and_save(cx, "set_home_layout_grid", move |state, _| {
+                    state.set_home_layout_mode(HomeLayoutMode::Grid);
+                });
+            });
+
+        let list_btn = Button::new("home-layout-list")
+            .ghost()
+            .small()
+            .outline()
+            .selected(is_list_active)
+            .icon(IconName::Menu)
+            .tooltip(i18n_servers(cx, "switch_to_list_tooltip"))
+            .on_click(move |_, _, cx| {
+                if is_list_active {
+                    return;
+                }
+                update_app_state_and_save(cx, "set_home_layout_list", move |state, _| {
+                    state.set_home_layout_mode(HomeLayoutMode::List);
+                });
+            });
+
+        h_flex()
+            .w_full()
+            .justify_end()
+            .px_4()
+            .pt_4()
+            .pb_2()
+            .gap_2()
+            .child(grid_btn)
+            .child(list_btn)
+            .into_any_element()
+    }
+
     /// Render a single server card
     fn render_server_card(
         &self,
@@ -724,14 +789,11 @@ impl DfcContent {
         let menu_server_id_for_copy = server.id.clone();
         let menu_server_id_for_delete = server.id.clone();
         let store = cx.global::<DfcGlobalStore>().clone();
+        let copy_button_store = store.clone();
+        let copy_button_server_id = server.id.clone();
 
-        let updated_at = server
-            .updated_at
-            .as_ref()
-            .map(|s| s.chars().take(10).collect::<String>())
-            .unwrap_or_default();
-
-        let title = format!("{} ({}:{})", server.name, server.host, server.port);
+        let updated_at = self.server_updated_at(server);
+        let title = server.display_name();
         let edit_label = i18n_common(cx, "edit");
         let copy_label = i18n_common(cx, "copy");
         let delete_label = i18n_common(cx, "delete");
@@ -745,6 +807,17 @@ impl DfcContent {
                 cx.stop_propagation();
                 this.fill_inputs(window, cx, &update_server);
                 this.open_server_dialog(window, cx);
+            }));
+
+        let copy_btn = Button::new(("server-copy", index))
+            .ghost()
+            .xsmall()
+            .tooltip(i18n_common(cx, "copy"))
+            .icon(IconName::Copy)
+            .on_click(cx.listener(move |_, _, window, cx| {
+                cx.stop_propagation();
+                copy_button_store.set_pending_server(copy_button_server_id.clone());
+                window.dispatch_action(Box::new(crate::helpers::ServerAction::Copy), cx);
             }));
 
         let delete_btn = Button::new(("server-delete", index))
@@ -825,7 +898,13 @@ impl DfcContent {
                                             .max_w(px(200.0)),
                                     ),
                             )
-                            .child(h_flex().gap_1().child(edit_btn).child(delete_btn)),
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(edit_btn)
+                                    .child(copy_btn)
+                                    .child(delete_btn),
+                            ),
                     )
                     .when(!updated_at.is_empty(), |this| {
                         this.child(
@@ -835,6 +914,201 @@ impl DfcContent {
                         )
                     }),
             )
+            .into_any_element()
+    }
+
+    fn render_server_list_row(
+        &self,
+        index: usize,
+        server: &DfcServerConfig,
+        bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let server_id = server.id.clone();
+        let update_server = server.clone();
+        let remove_server_id = server.id.clone();
+        let menu_server_id_for_edit = server.id.clone();
+        let menu_server_id_for_copy = server.id.clone();
+        let menu_server_id_for_delete = server.id.clone();
+        let store = cx.global::<DfcGlobalStore>().clone();
+        let copy_button_store = store.clone();
+        let copy_button_server_id = server.id.clone();
+
+        let title = server.display_name();
+        let updated_at = self.server_updated_at(server);
+        let edit_label = i18n_common(cx, "edit");
+        let copy_label = i18n_common(cx, "copy");
+        let delete_label = i18n_common(cx, "delete");
+
+        let edit_btn = Button::new(("server-list-edit", index))
+            .ghost()
+            .xsmall()
+            .tooltip(i18n_servers(cx, "edit_tooltip"))
+            .icon(Icon::from(CustomIconName::FilePenLine))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.fill_inputs(window, cx, &update_server);
+                this.open_server_dialog(window, cx);
+            }));
+
+        let copy_btn = Button::new(("server-list-copy", index))
+            .ghost()
+            .xsmall()
+            .tooltip(i18n_common(cx, "copy"))
+            .icon(IconName::Copy)
+            .on_click(cx.listener(move |_, _, window, cx| {
+                cx.stop_propagation();
+                copy_button_store.set_pending_server(copy_button_server_id.clone());
+                window.dispatch_action(Box::new(crate::helpers::ServerAction::Copy), cx);
+            }));
+
+        let delete_btn = Button::new(("server-list-delete", index))
+            .ghost()
+            .xsmall()
+            .tooltip(i18n_servers(cx, "delete_tooltip"))
+            .icon(Icon::from(CustomIconName::FileXCorner))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.remove_server(window, cx, &remove_server_id);
+            }));
+
+        div()
+            .id(("server-list-row", index))
+            .px_6()
+            .py_5()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(bg)
+            .cursor_pointer()
+            .hover(|this| this.border_color(cx.theme().primary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                tracing::info!("Server list row clicked: {}", server_id);
+                this.reconnect_server(&server_id, cx);
+            }))
+            .context_menu(move |menu, _, _| {
+                let store_for_edit = store.clone();
+                let store_for_copy = store.clone();
+                let store_for_delete = store.clone();
+                let sid_edit = menu_server_id_for_edit.clone();
+                let sid_copy = menu_server_id_for_copy.clone();
+                let sid_delete = menu_server_id_for_delete.clone();
+
+                menu.item(
+                    PopupMenuItem::new(edit_label.clone())
+                        .icon(Icon::from(CustomIconName::FilePenLine))
+                        .on_click(move |_, window, cx| {
+                            store_for_edit.set_pending_server(sid_edit.clone());
+                            window
+                                .dispatch_action(Box::new(crate::helpers::ServerAction::Edit), cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(copy_label.clone())
+                        .icon(Icon::from(CustomIconName::FilePlusCorner))
+                        .on_click(move |_, window, cx| {
+                            store_for_copy.set_pending_server(sid_copy.clone());
+                            window
+                                .dispatch_action(Box::new(crate::helpers::ServerAction::Copy), cx);
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(delete_label.clone())
+                        .icon(Icon::from(CustomIconName::FileXCorner))
+                        .on_click(move |_, window, cx| {
+                            store_for_delete.set_pending_server(sid_delete.clone());
+                            window.dispatch_action(
+                                Box::new(crate::helpers::ServerAction::Delete),
+                                cx,
+                            );
+                        }),
+                )
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap_2()
+                            .items_center()
+                            .child(Icon::new(CustomIconName::DatabaseZap).size_4())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .child(Label::new(title).text_sm().text_ellipsis()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_6()
+                            .child(
+                                Label::new(updated_at)
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(edit_btn)
+                                    .child(copy_btn)
+                                    .child(delete_btn),
+                            ),
+                    )
+            )
+            .into_any_element()
+    }
+
+    fn render_server_grid(
+        &self,
+        window: &mut Window,
+        servers: &[DfcServerConfig],
+        bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let width = window.viewport_size().width;
+
+        let cols = match width {
+            width if width < px(VIEWPORT_BREAKPOINT_SMALL) => 1,
+            width if width < px(VIEWPORT_BREAKPOINT_MEDIUM) => 2,
+            _ => 3,
+        };
+
+        let mut children = Vec::new();
+        for (index, server) in servers.iter().enumerate() {
+            children.push(self.render_server_card(index, server, bg, cx));
+        }
+
+        div()
+            .grid()
+            .grid_cols(cols)
+            .gap_2()
+            .p_2()
+            .w_full()
+            .children(children)
+            .into_any_element()
+    }
+
+    fn render_server_list(
+        &self,
+        servers: &[DfcServerConfig],
+        bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut rows = Vec::new();
+        for (index, server) in servers.iter().enumerate() {
+            rows.push(self.render_server_list_row(index, server, bg, cx));
+        }
+
+        v_flex()
+            .p_2()
+            .gap_2()
+            .children(rows)
             .into_any_element()
     }
 
@@ -851,17 +1125,7 @@ impl DfcContent {
             return self.config_view.clone().into_any_element();
         }
 
-        // Otherwise, show server cards grid
-        let width = window.viewport_size().width;
-
-        // Responsive grid columns
-        let cols = match width {
-            width if width < px(VIEWPORT_BREAKPOINT_SMALL) => 1,
-            width if width < px(VIEWPORT_BREAKPOINT_MEDIUM) => 2,
-            _ => 3,
-        };
-
-        // Card background color
+        // Otherwise, show server list in the selected layout
         let bg = if cx.theme().is_dark() {
             cx.theme().background.lighten(THEME_LIGHTEN_AMOUNT_DARK)
         } else {
@@ -877,28 +1141,20 @@ impl DfcContent {
             .filter(|s| self.server_matches_filter(s))
             .cloned()
             .collect();
-
-        let mut children = Vec::new();
-        for (index, server) in servers.iter().enumerate() {
-            children.push(self.render_server_card(index, server, bg, cx));
-        }
-
-        let grid = div()
-            .grid()
-            .grid_cols(cols)
-            .gap_2()
-            .p_2()
-            .w_full()
-            .children(children);
+        let content = match self.app_state.read(cx).home_layout_mode() {
+            HomeLayoutMode::Grid => self.render_server_grid(window, &servers, bg, cx),
+            HomeLayoutMode::List => self.render_server_list(&servers, bg, cx),
+        };
 
         v_flex()
             .size_full()
+            .child(self.render_layout_switcher(cx))
             .child(
                 div()
                     .id("servers-grid-scroll")
                     .flex_1()
                     .overflow_y_scroll()
-                    .child(grid),
+                    .child(content),
             )
             .child(self.render_toolbar(cx))
             .into_any_element()
