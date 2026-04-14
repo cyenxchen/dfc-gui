@@ -3,7 +3,7 @@
 //! Holds parsed rows from iothub `prop_data` topics and UI pagination state.
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::helpers::cmp_u64ish;
@@ -139,6 +139,35 @@ pub struct PropRow {
     pub summary: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PropRowKey {
+    global_uuid: String,
+    device: String,
+    imr: String,
+    imid: i32,
+    value: String,
+    quality: i32,
+    bcrid: String,
+    time: String,
+    summary: String,
+}
+
+impl From<&PropRow> for PropRowKey {
+    fn from(row: &PropRow) -> Self {
+        Self {
+            global_uuid: row.global_uuid.clone(),
+            device: row.device.clone(),
+            imr: row.imr.clone(),
+            imid: row.imid,
+            value: row.value.clone(),
+            quality: row.quality,
+            bcrid: row.bcrid.clone(),
+            time: row.time.clone(),
+            summary: row.summary.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum PropTableLoadState {
     #[default]
@@ -152,6 +181,7 @@ pub enum PropTableLoadState {
 pub struct PropTableState {
     topic_path: Option<String>,
     rows: VecDeque<PropRow>,
+    row_keys: HashSet<PropRowKey>,
     load_state: PropTableLoadState,
     page_size: usize,
     page_index: usize,
@@ -167,6 +197,7 @@ impl PropTableState {
         Self {
             topic_path: None,
             rows: VecDeque::new(),
+            row_keys: HashSet::new(),
             load_state: PropTableLoadState::Idle,
             page_size: 20,
             page_index: 0,
@@ -283,6 +314,7 @@ impl PropTableState {
     pub fn reset_for_topic(&mut self, topic_path: Option<String>) {
         self.topic_path = topic_path;
         self.rows.clear();
+        self.row_keys.clear();
         self.page_index = 0;
         self.sort = None;
         self.filters = PropFilters::default();
@@ -309,14 +341,23 @@ impl PropTableState {
             return;
         }
 
-        // Keep per-message ordering stable: newest overall should appear first.
-        // We push in reverse so the first element in `batch` ends up before later ones.
-        while let Some(row) = batch.pop() {
+        batch.retain(|row| self.row_keys.insert(PropRowKey::from(&*row)));
+
+        if batch.is_empty() {
+            self.mark_ready();
+            return;
+        }
+
+        // Keep per-message ordering stable: the first element in `batch` remains
+        // before later ones after pushing to the front.
+        for row in batch.into_iter().rev() {
             self.rows.push_front(row);
         }
 
         while self.rows.len() > self.max_rows {
-            self.rows.pop_back();
+            if let Some(row) = self.rows.pop_back() {
+                self.row_keys.remove(&PropRowKey::from(&row));
+            }
         }
 
         self.rebuild_visible_indices();
@@ -412,6 +453,88 @@ impl PropTableState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prop_row(uid: u64, message_time: &str) -> PropRow {
+        PropRow {
+            uid,
+            global_uuid: "705537041061273601".to_string(),
+            device: "100852277".to_string(),
+            imr: "Turbine/WTUR/State/DataAvailable".to_string(),
+            imid: 1,
+            value: "false".to_string(),
+            quality: 0,
+            bcrid: String::new(),
+            time: "2026-04-03 11:04:40.000".to_string(),
+            message_time: message_time.to_string(),
+            summary: "per".to_string(),
+        }
+    }
+
+    #[test]
+    fn push_rows_front_deduplicates_periodic_repeated_samples() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        state.push_rows_front(vec![
+            prop_row(1, "2026-04-14 11:33:03.000"),
+            prop_row(2, "2026-04-14 11:33:06.000"),
+        ]);
+
+        assert_eq!(state.rows_len(), 1);
+        assert_eq!(
+            state.page_rows_owned()[0].message_time,
+            "2026-04-14 11:33:03.000"
+        );
+
+        let mut changed = prop_row(3, "2026-04-14 11:33:09.000");
+        changed.value = "true".to_string();
+        state.push_rows_front(vec![changed]);
+
+        assert_eq!(state.rows_len(), 2);
+        assert_eq!(state.page_rows_owned()[0].value, "true");
+    }
+
+    #[test]
+    fn reset_for_topic_clears_prop_row_dedup_keys() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic-a".to_string()));
+        state.push_rows_front(vec![prop_row(1, "2026-04-14 11:33:03.000")]);
+
+        state.reset_for_topic(Some("persistent://topic-b".to_string()));
+        state.push_rows_front(vec![prop_row(2, "2026-04-14 11:33:06.000")]);
+
+        assert_eq!(state.rows_len(), 1);
+        assert_eq!(
+            state.page_rows_owned()[0].message_time,
+            "2026-04-14 11:33:06.000"
+        );
+    }
+
+    #[test]
+    fn trimming_old_rows_releases_prop_row_dedup_keys() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+        state.max_rows = 1;
+
+        let first = prop_row(1, "2026-04-14 11:33:03.000");
+        let mut second = prop_row(2, "2026-04-14 11:33:06.000");
+        second.value = "true".to_string();
+
+        state.push_rows_front(vec![first.clone()]);
+        state.push_rows_front(vec![second]);
+        state.push_rows_front(vec![first]);
+
+        assert_eq!(state.rows_len(), 1);
+        assert_eq!(
+            state.page_rows_owned()[0].message_time,
+            "2026-04-14 11:33:03.000"
+        );
+    }
+}
+
 fn row_matches_lowered(row: &PropRow, needles: &[Option<String>; 10]) -> bool {
     if let Some(n) = &needles[0] {
         if !matches_lowered(&row.global_uuid, n) {
@@ -486,4 +609,3 @@ fn compare_prop_rows(a: &PropRow, b: &PropRow, column: PropSortColumn) -> Orderi
         PropSortColumn::Summary => a.summary.cmp(&b.summary),
     }
 }
-

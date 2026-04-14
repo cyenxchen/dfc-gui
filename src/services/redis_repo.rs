@@ -14,7 +14,6 @@ use fred::clients::Client as FredClient;
 use fred::prelude::*;
 use fred::types::CustomCommand;
 use fred::types::config::Config as FredConfig;
-use serde::Deserialize;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -605,22 +604,6 @@ impl RedisRepo {
         &self,
         cfgid: &str,
     ) -> Result<std::collections::HashMap<(String, u32), String>> {
-        #[derive(Debug, Deserialize)]
-        struct InfoProp {
-            #[serde(default)]
-            uuid: String,
-            #[serde(default)]
-            imid: u32,
-        }
-
-        #[derive(Debug, Deserialize)]
-        struct Info {
-            #[serde(default)]
-            uuid: String,
-            #[serde(default)]
-            props: Vec<InfoProp>,
-        }
-
         let wrapped = Self::wrap_cfgid(cfgid);
         let key = format!("CMC_{}_sg.infomodel.property", wrapped);
 
@@ -629,27 +612,77 @@ impl RedisRepo {
                 return Ok(std::collections::HashMap::new());
             };
 
-            let infos: Vec<Info> = serde_json::from_value(json).unwrap_or_default();
-            let mut map: std::collections::HashMap<(String, u32), String> =
-                std::collections::HashMap::new();
-
-            for info in infos {
-                let uuid_base = match info.uuid.split('_').next() {
-                    Some(v) if !v.is_empty() => v.to_string(),
-                    _ => info.uuid.clone(),
-                };
-
-                for prop in info.props {
-                    if prop.imid == 0 || prop.uuid.is_empty() || uuid_base.is_empty() {
-                        continue;
-                    }
-                    map.insert((uuid_base.clone(), prop.imid), prop.uuid);
-                }
-            }
-
+            let map = Self::parse_imid2imr_json(&json);
+            tracing::debug!(key = %key, count = map.len(), "Loaded IMID->IMR mapping");
             Ok(map)
         })
         .await
+    }
+
+    fn parse_imid2imr_json(
+        json: &serde_json::Value,
+    ) -> std::collections::HashMap<(String, u32), String> {
+        let mut map: std::collections::HashMap<(String, u32), String> =
+            std::collections::HashMap::new();
+        let mut unique_imid_map: std::collections::HashMap<u32, Option<String>> =
+            std::collections::HashMap::new();
+
+        for info in Self::value_as_array(json) {
+            let Some(uuid) = Self::get_json_string(info, "uuid") else {
+                continue;
+            };
+            let uuid_base = match uuid.split('_').next() {
+                Some(v) if !v.is_empty() => v.to_string(),
+                _ => uuid,
+            };
+            if uuid_base.is_empty() {
+                continue;
+            }
+
+            let Some(props) = info.get("props") else {
+                continue;
+            };
+            for prop in Self::value_as_array(props) {
+                let Some(imr) = Self::get_json_string(prop, "uuid") else {
+                    continue;
+                };
+                let Some(imid) = prop
+                    .get("imid")
+                    .or_else(|| prop.get("i"))
+                    .and_then(Self::json_u32ish)
+                else {
+                    continue;
+                };
+                if imid == 0 || imr.is_empty() {
+                    continue;
+                }
+                map.insert((uuid_base.clone(), imid), imr.clone());
+                unique_imid_map
+                    .entry(imid)
+                    .and_modify(|existing| {
+                        if existing.as_ref().is_some_and(|value| value != &imr) {
+                            *existing = None;
+                        }
+                    })
+                    .or_insert(Some(imr));
+            }
+        }
+
+        for (imid, imr) in unique_imid_map {
+            if let Some(imr) = imr {
+                map.insert((String::new(), imid), imr);
+            }
+        }
+
+        map
+    }
+
+    fn json_u32ish(value: &serde_json::Value) -> Option<u32> {
+        match value {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+            serde_json::Value::String(s) => s.trim().parse::<u32>().ok(),
+            _ => None,
+        }
     }
 
     fn build_topic_agents_from_details(
@@ -1586,6 +1619,63 @@ mod tests {
         let obj = value.as_object().expect("object");
         assert!(obj.get("a").unwrap().is_object());
         assert!(obj.get("b").unwrap().is_string());
+    }
+
+    #[test]
+    fn parse_imid2imr_json_accepts_suffixed_uuid_and_string_imid() {
+        let value = json!([
+            {
+                "uuid": "705537041061273601_template",
+                "props": [
+                    { "uuid": "Turbine/WTUR/State/DataAvailable", "imid": "1" },
+                    { "uuid": "Turbine/WTUR/State/IgnoredZero", "imid": 0 },
+                    { "uuid": "Turbine/WTUR/State/IgnoredMissing" }
+                ]
+            }
+        ]);
+
+        let map = RedisRepo::parse_imid2imr_json(&value);
+
+        assert_eq!(
+            map.get(&("705537041061273601".to_string(), 1)),
+            Some(&"Turbine/WTUR/State/DataAvailable".to_string())
+        );
+        assert_eq!(
+            map.get(&(String::new(), 1)),
+            Some(&"Turbine/WTUR/State/DataAvailable".to_string())
+        );
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn parse_imid2imr_json_accepts_compact_imid_and_unique_fallback() {
+        let value = json!([
+            {
+                "uuid": "683918651070767105_36_IC792388231487426560",
+                "props": [
+                    { "uuid": "Inverter/PROP/INVE/StringBranchCurrent23", "i": 34857, "d": "float" },
+                    { "uuid": "STD/PROP/BASE/IsDeviceConnected", "i": 1, "d": "bool" }
+                ]
+            },
+            {
+                "uuid": "670353901024075777_12_IC790045472579522560",
+                "props": [
+                    { "uuid": "Other/PROP/BASE/IsDeviceConnected", "i": 1, "d": "bool" }
+                ]
+            }
+        ]);
+
+        let map = RedisRepo::parse_imid2imr_json(&value);
+
+        assert_eq!(
+            map.get(&("683918651070767105".to_string(), 34857)),
+            Some(&"Inverter/PROP/INVE/StringBranchCurrent23".to_string())
+        );
+        assert_eq!(
+            map.get(&(String::new(), 34857)),
+            Some(&"Inverter/PROP/INVE/StringBranchCurrent23".to_string())
+        );
+        assert_eq!(map.get(&(String::new(), 1)), None);
     }
 
     #[test]

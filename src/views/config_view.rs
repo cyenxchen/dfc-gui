@@ -412,7 +412,10 @@ impl ConfigView {
         };
 
         for (col, entity) in [
-            (PropSortColumn::GlobalUuid, prop_filter_inputs.global_uuid.clone()),
+            (
+                PropSortColumn::GlobalUuid,
+                prop_filter_inputs.global_uuid.clone(),
+            ),
             (PropSortColumn::Device, prop_filter_inputs.device.clone()),
             (PropSortColumn::Imr, prop_filter_inputs.imr.clone()),
             (PropSortColumn::Imid, prop_filter_inputs.imid.clone()),
@@ -420,7 +423,10 @@ impl ConfigView {
             (PropSortColumn::Quality, prop_filter_inputs.quality.clone()),
             (PropSortColumn::Bcrid, prop_filter_inputs.bcrid.clone()),
             (PropSortColumn::Time, prop_filter_inputs.time.clone()),
-            (PropSortColumn::MessageTime, prop_filter_inputs.message_time.clone()),
+            (
+                PropSortColumn::MessageTime,
+                prop_filter_inputs.message_time.clone(),
+            ),
             (PropSortColumn::Summary, prop_filter_inputs.summary.clone()),
         ] {
             subscriptions.push(cx.subscribe(&entity, move |this, state, event, cx| {
@@ -438,16 +444,34 @@ impl ConfigView {
             (EventSortColumn::Uuid, event_filter_inputs.uuid.clone()),
             (EventSortColumn::Device, event_filter_inputs.device.clone()),
             (EventSortColumn::Imr, event_filter_inputs.imr.clone()),
-            (EventSortColumn::EventType, event_filter_inputs.event_type.clone()),
+            (
+                EventSortColumn::EventType,
+                event_filter_inputs.event_type.clone(),
+            ),
             (EventSortColumn::Level, event_filter_inputs.level.clone()),
             (EventSortColumn::Tags, event_filter_inputs.tags.clone()),
             (EventSortColumn::Codes, event_filter_inputs.codes.clone()),
-            (EventSortColumn::StrCodes, event_filter_inputs.str_codes.clone()),
-            (EventSortColumn::HappenedTime, event_filter_inputs.happened_time.clone()),
-            (EventSortColumn::RecordTime, event_filter_inputs.record_time.clone()),
+            (
+                EventSortColumn::StrCodes,
+                event_filter_inputs.str_codes.clone(),
+            ),
+            (
+                EventSortColumn::HappenedTime,
+                event_filter_inputs.happened_time.clone(),
+            ),
+            (
+                EventSortColumn::RecordTime,
+                event_filter_inputs.record_time.clone(),
+            ),
             (EventSortColumn::BcrId, event_filter_inputs.bcr_id.clone()),
-            (EventSortColumn::Context, event_filter_inputs.context.clone()),
-            (EventSortColumn::Summary, event_filter_inputs.summary.clone()),
+            (
+                EventSortColumn::Context,
+                event_filter_inputs.context.clone(),
+            ),
+            (
+                EventSortColumn::Summary,
+                event_filter_inputs.summary.clone(),
+            ),
         ] {
             subscriptions.push(cx.subscribe(&entity, move |this, state, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -473,10 +497,8 @@ impl ConfigView {
         // Subscribe to config state changes. We use observe_in (instead of observe) so
         // that the callback receives a Window — sync_topic_stream_with_selection needs
         // it to clear filter input fields on topic transitions.
-        subscriptions.push(cx.observe_in(
-            &config_state,
-            window,
-            |this, _model, window, cx| {
+        subscriptions.push(
+            cx.observe_in(&config_state, window, |this, _model, window, cx| {
                 let query = this.agent_search_state.read(cx).value().trim().to_string();
                 if !query.is_empty() {
                     let selected = this
@@ -494,8 +516,8 @@ impl ConfigView {
                 }
                 this.sync_topic_stream_with_selection(window, cx);
                 cx.notify();
-            },
-        ));
+            }),
+        );
 
         // Subscribe to agent search input changes for filtering and selection clearing
         subscriptions.push(cx.subscribe(&agent_search_state, |this, state, event, cx| {
@@ -662,11 +684,7 @@ impl ConfigView {
         Some((req, resp))
     }
 
-    fn sync_topic_stream_with_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn sync_topic_stream_with_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected_topic_path: Option<String> = {
             let state = self.config_state.read(cx);
             match (state.selected_agent(), state.selected_topic_index()) {
@@ -2978,9 +2996,7 @@ impl ConfigView {
                                             .text_ellipsis(),
                                     )
                                     .child(
-                                        Icon::new(sort_icon)
-                                            .size_3()
-                                            .text_color(sort_icon_color),
+                                        Icon::new(sort_icon).size_3().text_color(sort_icon_color),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3096,9 +3112,7 @@ impl ConfigView {
                                             .text_ellipsis(),
                                     )
                                     .child(
-                                        Icon::new(sort_icon)
-                                            .size_3()
-                                            .text_color(sort_icon_color),
+                                        Icon::new(sort_icon).size_3().text_color(sort_icon_color),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3816,6 +3830,7 @@ fn parse_prop_rows_from_payload(
                     let key = (global_uuid.clone(), *id);
                     let imr = imid2imr
                         .get(&key)
+                        .or_else(|| imid2imr.get(&(String::new(), *id)))
                         .cloned()
                         .unwrap_or_else(|| "Unknown Imr".to_string());
                     (i32::try_from(*id).unwrap_or(0), imr)
@@ -4332,11 +4347,13 @@ async fn run_event_topic_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_event_rows_from_payload, topic_display_name};
+    use super::{parse_event_rows_from_payload, parse_prop_rows_from_payload, topic_display_name};
     use crate::proto::iothub::{
-        ClockTime, EnumValue, EventRecord, EventRecordList, HiClockTime, enum_value,
+        AnyValue, ClockTime, DataFrame, DataHeader, DataRecord, DataRecordSet, EnumValue,
+        EventRecord, EventRecordList, HiClockTime, any_value, data_record, enum_value,
     };
     use prost::Message as _;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
 
     #[test]
@@ -4383,6 +4400,64 @@ mod tests {
             topic_display_name("persistent://goldwind/iothub/thing_event-BZ-626221420272574464"),
             "thing_event-BZ"
         );
+    }
+
+    #[test]
+    fn parse_prop_rows_uses_dfc_data_frame_and_imid_mapping() {
+        let frame = DataFrame {
+            frame: vec![DataRecordSet {
+                header: Some(DataHeader {
+                    im_global_uuid: "705537041061273601".to_string(),
+                    series_type: "Guarantee".to_string(),
+                    window_size: 0,
+                    source_device: "100852277".to_string(),
+                    t: Some(ClockTime {
+                        t: 1_711_111_112,
+                        zone_info: 0,
+                    }),
+                    nano_second: 0,
+                    extends_data: Default::default(),
+                }),
+                data: vec![DataRecord {
+                    k: Some(data_record::K::Im2id(1)),
+                    v: Some(AnyValue {
+                        v: Some(any_value::V::BoolV(false)),
+                    }),
+                    q: 0,
+                    bcr_uuid: "bcr-1".to_string(),
+                    device_time: Some(ClockTime {
+                        t: 1_711_111_111,
+                        zone_info: 0,
+                    }),
+                }],
+            }],
+        };
+
+        let mut proto = Vec::new();
+        frame.encode(&mut proto).expect("encode test data frame");
+
+        let summary = b"per";
+        let mut payload = vec![0x20, 0x02, summary.len() as u8];
+        payload.extend_from_slice(summary);
+        payload.extend_from_slice(&proto);
+
+        let uid = AtomicU64::new(1);
+        let imid2imr = HashMap::from([(
+            ("705537041061273601".to_string(), 1),
+            "Turbine/WTUR/State/DataAvailable".to_string(),
+        )]);
+        let (rows, decoded) = parse_prop_rows_from_payload(&payload, &imid2imr, &uid);
+
+        assert!(decoded);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].global_uuid, "705537041061273601");
+        assert_eq!(rows[0].device, "100852277");
+        assert_eq!(rows[0].imid, 1);
+        assert_eq!(rows[0].imr, "Turbine/WTUR/State/DataAvailable");
+        assert_eq!(rows[0].value, "false");
+        assert_eq!(rows[0].quality, 0);
+        assert_eq!(rows[0].bcrid, "bcr-1");
+        assert_eq!(rows[0].summary, "per");
     }
 
     #[test]
