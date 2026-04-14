@@ -1775,23 +1775,29 @@ impl ConfigView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let bg = if is_selected {
-            cx.theme().accent
+            cx.theme().list_active
         } else {
             cx.theme().background
         };
 
-        let text_color = if is_selected {
-            cx.theme().accent_foreground
-        } else {
-            cx.theme().foreground
-        };
+        let text_color = cx.theme().foreground;
 
-        let hover_color = cx.theme().accent.opacity(0.5);
-        let border_color = cx.theme().border;
+        let hover_color = if is_selected {
+            bg
+        } else if cx.theme().is_dark() {
+            cx.theme().secondary.lighten(0.04)
+        } else {
+            cx.theme().secondary.darken(0.02)
+        };
+        let border_color = if is_selected {
+            cx.theme().list_active_border
+        } else {
+            cx.theme().border
+        };
         let agent_id_for_click = agent_id.clone();
 
         let count_color = if is_selected {
-            cx.theme().accent_foreground.opacity(0.9)
+            cx.theme().foreground.opacity(0.72)
         } else {
             cx.theme().muted_foreground
         };
@@ -1799,29 +1805,35 @@ impl ConfigView {
         div()
             .id(("agent-item", index))
             .w_full()
-            .px_3()
-            .py_2()
-            .bg(bg)
             .cursor_pointer()
-            .border_b_1()
-            .border_color(border_color)
-            .hover(|this| this.bg(hover_color))
+            .when(is_selected, |this| this.px_1().py_px())
             .child(
-                h_flex()
+                div()
                     .w_full()
-                    .items_center()
-                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .bg(bg)
+                    .when(is_selected, |this| this.rounded_sm().border_1())
+                    .when(!is_selected, |this| this.border_b_1())
+                    .border_color(border_color)
+                    .hover(|this| this.bg(hover_color))
                     .child(
-                        Label::new(agent_id.clone())
-                            .text_sm()
-                            .text_color(text_color)
-                            .text_ellipsis()
-                            .flex_1(),
-                    )
-                    .child(
-                        Label::new(format!("{} topics", topic_count))
-                            .text_xs()
-                            .text_color(count_color),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Label::new(agent_id.clone())
+                                    .text_sm()
+                                    .text_color(text_color)
+                                    .text_ellipsis()
+                                    .flex_1(),
+                            )
+                            .child(
+                                Label::new(format!("{} topics", topic_count))
+                                    .text_xs()
+                                    .text_color(count_color),
+                            ),
                     ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {

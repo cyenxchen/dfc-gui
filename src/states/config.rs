@@ -26,6 +26,9 @@ pub struct ConfigState {
 }
 
 impl ConfigState {
+    const PREFERRED_AGENT_TOPIC_PREFIX: &str =
+        "non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee";
+
     /// Create a new empty config state
     pub fn new() -> Self {
         Self {
@@ -104,6 +107,63 @@ impl ConfigState {
         })
     }
 
+    fn is_preferred_agent_topic(topic: &TopicDetail) -> bool {
+        topic.path.starts_with(Self::PREFERRED_AGENT_TOPIC_PREFIX)
+    }
+
+    fn is_prop_agent_topic(topic: &TopicDetail) -> bool {
+        topic.path.contains("prop_data-BZ-") || topic.topic_type == "prop"
+    }
+
+    fn default_topic_index_for_agent(agent: &TopicAgentItem) -> Option<i32> {
+        agent
+            .topics
+            .iter()
+            .position(Self::is_preferred_agent_topic)
+            .or_else(|| agent.topics.iter().position(Self::is_prop_agent_topic))
+            .or_else(|| (!agent.topics.is_empty()).then_some(0))
+            .map(|idx| idx as i32)
+    }
+
+    fn default_agent_selection(&self) -> Option<(String, Option<i32>)> {
+        self.topic_agents_merged
+            .iter()
+            .find(|agent| agent.topics.iter().any(Self::is_preferred_agent_topic))
+            .map(|agent| {
+                (
+                    agent.agent_id.clone(),
+                    Self::default_topic_index_for_agent(agent),
+                )
+            })
+            .or_else(|| {
+                self.topic_agents_merged
+                    .iter()
+                    .find(|agent| agent.topics.iter().any(Self::is_prop_agent_topic))
+                    .map(|agent| {
+                        (
+                            agent.agent_id.clone(),
+                            Self::default_topic_index_for_agent(agent),
+                        )
+                    })
+            })
+            .or_else(|| {
+                self.topic_agents_merged
+                    .iter()
+                    .find(|agent| !agent.topics.is_empty())
+                    .map(|agent| {
+                        (
+                            agent.agent_id.clone(),
+                            Self::default_topic_index_for_agent(agent),
+                        )
+                    })
+            })
+            .or_else(|| {
+                self.topic_agents_merged
+                    .first()
+                    .map(|agent| (agent.agent_id.clone(), None))
+            })
+    }
+
     fn rebuild_topic_agents_merged(&mut self) {
         #[derive(Clone, Debug)]
         struct MergedTopicMeta {
@@ -177,9 +237,9 @@ impl ConfigState {
         self.selected_config_id = None;
 
         // Initialize selection to first agent/topic when available
-        if let Some(first_agent) = self.topic_agents_merged.first() {
-            self.selected_agent_id = Some(first_agent.agent_id.clone());
-            self.selected_topic_index = None;
+        if let Some((agent_id, topic_index)) = self.default_agent_selection() {
+            self.selected_agent_id = Some(agent_id);
+            self.selected_topic_index = topic_index;
         } else {
             self.selected_agent_id = None;
             self.selected_topic_index = None;
@@ -227,12 +287,14 @@ impl ConfigState {
     /// Select a TopicAgentId
     pub fn select_agent(&mut self, agent_id: Option<String>, cx: &mut Context<Self>) {
         self.selected_agent_id = agent_id;
-        // No topic selected by default
-        self.selected_topic_index = None;
+        self.selected_topic_index = self
+            .selected_agent()
+            .and_then(Self::default_topic_index_for_agent);
         if let Some(agent) = self.selected_agent() {
             tracing::info!(
                 agent_id = %agent.agent_id,
                 topics = agent.topics.len(),
+                selected_topic_index = self.selected_topic_index,
                 "Selected TopicAgentId"
             );
         } else {
@@ -396,7 +458,7 @@ mod tests {
         assert!(matches!(state.load_state(), ConfigLoadState::Loaded));
         // Agents are sorted by agent_id, so "A" should be first and selected.
         assert_eq!(state.selected_agent_id(), Some("A"));
-        assert_eq!(state.selected_topic_index(), None);
+        assert_eq!(state.selected_topic_index(), Some(0));
     }
 
     #[test]
@@ -408,5 +470,135 @@ mod tests {
         assert!(state.topic_agents().is_empty());
         assert_eq!(state.selected_agent_id(), None);
         assert_eq!(state.selected_topic_index(), None);
+    }
+
+    #[test]
+    fn default_topic_index_prefers_fast_guarantee_prop_topic() {
+        let agent = make_agent(
+            "A",
+            vec![
+                (
+                    0,
+                    "non-persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-1",
+                    true,
+                    "prop",
+                ),
+                (
+                    1,
+                    "non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee-1",
+                    true,
+                    "prop",
+                ),
+                (
+                    2,
+                    "non-persistent://goldwind/iothub/thing_event-BZ-FAST-realdev-Guarantee-1",
+                    true,
+                    "event",
+                ),
+            ],
+            1,
+        );
+
+        assert_eq!(ConfigState::default_topic_index_for_agent(&agent), Some(1));
+    }
+
+    #[test]
+    fn default_topic_index_falls_back_to_first_prop_then_first_topic() {
+        let prop_fallback = make_agent(
+            "A",
+            vec![
+                (
+                    0,
+                    "non-persistent://goldwind/iothub/thing_event-BZ-FAST-realdev-Guarantee-1",
+                    true,
+                    "event",
+                ),
+                (
+                    1,
+                    "non-persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-1",
+                    true,
+                    "prop",
+                ),
+            ],
+            1,
+        );
+        assert_eq!(
+            ConfigState::default_topic_index_for_agent(&prop_fallback),
+            Some(1)
+        );
+
+        let first_topic_fallback = make_agent(
+            "B",
+            vec![
+                (
+                    0,
+                    "non-persistent://goldwind/iothub/thing_event-BZ-FAST-realdev-Guarantee-1",
+                    true,
+                    "event",
+                ),
+                (
+                    1,
+                    "non-persistent://goldwind/iothub/service-BZ-FAST-realdev-Guarantee-1",
+                    true,
+                    "cmd",
+                ),
+            ],
+            1,
+        );
+        assert_eq!(
+            ConfigState::default_topic_index_for_agent(&first_topic_fallback),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn default_topic_index_treats_prop_data_path_as_prop_even_if_type_unknown() {
+        let agent = make_agent(
+            "A",
+            vec![
+                (
+                    0,
+                    "non-persistent://goldwind/iothub/thing_event-BZ-FAST-realdev-Guarantee-1",
+                    true,
+                    "event",
+                ),
+                (
+                    1,
+                    "non-persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-1",
+                    true,
+                    "unknown",
+                ),
+            ],
+            1,
+        );
+
+        assert_eq!(ConfigState::default_topic_index_for_agent(&agent), Some(1));
+    }
+
+    #[test]
+    fn apply_configs_prefers_agent_with_fast_topic_over_empty_first_agent() {
+        let mut state = ConfigState::new();
+
+        let configs = vec![make_config(
+            1,
+            vec![
+                make_agent("A", vec![], 1),
+                make_agent(
+                    "B",
+                    vec![(
+                        0,
+                        "non-persistent://goldwind/iothub/prop_data-BZ-FAST-realdev-Guarantee-1",
+                        true,
+                        "unknown",
+                    )],
+                    1,
+                ),
+            ],
+        )];
+
+        state.apply_configs(configs);
+
+        assert_eq!(state.selected_agent_id(), Some("B"));
+        assert_eq!(state.selected_topic_index(), Some(0));
     }
 }
