@@ -1,0 +1,136 @@
+name: Release
+
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS arm64
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package release asset
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_tag="${GITHUB_REF_NAME//\//-}"
+          asset="dfc-gui-${safe_tag}-macos-arm64.zip"
+          dir="dist/dfc-gui-${safe_tag}-macos-arm64"
+          mkdir -p "$dir"
+          cp "target/aarch64-apple-darwin/release/dfc-gui" "$dir/"
+          ditto -c -k --sequesterRsrc --keepParent "$dir" "$asset"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  build-windows-x86:
+    name: Build Windows x86
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add i686-pc-windows-msvc
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release --target i686-pc-windows-msvc
+
+      - name: Package release asset
+        id: package
+        shell: pwsh
+        run: |
+          $safeTag = $env:GITHUB_REF_NAME -replace '/', '-'
+          $asset = "dfc-gui-$safeTag-windows-x86.zip"
+          $dir = "dist/dfc-gui-$safeTag-windows-x86"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Copy-Item "target/i686-pc-windows-msvc/release/dfc-gui.exe" "$dir/dfc-gui.exe"
+          if (Test-Path $asset) {
+            Remove-Item $asset -Force
+          }
+          Compress-Archive -Path $dir -DestinationPath $asset
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "asset=$asset"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish release
+    runs-on: ubuntu-22.04
+    needs:
+      - build-macos-arm64
+      - build-windows-x86
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: release-assets/macos
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows-x86
+          path: release-assets/windows
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mapfile -t files < <(find release-assets -maxdepth 2 -type f | sort)
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No release assets found"
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --verify-tag --generate-notes
+          fi
