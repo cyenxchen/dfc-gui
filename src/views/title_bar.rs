@@ -78,9 +78,16 @@ impl DfcTitleBar {
                 Box::new(MenuAction::CheckForUpdates),
                 move |_window, cx| Label::new(i18n_update(cx, "check_for_updates")),
             );
+        } else {
+            menu = menu.separator();
         }
 
-        menu.separator().menu_element_with_icon(
+        menu.menu_element_with_icon(
+            Icon::new(IconName::Info),
+            Box::new(MenuAction::About),
+            move |_window, cx| Label::new(i18n_sidebar(cx, "about")),
+        )
+        .menu_element_with_icon(
             Icon::new(IconName::Settings2),
             Box::new(SettingsAction::Open),
             move |_window, cx| Label::new(i18n_sidebar(cx, "settings")),
@@ -122,8 +129,8 @@ impl Render for DfcTitleBar {
                             .icon(IconName::Info)
                             .small()
                             .ghost()
-                            .on_click(|_, _, _cx| {
-                                // TODO: Open about dialog
+                            .on_click(|_, _, cx| {
+                                crate::views::open_about_dialog(cx);
                             }),
                     ),
             )

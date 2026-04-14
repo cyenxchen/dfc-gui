@@ -48,6 +48,12 @@ pub fn i18n_settings(cx: &App, key: &str) -> SharedString {
     t!(format!("settings.{key}"), locale = locale).into()
 }
 
+/// Get translated string from "about" namespace
+pub fn i18n_about(cx: &App, key: &str) -> SharedString {
+    let locale = cx.global::<DfcGlobalStore>().read(cx).locale();
+    t!(format!("about.{key}"), locale = locale).into()
+}
+
 /// Get translated string from "update" namespace
 pub fn i18n_update(cx: &App, key: &str) -> SharedString {
     let locale = cx.global::<DfcGlobalStore>().read(cx).locale();

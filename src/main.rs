@@ -14,7 +14,7 @@ use crate::states::{
     FontSizeAction, KeysState, LocaleAction, Route, SettingsAction, ThemeAction, check_for_updates,
     start_auto_update_scheduler, update_app_state_and_save,
 };
-use crate::views::{DfcContent, DfcSidebar, DfcTitleBar};
+use crate::views::{DfcContent, DfcSidebar, DfcTitleBar, open_about_dialog};
 use gpui::{
     App, Application, Bounds, Entity, Menu, MenuItem, Pixels, Task, TitlebarOptions, Window,
     WindowAppearance, WindowBounds, WindowOptions, prelude::*, px, size,
@@ -397,8 +397,7 @@ fn main() {
         cx.on_action(|e: &MenuAction, cx: &mut App| match e {
             MenuAction::Quit => cx.quit(),
             MenuAction::About => {
-                // TODO: Open about dialog
-                info!("About dialog");
+                open_about_dialog(cx);
             }
             MenuAction::CheckForUpdates => {
                 check_for_updates(true, cx);

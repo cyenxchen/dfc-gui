@@ -116,6 +116,15 @@ reset_defaults = "Reset to Defaults"
 preset_credentials = "Preset Credentials"
 preset_credentials_placeholder = "One password per line, or username:password"
 
+[about]
+title = "About DFC-GUI"
+tagline = "Desktop client for device fleet control"
+description = "Desktop client for external debugging tools."
+version = "Current Version"
+feature_connections = "Manage Redis and Pulsar connection settings"
+feature_runtime = "Browse devices, properties, events, and Keys data"
+feature_commands = "Send device commands and review execution feedback"
+
 [alarms]
 title = "Alarms"
 code = "Alarm Code"

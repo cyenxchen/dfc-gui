@@ -20,6 +20,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+mod about_dialog;
 mod config_view;
 mod content;
 mod keys_browser;
@@ -28,6 +29,7 @@ mod sidebar;
 mod title_bar;
 mod update_dialog;
 
+pub use about_dialog::*;
 pub use config_view::*;
 pub use content::*;
 pub use keys_browser::*;
