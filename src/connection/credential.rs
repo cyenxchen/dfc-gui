@@ -71,14 +71,15 @@ mod tests {
 
     #[test]
     fn test_parse_password_only() {
-        let cred = PresetCredential::from_str("mypassword").unwrap();
+        let cred = PresetCredential::from_str("mypassword").expect("password should parse");
         assert_eq!(cred.username, None);
         assert_eq!(cred.password, "mypassword");
     }
 
     #[test]
     fn test_parse_username_password() {
-        let cred = PresetCredential::from_str("admin:secret123").unwrap();
+        let cred =
+            PresetCredential::from_str("admin:secret123").expect("username/password should parse");
         assert_eq!(cred.username, Some("admin".to_string()));
         assert_eq!(cred.password, "secret123");
     }

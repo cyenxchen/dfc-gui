@@ -1617,8 +1617,8 @@ mod tests {
             ("b".to_string(), "plain".to_string()),
         ]);
         let obj = value.as_object().expect("object");
-        assert!(obj.get("a").unwrap().is_object());
-        assert!(obj.get("b").unwrap().is_string());
+        assert!(obj.get("a").is_some_and(serde_json::Value::is_object));
+        assert!(obj.get("b").is_some_and(serde_json::Value::is_string));
     }
 
     #[test]

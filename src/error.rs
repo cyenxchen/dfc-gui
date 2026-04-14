@@ -46,6 +46,10 @@ pub enum Error {
     /// Parse error
     #[snafu(display("Parse error: {message}"))]
     Parse { message: String },
+
+    /// Update-related error
+    #[snafu(display("Update error: {message}"))]
+    Update { message: String },
 }
 
 impl From<std::io::Error> for Error {
@@ -69,6 +73,14 @@ impl From<toml::de::Error> for Error {
 impl From<toml::ser::Error> for Error {
     fn from(source: toml::ser::Error) -> Self {
         Error::TomlSe { source }
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(source: reqwest::Error) -> Self {
+        Error::Update {
+            message: source.to_string(),
+        }
     }
 }
 

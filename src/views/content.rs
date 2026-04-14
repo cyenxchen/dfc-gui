@@ -1059,7 +1059,7 @@ impl DfcContent {
                                     .child(copy_btn)
                                     .child(delete_btn),
                             ),
-                    )
+                    ),
             )
             .into_any_element()
     }
@@ -1105,11 +1105,7 @@ impl DfcContent {
             rows.push(self.render_server_list_row(index, server, bg, cx));
         }
 
-        v_flex()
-            .p_2()
-            .gap_2()
-            .children(rows)
-            .into_any_element()
+        v_flex().p_2().gap_2().children(rows).into_any_element()
     }
 
     /// Render the home view with server cards, config view, or keys browser

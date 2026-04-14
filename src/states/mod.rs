@@ -16,6 +16,7 @@ mod keys;
 mod prop_table;
 mod service_table;
 mod ui_event;
+pub mod update;
 
 pub use app::*;
 pub use config::*;
@@ -26,3 +27,4 @@ pub use keys::*;
 pub use prop_table::*;
 pub use service_table::*;
 pub use ui_event::*;
+pub use update::*;

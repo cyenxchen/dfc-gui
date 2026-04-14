@@ -392,7 +392,8 @@ mod tests {
             event_array: vec![event],
         };
         let mut payload = vec![0x20, 0x02, 0x00];
-        list.encode(&mut payload).unwrap();
+        list.encode(&mut payload)
+            .expect("event record list should encode");
 
         let uid = AtomicU64::new(1);
         let rows = parse_service_response_rows(&payload, &uid);
@@ -421,7 +422,7 @@ mod tests {
         let int_av = json_value_to_any_value(&serde_json::json!(42));
         assert!(matches!(int_av.v, Some(V::Sint64V(42))));
 
-        let float_av = json_value_to_any_value(&serde_json::json!(3.14));
+        let float_av = json_value_to_any_value(&serde_json::json!(std::f64::consts::PI));
         assert!(matches!(float_av.v, Some(V::DoubleV(_))));
 
         let str_av = json_value_to_any_value(&serde_json::json!("hi"));

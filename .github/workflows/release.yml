@@ -42,11 +42,40 @@ jobs:
         run: |
           set -euo pipefail
           safe_tag="${GITHUB_REF_NAME//\//-}"
-          asset="dfc-gui-${safe_tag}-macos-arm64.zip"
-          dir="dist/dfc-gui-${safe_tag}-macos-arm64"
-          mkdir -p "$dir"
-          cp "target/aarch64-apple-darwin/release/dfc-gui" "$dir/"
-          ditto -c -k --sequesterRsrc --keepParent "$dir" "$asset"
+          app="dist/DFC-GUI.app"
+          asset="dfc-gui-${safe_tag}-macos-arm64.dmg"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/aarch64-apple-darwin/release/dfc-gui" "$app/Contents/MacOS/dfc-gui"
+          chmod +x "$app/Contents/MacOS/dfc-gui"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleExecutable</key>
+            <string>dfc-gui</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.goldwind.dfc-gui</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>DFC-GUI</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${safe_tag#v}</string>
+            <key>CFBundleVersion</key>
+            <string>${safe_tag#v}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          hdiutil create -volname "DFC-GUI" -srcfolder "$app" -ov -format UDZO "$asset"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS artifact
@@ -87,13 +116,13 @@ jobs:
         run: |
           $safeTag = $env:GITHUB_REF_NAME -replace '/', '-'
           $asset = "dfc-gui-$safeTag-windows-x86.zip"
-          $dir = "dist/dfc-gui-$safeTag-windows-x86"
+          $dir = "dist"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          Copy-Item "target/i686-pc-windows-msvc/release/dfc-gui.exe" "$dir/dfc-gui.exe"
+          Copy-Item "target/i686-pc-windows-msvc/release/dfc-gui.exe" "$dir/dfc-gui.exe" -Force
           if (Test-Path $asset) {
             Remove-Item $asset -Force
           }
-          Compress-Archive -Path $dir -DestinationPath $asset
+          Compress-Archive -Path "$dir/dfc-gui.exe" -DestinationPath $asset
           Add-Content -Path $env:GITHUB_OUTPUT -Value "asset=$asset"
 
       - name: Upload Windows artifact

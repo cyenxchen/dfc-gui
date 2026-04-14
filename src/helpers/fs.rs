@@ -94,6 +94,24 @@ pub fn is_development() -> bool {
     cfg!(debug_assertions)
 }
 
+/// Check whether the current build/runtime supports in-app auto-update.
+pub fn supports_auto_update() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        get_app_bundle_path().is_some()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 /// Check if running on Windows
 pub fn is_windows() -> bool {
     cfg!(target_os = "windows")
@@ -196,4 +214,26 @@ pub fn get_or_create_log_dir() -> Result<PathBuf> {
     }
 
     Ok(log_dir)
+}
+
+/// Returns the macOS `.app` bundle path by navigating up from the executable.
+#[cfg(target_os = "macos")]
+pub fn get_app_bundle_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos_dir = exe.parent()?;
+    if macos_dir.file_name()?.to_str()? != "MacOS" {
+        return None;
+    }
+
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name()?.to_str()? != "Contents" {
+        return None;
+    }
+
+    let app_bundle = contents_dir.parent()?;
+    if app_bundle.extension()?.to_str()? != "app" {
+        return None;
+    }
+
+    Some(app_bundle.to_path_buf())
 }

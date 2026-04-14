@@ -4,21 +4,22 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use crate::constants::SIDEBAR_WIDTH;
 use crate::helpers::{
-    DeviceAction, MenuAction, ServerAction, get_or_create_log_dir, is_development, new_key_bindings,
+    DeviceAction, MenuAction, ServerAction, get_or_create_log_dir, is_app_store_build,
+    is_development, new_key_bindings, supports_auto_update,
 };
 use crate::services::ServiceHub;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, FleetState, FontSize, FontSizeAction, KeysState,
-    LocaleAction, Route, SettingsAction, ThemeAction, UIEvent, update_app_state_and_save,
+    ConfigState, DfcAppState, DfcGlobalStore, DfcUpdateState, DfcUpdateStore, FleetState, FontSize,
+    FontSizeAction, KeysState, LocaleAction, Route, SettingsAction, ThemeAction, check_for_updates,
+    start_auto_update_scheduler, update_app_state_and_save,
 };
-use crate::views::{DfcContent, DfcSidebar, DfcTitleBar};
+use crate::views::{DfcContent, DfcSidebar, DfcTitleBar, open_about_dialog};
 use gpui::{
     App, Application, Bounds, Entity, Menu, MenuItem, Pixels, Task, TitlebarOptions, Window,
-    WindowAppearance, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    WindowAppearance, WindowBounds, WindowOptions, prelude::*, px, size,
 };
-use gpui_component::{ActiveTheme, Root, Theme, ThemeMode, WindowExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Root, Theme, ThemeMode, h_flex, v_flex};
 use std::env;
 use tracing::{Level, error, info};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -388,24 +389,34 @@ fn main() {
         }
 
         cx.set_global(global_store);
+        let update_state = cx.new(|_| DfcUpdateState::default());
+        cx.set_global(DfcUpdateStore::new(update_state));
         cx.bind_keys(new_key_bindings());
 
         // Set up menu actions
         cx.on_action(|e: &MenuAction, cx: &mut App| match e {
             MenuAction::Quit => cx.quit(),
             MenuAction::About => {
-                // TODO: Open about dialog
-                info!("About dialog");
+                open_about_dialog(cx);
+            }
+            MenuAction::CheckForUpdates => {
+                check_for_updates(true, cx);
             }
         });
 
         // Set up application menu
+        let mut app_menu_items = vec![MenuItem::action("About DFC-GUI", MenuAction::About)];
+        if supports_auto_update() {
+            app_menu_items.push(MenuItem::action(
+                "Check for Updates...",
+                MenuAction::CheckForUpdates,
+            ));
+        }
+        app_menu_items.push(MenuItem::action("Quit", MenuAction::Quit));
+
         cx.set_menus(vec![Menu {
             name: "DFC-GUI".into(),
-            items: vec![
-                MenuItem::action("About DFC-GUI", MenuAction::About),
-                MenuItem::action("Quit", MenuAction::Quit),
-            ],
+            items: app_menu_items,
         }]);
 
         // Start services
@@ -444,5 +455,9 @@ fn main() {
             Ok::<_, anyhow::Error>(())
         })
         .detach();
+
+        if supports_auto_update() && !is_development() && !is_app_store_build() {
+            start_auto_update_scheduler(cx);
+        }
     });
 }

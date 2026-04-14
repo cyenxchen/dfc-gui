@@ -13,6 +13,8 @@ pub enum MenuAction {
     Quit,
     /// Show about dialog
     About,
+    /// Check for application updates
+    CheckForUpdates,
 }
 
 /// Navigation actions
