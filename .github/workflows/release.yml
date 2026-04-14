@@ -28,6 +28,11 @@ jobs:
           rustup default stable
           rustup target add aarch64-apple-darwin
 
+      - name: Install protoc
+        run: |
+          brew install protobuf
+          protoc --version
+
       - name: Build release binary
         run: cargo build --release --target aarch64-apple-darwin
 
@@ -65,6 +70,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add i686-pc-windows-msvc
+
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          choco install protoc -y
+          protoc --version
 
       - name: Build release binary
         shell: pwsh
