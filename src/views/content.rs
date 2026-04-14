@@ -733,7 +733,7 @@ impl DfcContent {
 
         let title = format!("{} ({}:{})", server.name, server.host, server.port);
         let edit_label = i18n_common(cx, "edit");
-        let copy_label = i18n_common(cx, "copy");
+        let duplicate_label = i18n_common(cx, "duplicate");
         let delete_label = i18n_common(cx, "delete");
 
         let edit_btn = Button::new(("server-edit", index))
@@ -788,7 +788,7 @@ impl DfcContent {
                         }),
                 )
                 .item(
-                    PopupMenuItem::new(copy_label.clone())
+                    PopupMenuItem::new(duplicate_label.clone())
                         .icon(Icon::from(CustomIconName::FilePlusCorner))
                         .on_click(move |_, window, cx| {
                             store_for_copy.set_pending_server(sid_copy.clone());
