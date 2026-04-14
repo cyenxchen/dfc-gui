@@ -422,6 +422,46 @@ impl EventTableState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_row(uid: u64, happened_time: &str) -> EventRow {
+        EventRow {
+            uid,
+            uuid: format!("uuid-{uid}"),
+            device: "100852277".to_string(),
+            imr: "Turbine/EVENT/Grid".to_string(),
+            event_type: "event".to_string(),
+            level: "info".to_string(),
+            tags: String::new(),
+            codes: String::new(),
+            str_codes: String::new(),
+            happened_time: happened_time.to_string(),
+            record_time: "2026-04-14 11:33:03.000".to_string(),
+            bcr_id: String::new(),
+            context: String::new(),
+            summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn time_filters_match_whole_day_prefix() {
+        let mut state = EventTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        state.push_rows_front(vec![
+            event_row(1, "2026-04-14 00:00:01.000"),
+            event_row(2, "2026-04-15 00:00:01.000"),
+        ]);
+        state.set_filter(EventSortColumn::HappenedTime, "2026-04-14".to_string());
+
+        let rows = state.page_rows_owned();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].happened_time, "2026-04-14 00:00:01.000");
+    }
+}
+
 fn row_matches_lowered(row: &EventRow, needles: &[Option<String>; 13]) -> bool {
     if let Some(n) = &needles[0] {
         if !matches_lowered(&row.uuid, n) {
@@ -464,12 +504,12 @@ fn row_matches_lowered(row: &EventRow, needles: &[Option<String>; 13]) -> bool {
         }
     }
     if let Some(n) = &needles[8] {
-        if !matches_lowered(&row.happened_time, n) {
+        if !matches_day_filter(&row.happened_time, n) {
             return false;
         }
     }
     if let Some(n) = &needles[9] {
-        if !matches_lowered(&row.record_time, n) {
+        if !matches_day_filter(&row.record_time, n) {
             return false;
         }
     }
@@ -489,6 +529,10 @@ fn row_matches_lowered(row: &EventRow, needles: &[Option<String>; 13]) -> bool {
         }
     }
     true
+}
+
+fn matches_day_filter(timestamp: &str, day: &str) -> bool {
+    timestamp.starts_with(day)
 }
 
 impl Default for EventTableState {
@@ -514,4 +558,3 @@ fn compare_event_rows(a: &EventRow, b: &EventRow, column: EventSortColumn) -> Or
         EventSortColumn::Summary => a.summary.cmp(&b.summary),
     }
 }
-

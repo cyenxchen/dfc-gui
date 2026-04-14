@@ -20,12 +20,13 @@ use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
 use gpui::{
-    Action, App, Context, Corner, Entity, MouseButton, ScrollHandle, ScrollWheelEvent,
+    Action, App, Context, Corner, Entity, Focusable, MouseButton, ScrollHandle, ScrollWheelEvent,
     StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants, DropdownButton},
+    calendar::{Calendar, CalendarEvent, CalendarState, Date},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -162,7 +163,9 @@ struct PropFilterInputs {
     quality: Entity<InputState>,
     bcrid: Entity<InputState>,
     time: Entity<InputState>,
+    time_calendar: Entity<CalendarState>,
     message_time: Entity<InputState>,
+    message_time_calendar: Entity<CalendarState>,
     summary: Entity<InputState>,
 }
 
@@ -196,6 +199,18 @@ impl PropFilterInputs {
             &self.summary,
         ]
     }
+
+    fn calendar(&self, col: PropSortColumn) -> Option<&Entity<CalendarState>> {
+        match col {
+            PropSortColumn::Time => Some(&self.time_calendar),
+            PropSortColumn::MessageTime => Some(&self.message_time_calendar),
+            _ => None,
+        }
+    }
+
+    fn calendars(&self) -> [&Entity<CalendarState>; 2] {
+        [&self.time_calendar, &self.message_time_calendar]
+    }
 }
 
 /// Per-column filter input states for the event topic table.
@@ -209,7 +224,9 @@ struct EventFilterInputs {
     codes: Entity<InputState>,
     str_codes: Entity<InputState>,
     happened_time: Entity<InputState>,
+    happened_time_calendar: Entity<CalendarState>,
     record_time: Entity<InputState>,
+    record_time_calendar: Entity<CalendarState>,
     bcr_id: Entity<InputState>,
     context: Entity<InputState>,
     summary: Entity<InputState>,
@@ -251,6 +268,18 @@ impl EventFilterInputs {
             &self.summary,
         ]
     }
+
+    fn calendar(&self, col: EventSortColumn) -> Option<&Entity<CalendarState>> {
+        match col {
+            EventSortColumn::HappenedTime => Some(&self.happened_time_calendar),
+            EventSortColumn::RecordTime => Some(&self.record_time_calendar),
+            _ => None,
+        }
+    }
+
+    fn calendars(&self) -> [&Entity<CalendarState>; 2] {
+        [&self.happened_time_calendar, &self.record_time_calendar]
+    }
 }
 
 fn new_filter_input(window: &mut Window, cx: &mut Context<ConfigView>) -> Entity<InputState> {
@@ -259,6 +288,43 @@ fn new_filter_input(window: &mut Window, cx: &mut Context<ConfigView>) -> Entity
             .clean_on_escape()
             .placeholder("过滤...")
     })
+}
+
+fn new_date_filter_calendar(
+    window: &mut Window,
+    cx: &mut Context<ConfigView>,
+) -> Entity<CalendarState> {
+    cx.new(|cx| CalendarState::new(window, cx))
+}
+
+fn date_filter_value(date: Date) -> String {
+    date.start()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+fn new_table_cell_input(window: &mut Window, cx: &mut Context<ConfigView>) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .multi_line(true)
+            .rows(1)
+            .soft_wrap(false)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableCellId {
+    row_uid: u64,
+    column_key: &'static str,
+}
+
+impl TableCellId {
+    const fn new(row_uid: u64, column_key: &'static str) -> Self {
+        Self {
+            row_uid,
+            column_key,
+        }
+    }
 }
 
 /// Configuration view component
@@ -288,6 +354,10 @@ pub struct ConfigView {
     event_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the event table header and body
     event_table_horizontal_scroll_handle: ScrollHandle,
+    /// Shared editor used when a table cell enters copy/select mode
+    table_cell_input: Entity<InputState>,
+    /// Currently active table cell in copy/select mode
+    active_table_cell: Option<TableCellId>,
     /// Service topic state (for `thing_service` REQUEST/RESPONSE topic pair)
     service_table_state: Entity<ServiceTableState>,
     service_form: ServiceFormState,
@@ -345,6 +415,7 @@ impl ConfigView {
         let event_row_uid = Arc::new(AtomicU64::new(1));
         let service_table_state = cx.new(|_| ServiceTableState::new());
         let service_row_uid = Arc::new(AtomicU64::new(1));
+        let table_cell_input = new_table_cell_input(window, cx);
 
         let devices_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -391,7 +462,9 @@ impl ConfigView {
             quality: new_filter_input(window, cx),
             bcrid: new_filter_input(window, cx),
             time: new_filter_input(window, cx),
+            time_calendar: new_date_filter_calendar(window, cx),
             message_time: new_filter_input(window, cx),
+            message_time_calendar: new_date_filter_calendar(window, cx),
             summary: new_filter_input(window, cx),
         };
 
@@ -405,7 +478,9 @@ impl ConfigView {
             codes: new_filter_input(window, cx),
             str_codes: new_filter_input(window, cx),
             happened_time: new_filter_input(window, cx),
+            happened_time_calendar: new_date_filter_calendar(window, cx),
             record_time: new_filter_input(window, cx),
+            record_time_calendar: new_date_filter_calendar(window, cx),
             bcr_id: new_filter_input(window, cx),
             context: new_filter_input(window, cx),
             summary: new_filter_input(window, cx),
@@ -438,6 +513,30 @@ impl ConfigView {
                     });
                 }
             }));
+        }
+
+        for (calendar, input) in [
+            (
+                prop_filter_inputs.time_calendar.clone(),
+                prop_filter_inputs.time.clone(),
+            ),
+            (
+                prop_filter_inputs.message_time_calendar.clone(),
+                prop_filter_inputs.message_time.clone(),
+            ),
+        ] {
+            subscriptions.push(cx.subscribe_in(
+                &calendar,
+                window,
+                move |_this, _state, event: &CalendarEvent, window, cx| match event {
+                    CalendarEvent::Selected(date) => {
+                        let value = date_filter_value(*date);
+                        input.update(cx, |state, cx| {
+                            state.set_value(value, window, cx);
+                        });
+                    }
+                },
+            ));
         }
 
         for (col, entity) in [
@@ -484,6 +583,30 @@ impl ConfigView {
             }));
         }
 
+        for (calendar, input) in [
+            (
+                event_filter_inputs.happened_time_calendar.clone(),
+                event_filter_inputs.happened_time.clone(),
+            ),
+            (
+                event_filter_inputs.record_time_calendar.clone(),
+                event_filter_inputs.record_time.clone(),
+            ),
+        ] {
+            subscriptions.push(cx.subscribe_in(
+                &calendar,
+                window,
+                move |_this, _state, event: &CalendarEvent, window, cx| match event {
+                    CalendarEvent::Selected(date) => {
+                        let value = date_filter_value(*date);
+                        input.update(cx, |state, cx| {
+                            state.set_value(value, window, cx);
+                        });
+                    }
+                },
+            ));
+        }
+
         subscriptions.push(cx.observe(&prop_table_state, |_this, _model, cx| {
             cx.notify();
         }));
@@ -493,6 +616,15 @@ impl ConfigView {
         subscriptions.push(cx.observe(&service_table_state, |_this, _model, cx| {
             cx.notify();
         }));
+        subscriptions.push(cx.on_blur(
+            &table_cell_input.read(cx).focus_handle(cx),
+            window,
+            |this, _window, cx| {
+                if this.active_table_cell.take().is_some() {
+                    cx.notify();
+                }
+            },
+        ));
 
         // Subscribe to config state changes. We use observe_in (instead of observe) so
         // that the callback receives a Window — sync_topic_stream_with_selection needs
@@ -557,6 +689,8 @@ impl ConfigView {
             event_filter_inputs,
             event_table_scroll_handle: ScrollHandle::default(),
             event_table_horizontal_scroll_handle: ScrollHandle::default(),
+            table_cell_input,
+            active_table_cell: None,
             service_table_state,
             service_form,
             service_table_horizontal_scroll_handle: ScrollHandle::default(),
@@ -581,6 +715,27 @@ impl ConfigView {
     /// Get the locale string
     fn locale(&self, cx: &App) -> String {
         cx.global::<DfcGlobalStore>().read(cx).locale().to_string()
+    }
+
+    fn activate_table_cell(
+        &mut self,
+        cell: TableCellId,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.table_cell_input.update(cx, |state, cx| {
+            state.set_value(text.to_string(), window, cx);
+        });
+        self.active_table_cell = Some(cell);
+
+        let input = self.table_cell_input.clone();
+        window.defer(cx, move |window, cx| {
+            let handle = input.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+        });
+        cx.notify();
     }
 
     fn agent_id_matches_query(&self, agent_id: &str, query: &str) -> bool {
@@ -720,11 +875,22 @@ impl ConfigView {
                 state.set_value("".to_string(), window, cx);
             });
         }
+        for calendar in self.prop_filter_inputs.calendars() {
+            calendar.update(cx, |state, cx| {
+                state.set_date(Date::Single(None), window, cx);
+            });
+        }
         for entity in self.event_filter_inputs.all() {
             entity.update(cx, |state, cx| {
                 state.set_value("".to_string(), window, cx);
             });
         }
+        for calendar in self.event_filter_inputs.calendars() {
+            calendar.update(cx, |state, cx| {
+                state.set_date(Date::Single(None), window, cx);
+            });
+        }
+        self.active_table_cell = None;
 
         // Stop any existing stream and reset state if needed.
         self.stop_prop_stream();
@@ -1780,11 +1946,7 @@ impl ConfigView {
     }
 
     /// Render the right panel with topic tabs for selected agent
-    fn render_agent_topics(
-        &self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_agent_topics(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let locale = self.locale(cx);
 
         // Collect data first to avoid borrow conflicts
@@ -1895,14 +2057,14 @@ impl ConfigView {
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .child(match selected_topic_path.as_deref() {
-                        Some(topic_path) if is_prop_topic => {
-                            self.render_prop_table(topic_path, cx).into_any_element()
-                        }
-                        Some(topic_path) if is_event_topic => {
-                            self.render_event_table(topic_path, cx).into_any_element()
-                        }
+                        Some(topic_path) if is_prop_topic => self
+                            .render_prop_table(topic_path, window, cx)
+                            .into_any_element(),
+                        Some(topic_path) if is_event_topic => self
+                            .render_event_table(topic_path, window, cx)
+                            .into_any_element(),
                         Some(_) if is_service_topic => {
-                            self.render_service_panel(cx).into_any_element()
+                            self.render_service_panel(window, cx).into_any_element()
                         }
                         Some(topic_path) => self
                             .render_unsupported_topic(topic_path, cx)
@@ -1968,6 +2130,7 @@ impl ConfigView {
     fn render_prop_table(
         &self,
         selected_topic_path: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let border = cx.theme().border;
@@ -2039,16 +2202,76 @@ impl ConfigView {
                     .bg(bg)
                     .border_b_1()
                     .border_color(border)
-                    .child(self.render_prop_cell(180.0, &row.global_uuid, cx))
-                    .child(self.render_prop_cell(110.0, &row.device, cx))
-                    .child(self.render_prop_cell(320.0, &row.imr, cx))
-                    .child(self.render_prop_cell(90.0, &row.imid.to_string(), cx))
-                    .child(self.render_prop_cell(120.0, &row.value, cx))
-                    .child(self.render_prop_cell(90.0, &row.quality.to_string(), cx))
-                    .child(self.render_prop_cell(140.0, &row.bcrid, cx))
-                    .child(self.render_prop_cell(180.0, &row.time, cx))
-                    .child(self.render_prop_cell(180.0, &row.message_time, cx))
-                    .child(self.render_prop_cell(240.0, &row.summary, cx)),
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-global-uuid"),
+                        180.0,
+                        &row.global_uuid,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-device"),
+                        110.0,
+                        &row.device,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-imr"),
+                        320.0,
+                        &row.imr,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-imid"),
+                        90.0,
+                        &row.imid.to_string(),
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-value"),
+                        120.0,
+                        &row.value,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-quality"),
+                        90.0,
+                        &row.quality.to_string(),
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-bcrid"),
+                        140.0,
+                        &row.bcrid,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-time"),
+                        180.0,
+                        &row.time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-message-time"),
+                        180.0,
+                        &row.message_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "prop-summary"),
+                        240.0,
+                        &row.summary,
+                        window,
+                        cx,
+                    )),
             );
         }
 
@@ -2202,6 +2425,7 @@ impl ConfigView {
     fn render_event_table(
         &self,
         selected_topic_path: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let border = cx.theme().border;
@@ -2273,19 +2497,97 @@ impl ConfigView {
                     .bg(bg)
                     .border_b_1()
                     .border_color(border)
-                    .child(self.render_prop_cell(220.0, &row.uuid, cx))
-                    .child(self.render_prop_cell(110.0, &row.device, cx))
-                    .child(self.render_prop_cell(320.0, &row.imr, cx))
-                    .child(self.render_prop_cell(140.0, &row.event_type, cx))
-                    .child(self.render_prop_cell(90.0, &row.level, cx))
-                    .child(self.render_prop_cell(160.0, &row.tags, cx))
-                    .child(self.render_prop_cell(140.0, &row.codes, cx))
-                    .child(self.render_prop_cell(160.0, &row.str_codes, cx))
-                    .child(self.render_prop_cell(180.0, &row.happened_time, cx))
-                    .child(self.render_prop_cell(180.0, &row.record_time, cx))
-                    .child(self.render_prop_cell(140.0, &row.bcr_id, cx))
-                    .child(self.render_prop_cell(260.0, &row.context, cx))
-                    .child(self.render_prop_cell(240.0, &row.summary, cx)),
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-uuid"),
+                        220.0,
+                        &row.uuid,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-device"),
+                        110.0,
+                        &row.device,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-imr"),
+                        320.0,
+                        &row.imr,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-type"),
+                        140.0,
+                        &row.event_type,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-level"),
+                        90.0,
+                        &row.level,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-tags"),
+                        160.0,
+                        &row.tags,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-codes"),
+                        140.0,
+                        &row.codes,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-str-codes"),
+                        160.0,
+                        &row.str_codes,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-happened-time"),
+                        180.0,
+                        &row.happened_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-record-time"),
+                        180.0,
+                        &row.record_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-bcr-id"),
+                        140.0,
+                        &row.bcr_id,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-context"),
+                        260.0,
+                        &row.context,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "event-summary"),
+                        240.0,
+                        &row.summary,
+                        window,
+                        cx,
+                    )),
             );
         }
 
@@ -2453,7 +2755,11 @@ impl ConfigView {
             .into_any_element()
     }
 
-    fn render_service_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_service_panel(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let border = cx.theme().border;
         let muted_fg = cx.theme().muted_foreground;
         let secondary_bg = cx.theme().secondary;
@@ -2616,18 +2922,90 @@ impl ConfigView {
                     .bg(bg)
                     .border_b_1()
                     .border_color(border)
-                    .child(self.render_prop_cell(140.0, &row.device, cx))
-                    .child(self.render_prop_cell(280.0, &row.imr, cx))
-                    .child(self.render_prop_cell(180.0, &row.request_time, cx))
-                    .child(self.render_prop_cell(110.0, &row.timeout_ms.to_string(), cx))
-                    .child(self.render_prop_cell(90.0, is_test_text, cx))
-                    .child(self.render_prop_cell(110.0, &row.requester, cx))
-                    .child(self.render_prop_cell(220.0, &row.args_json, cx))
-                    .child(self.render_prop_cell(280.0, &row.uuid, cx))
-                    .child(self.render_prop_cell(180.0, &row.response_time, cx))
-                    .child(self.render_prop_cell(140.0, &row.response_code_hex, cx))
-                    .child(self.render_prop_cell(110.0, &row.responser, cx))
-                    .child(self.render_prop_cell(120.0, &row.summary, cx)),
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-device"),
+                        140.0,
+                        &row.device,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-imr"),
+                        280.0,
+                        &row.imr,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-request-time"),
+                        180.0,
+                        &row.request_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-timeout-ms"),
+                        110.0,
+                        &row.timeout_ms.to_string(),
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-is-test"),
+                        90.0,
+                        is_test_text,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-requester"),
+                        110.0,
+                        &row.requester,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-args-json"),
+                        220.0,
+                        &row.args_json,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-uuid"),
+                        280.0,
+                        &row.uuid,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-response-time"),
+                        180.0,
+                        &row.response_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-response-code"),
+                        140.0,
+                        &row.response_code_hex,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-responser"),
+                        110.0,
+                        &row.responser,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-req-summary"),
+                        120.0,
+                        &row.summary,
+                        window,
+                        cx,
+                    )),
             );
         }
 
@@ -2720,13 +3098,55 @@ impl ConfigView {
                     .bg(bg)
                     .border_b_1()
                     .border_color(border)
-                    .child(self.render_prop_cell(280.0, &row.request_uuid, cx))
-                    .child(self.render_prop_cell(280.0, &row.response_uuid, cx))
-                    .child(self.render_prop_cell(180.0, &row.response_time, cx))
-                    .child(self.render_prop_cell(140.0, &row.response_code_hex, cx))
-                    .child(self.render_prop_cell(110.0, &row.responser, cx))
-                    .child(self.render_prop_cell(180.0, &row.receive_time, cx))
-                    .child(self.render_prop_cell(370.0, &row.summary, cx)),
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-request-uuid"),
+                        280.0,
+                        &row.request_uuid,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-response-uuid"),
+                        280.0,
+                        &row.response_uuid,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-response-time"),
+                        180.0,
+                        &row.response_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-response-code"),
+                        140.0,
+                        &row.response_code_hex,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-responser"),
+                        110.0,
+                        &row.responser,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-receive-time"),
+                        180.0,
+                        &row.receive_time,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_prop_cell(
+                        TableCellId::new(row.uid, "svc-resp-summary"),
+                        370.0,
+                        &row.summary,
+                        window,
+                        cx,
+                    )),
             );
         }
 
@@ -2933,6 +3353,7 @@ impl ConfigView {
         let column_id = column as usize;
 
         let input_entity = self.prop_filter_inputs.entity(column).clone();
+        let calendar_entity = self.prop_filter_inputs.calendar(column).cloned();
 
         let trigger_button = Button::new(("prop-filter-trig", column_id))
             .ghost()
@@ -2945,25 +3366,41 @@ impl ConfigView {
             .trigger(trigger_button)
             .content(move |_state, _window, _cx| {
                 let input_for_clear = input_entity.clone();
-                v_flex()
-                    .gap_2()
-                    .w(px(240.0))
-                    .p_2()
-                    .child(Input::new(&input_entity).cleanable(true).small())
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new(("prop-filter-clear", column_id))
-                                .ghost()
-                                .compact()
-                                .small()
-                                .label("清除")
-                                .on_click(move |_, window, cx| {
-                                    input_for_clear.update(cx, |state, cx| {
-                                        state.set_value("".to_string(), window, cx);
+                let calendar_for_clear = calendar_entity.clone();
+                let control = if let Some(calendar) = calendar_entity.as_ref() {
+                    Calendar::new(calendar)
+                        .number_of_months(1)
+                        .small()
+                        .border_0()
+                        .rounded_none()
+                        .p_0()
+                        .into_any_element()
+                } else {
+                    Input::new(&input_entity)
+                        .cleanable(true)
+                        .small()
+                        .into_any_element()
+                };
+
+                v_flex().gap_2().w(px(240.0)).p_2().child(control).child(
+                    h_flex().justify_end().child(
+                        Button::new(("prop-filter-clear", column_id))
+                            .ghost()
+                            .compact()
+                            .small()
+                            .label("清除")
+                            .on_click(move |_, window, cx| {
+                                input_for_clear.update(cx, |state, cx| {
+                                    state.set_value("".to_string(), window, cx);
+                                });
+                                if let Some(calendar) = calendar_for_clear.as_ref() {
+                                    calendar.update(cx, |state, cx| {
+                                        state.set_date(Date::Single(None), window, cx);
                                     });
-                                }),
-                        ),
-                    )
+                                }
+                            }),
+                    ),
+                )
             });
 
         div()
@@ -3049,6 +3486,7 @@ impl ConfigView {
         let column_id = column as usize;
 
         let input_entity = self.event_filter_inputs.entity(column).clone();
+        let calendar_entity = self.event_filter_inputs.calendar(column).cloned();
 
         let trigger_button = Button::new(("event-filter-trig", column_id))
             .ghost()
@@ -3061,25 +3499,41 @@ impl ConfigView {
             .trigger(trigger_button)
             .content(move |_state, _window, _cx| {
                 let input_for_clear = input_entity.clone();
-                v_flex()
-                    .gap_2()
-                    .w(px(240.0))
-                    .p_2()
-                    .child(Input::new(&input_entity).cleanable(true).small())
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new(("event-filter-clear", column_id))
-                                .ghost()
-                                .compact()
-                                .small()
-                                .label("清除")
-                                .on_click(move |_, window, cx| {
-                                    input_for_clear.update(cx, |state, cx| {
-                                        state.set_value("".to_string(), window, cx);
+                let calendar_for_clear = calendar_entity.clone();
+                let control = if let Some(calendar) = calendar_entity.as_ref() {
+                    Calendar::new(calendar)
+                        .number_of_months(1)
+                        .small()
+                        .border_0()
+                        .rounded_none()
+                        .p_0()
+                        .into_any_element()
+                } else {
+                    Input::new(&input_entity)
+                        .cleanable(true)
+                        .small()
+                        .into_any_element()
+                };
+
+                v_flex().gap_2().w(px(240.0)).p_2().child(control).child(
+                    h_flex().justify_end().child(
+                        Button::new(("event-filter-clear", column_id))
+                            .ghost()
+                            .compact()
+                            .small()
+                            .label("清除")
+                            .on_click(move |_, window, cx| {
+                                input_for_clear.update(cx, |state, cx| {
+                                    state.set_value("".to_string(), window, cx);
+                                });
+                                if let Some(calendar) = calendar_for_clear.as_ref() {
+                                    calendar.update(cx, |state, cx| {
+                                        state.set_date(Date::Single(None), window, cx);
                                     });
-                                }),
-                        ),
-                    )
+                                }
+                            }),
+                    ),
+                )
             });
 
         div()
@@ -3126,14 +3580,48 @@ impl ConfigView {
             )
     }
 
-    fn render_prop_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_prop_cell(
+        &self,
+        cell: TableCellId,
+        w: f32,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = text.to_string();
+        let value = label.clone();
+        let is_active = self.active_table_cell == Some(cell);
+
         div()
             .w(px(w))
+            .h(px(36.0))
             .px_2()
             .py_2()
             .border_r_1()
             .border_color(cx.theme().border)
-            .child(Label::new(text.to_string()).text_sm().text_ellipsis())
+            .overflow_hidden()
+            .cursor_text()
+            .when(is_active, |this| {
+                this.child(
+                    Input::new(&self.table_cell_input)
+                        .appearance(false)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .disabled(true)
+                        .small()
+                        .h_full()
+                        .size_full(),
+                )
+            })
+            .when(!is_active, |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.activate_table_cell(cell, &value, window, cx);
+                    }),
+                )
+                .child(Label::new(label).text_sm().text_ellipsis())
+            })
     }
 
     fn render_prop_pagination(&self, cx: &mut Context<Self>) -> impl IntoElement {

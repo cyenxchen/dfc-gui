@@ -533,6 +533,24 @@ mod tests {
             "2026-04-14 11:33:03.000"
         );
     }
+
+    #[test]
+    fn time_filters_match_whole_day_prefix() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        let mut first = prop_row(1, "2026-04-14 11:33:03.000");
+        first.time = "2026-04-14 00:00:01.000".to_string();
+        let mut second = prop_row(2, "2026-04-15 11:33:03.000");
+        second.time = "2026-04-15 00:00:01.000".to_string();
+
+        state.push_rows_front(vec![first, second]);
+        state.set_filter(PropSortColumn::Time, "2026-04-14".to_string());
+
+        let rows = state.page_rows_owned();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].time, "2026-04-14 00:00:01.000");
+    }
 }
 
 fn row_matches_lowered(row: &PropRow, needles: &[Option<String>; 10]) -> bool {
@@ -572,12 +590,12 @@ fn row_matches_lowered(row: &PropRow, needles: &[Option<String>; 10]) -> bool {
         }
     }
     if let Some(n) = &needles[7] {
-        if !matches_lowered(&row.time, n) {
+        if !matches_day_filter(&row.time, n) {
             return false;
         }
     }
     if let Some(n) = &needles[8] {
-        if !matches_lowered(&row.message_time, n) {
+        if !matches_day_filter(&row.message_time, n) {
             return false;
         }
     }
@@ -587,6 +605,10 @@ fn row_matches_lowered(row: &PropRow, needles: &[Option<String>; 10]) -> bool {
         }
     }
     true
+}
+
+fn matches_day_filter(timestamp: &str, day: &str) -> bool {
+    timestamp.starts_with(day)
 }
 
 impl Default for PropTableState {
