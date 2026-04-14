@@ -50,6 +50,9 @@ use tokio::sync::watch;
 const AGENT_LIST_WIDTH: f32 = 320.0;
 /// Height of the top bar for left/right panels (keeps alignment)
 const PANEL_TOPBAR_HEIGHT: f32 = 48.0;
+const TOPIC_FEEDBACK_TICK_MS: u64 = 120;
+const TOPIC_SWITCH_FEEDBACK_MS: u64 = 320;
+const TOPIC_FEEDBACK_FRAME_COUNT: usize = 6;
 
 #[derive(Debug)]
 enum PropStreamEvent {
@@ -62,6 +65,14 @@ enum EventStreamEvent {
     Rows(Vec<EventRow>),
     Error(String),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopicFeedbackKind {
+    Switching,
+    Loading,
+}
+
+type TopicSelectionKey = (Option<String>, Option<String>);
 
 fn topic_display_name(topic_path: &str) -> String {
     if topic_path.contains("thing_service-BZ-RESPONSE")
@@ -384,6 +395,11 @@ pub struct ConfigView {
     prop_row_uid: Arc<AtomicU64>,
     /// Monotonic event row id generator
     event_row_uid: Arc<AtomicU64>,
+    /// Animated frame for the right-side switching/loading feedback.
+    topic_feedback_frame: usize,
+    _topic_feedback_task: Option<Task<()>>,
+    last_selection_key: TopicSelectionKey,
+    switch_feedback_until: Option<Instant>,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
 }
@@ -708,6 +724,10 @@ impl ConfigView {
             event_ingest_task: None,
             prop_row_uid,
             event_row_uid,
+            topic_feedback_frame: 0,
+            _topic_feedback_task: None,
+            last_selection_key: (None, None),
+            switch_feedback_until: None,
             _subscriptions: subscriptions,
         }
     }
@@ -818,6 +838,303 @@ impl ConfigView {
             && topic_path.contains("thing_service-BZ-RESPONSE")
     }
 
+    fn current_selection_key(&self, cx: &App) -> TopicSelectionKey {
+        let state = self.config_state.read(cx);
+        let agent_id = state.selected_agent_id().map(str::to_string);
+        let topic_path = match (state.selected_agent(), state.selected_topic_index()) {
+            (Some(agent), Some(idx)) => agent.topics.get(idx as usize).map(|t| t.path.clone()),
+            _ => None,
+        };
+
+        (agent_id, topic_path)
+    }
+
+    fn topic_feedback_kind_for_panel(
+        &self,
+        selected_topic_path: &str,
+        active_topic_path: Option<&str>,
+        item_count: usize,
+        is_loading: bool,
+        allow_loading_feedback: bool,
+    ) -> Option<TopicFeedbackKind> {
+        if active_topic_path != Some(selected_topic_path) {
+            Some(TopicFeedbackKind::Switching)
+        } else if self.is_topic_switch_feedback_active() && item_count == 0 {
+            Some(TopicFeedbackKind::Switching)
+        } else if allow_loading_feedback && is_loading && item_count == 0 {
+            Some(TopicFeedbackKind::Loading)
+        } else {
+            None
+        }
+    }
+
+    fn current_topic_feedback_kind(&self, cx: &App) -> Option<TopicFeedbackKind> {
+        let (_, selected_topic_path) = self.current_selection_key(cx);
+
+        match selected_topic_path.as_deref() {
+            Some(topic_path) if Self::is_prop_topic_path(topic_path) => {
+                let state = self.prop_table_state.read(cx);
+                self.topic_feedback_kind_for_panel(
+                    topic_path,
+                    state.topic_path(),
+                    state.rows_len(),
+                    matches!(state.load_state(), PropTableLoadState::Loading),
+                    true,
+                )
+            }
+            Some(topic_path) if Self::is_event_topic_path(topic_path) => {
+                let state = self.event_table_state.read(cx);
+                self.topic_feedback_kind_for_panel(
+                    topic_path,
+                    state.topic_path(),
+                    state.rows_len(),
+                    matches!(state.load_state(), EventTableLoadState::Loading),
+                    true,
+                )
+            }
+            Some(topic_path) if Self::is_service_topic_path(topic_path) => {
+                let state = self.service_table_state.read(cx);
+                self.topic_feedback_kind_for_panel(
+                    topic_path,
+                    state.topic_path(),
+                    state.requests_len() + state.responses_len(),
+                    matches!(state.load_state(), ServiceTableLoadState::Loading),
+                    false,
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn has_active_feedback(&self, cx: &App) -> bool {
+        self.current_topic_feedback_kind(cx).is_some()
+    }
+
+    fn ensure_topic_feedback_task(&mut self, cx: &mut Context<Self>) {
+        if self._topic_feedback_task.is_some() || !self.has_active_feedback(cx) {
+            return;
+        }
+
+        let task = cx.spawn(async move |handle, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(TOPIC_FEEDBACK_TICK_MS))
+                    .await;
+
+                let Ok(still_active) = handle.update(cx, |this, cx| {
+                    let now = Instant::now();
+                    let mut should_notify = false;
+
+                    if this
+                        .switch_feedback_until
+                        .is_some_and(|deadline| deadline <= now)
+                    {
+                        this.switch_feedback_until = None;
+                        should_notify = true;
+                    }
+
+                    let still_active = this.has_active_feedback(cx);
+                    if still_active {
+                        this.topic_feedback_frame =
+                            (this.topic_feedback_frame + 1) % TOPIC_FEEDBACK_FRAME_COUNT;
+                        should_notify = true;
+                    }
+
+                    if should_notify {
+                        cx.notify();
+                    }
+
+                    still_active
+                }) else {
+                    break;
+                };
+
+                if !still_active {
+                    break;
+                }
+            }
+
+            let _ = handle.update(cx, |this, _| {
+                this._topic_feedback_task = None;
+            });
+        });
+
+        self._topic_feedback_task = Some(task);
+    }
+
+    fn render_topic_feedback_if_needed(
+        &self,
+        selected_topic_path: &str,
+        active_topic_path: Option<&str>,
+        item_count: usize,
+        is_loading: bool,
+        allow_loading_feedback: bool,
+        switching_subtitle: &str,
+        loading_subtitle: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let topic_label = topic_display_name(selected_topic_path);
+
+        match self.topic_feedback_kind_for_panel(
+            selected_topic_path,
+            active_topic_path,
+            item_count,
+            is_loading,
+            allow_loading_feedback,
+        ) {
+            Some(TopicFeedbackKind::Switching) => Some(
+                self.render_topic_feedback(
+                    TopicFeedbackKind::Switching,
+                    format!("正在切换到 {topic_label}"),
+                    switching_subtitle.to_string(),
+                    cx,
+                )
+                .into_any_element(),
+            ),
+            Some(TopicFeedbackKind::Loading) => Some(
+                self.render_topic_feedback(
+                    TopicFeedbackKind::Loading,
+                    format!("{topic_label} 等待数据"),
+                    loading_subtitle.to_string(),
+                    cx,
+                )
+                .into_any_element(),
+            ),
+            None => None,
+        }
+    }
+
+    fn is_topic_switch_feedback_active(&self) -> bool {
+        self.switch_feedback_until
+            .is_some_and(|deadline| deadline > Instant::now())
+    }
+
+    fn render_topic_feedback(
+        &self,
+        kind: TopicFeedbackKind,
+        title: String,
+        subtitle: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let frame = self.topic_feedback_frame % TOPIC_FEEDBACK_FRAME_COUNT;
+        let title = format!("{title}{}", ".".repeat(frame % 3 + 1));
+        let accent = match kind {
+            TopicFeedbackKind::Switching => cx.theme().primary,
+            TopicFeedbackKind::Loading => cx.theme().accent,
+        };
+        let border = accent.opacity(if cx.theme().is_dark() { 0.75 } else { 0.45 });
+        let badge_bg = accent.opacity(if cx.theme().is_dark() { 0.18 } else { 0.12 });
+        let panel_bg = if cx.theme().is_dark() {
+            cx.theme().secondary.opacity(0.35)
+        } else {
+            cx.theme().secondary.opacity(0.8)
+        };
+        let muted_fg = cx.theme().muted_foreground;
+        let active_segment = frame % 3;
+        let active_skeleton = frame % 4;
+
+        let mut progress_segments = Vec::new();
+        for idx in 0..3 {
+            let opacity = if idx == active_segment {
+                if cx.theme().is_dark() { 0.75 } else { 0.4 }
+            } else if (idx + 1) % 3 == active_segment {
+                if cx.theme().is_dark() { 0.4 } else { 0.22 }
+            } else if cx.theme().is_dark() {
+                0.18
+            } else {
+                0.1
+            };
+
+            progress_segments.push(
+                div()
+                    .flex_1()
+                    .h(px(6.0))
+                    .rounded_md()
+                    .bg(accent.opacity(opacity))
+                    .into_any_element(),
+            );
+        }
+
+        let skeleton_widths = [1.0_f32, 0.86_f32, 0.72_f32, 0.58_f32];
+        let mut skeleton_rows = Vec::new();
+        for (idx, width_ratio) in skeleton_widths.into_iter().enumerate() {
+            let opacity = if idx == active_skeleton {
+                if cx.theme().is_dark() { 0.28 } else { 0.16 }
+            } else if cx.theme().is_dark() {
+                0.14
+            } else {
+                0.08
+            };
+
+            skeleton_rows.push(
+                div()
+                    .w_full()
+                    .child(
+                        div()
+                            .h(px(11.0))
+                            .w(px(360.0 * width_ratio))
+                            .rounded_md()
+                            .bg(accent.opacity(opacity)),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex_1()
+            .h_0()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .p_6()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(560.0))
+                    .gap_4()
+                    .p_5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel_bg)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(badge_bg)
+                                    .child(
+                                        Label::new(match kind {
+                                            TopicFeedbackKind::Switching => "切换中",
+                                            TopicFeedbackKind::Loading => "加载中",
+                                        })
+                                        .text_sm()
+                                        .text_color(accent),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(title)
+                                            .text_sm()
+                                            .text_color(cx.theme().foreground),
+                                    )
+                                    .child(Label::new(subtitle).text_sm().text_color(muted_fg)),
+                            ),
+                    )
+                    .child(h_flex().w_full().gap_2().children(progress_segments))
+                    .child(v_flex().w_full().gap_2().children(skeleton_rows)),
+            )
+    }
+
     /// Returns `(request_topic, response_topic)` extracted from the comma-pair path.
     fn split_service_topic_path(topic_path: &str) -> Option<(String, String)> {
         let mut parts = topic_path.split(',').map(|s| s.trim().to_string());
@@ -840,13 +1157,18 @@ impl ConfigView {
     }
 
     fn sync_topic_stream_with_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected_topic_path: Option<String> = {
-            let state = self.config_state.read(cx);
-            match (state.selected_agent(), state.selected_topic_index()) {
-                (Some(agent), Some(idx)) => agent.topics.get(idx as usize).map(|t| t.path.clone()),
-                _ => None,
-            }
-        };
+        let selection_key = self.current_selection_key(cx);
+        let selected_topic_path = selection_key.1.clone();
+
+        if self.last_selection_key != selection_key {
+            self.last_selection_key = selection_key.clone();
+            self.switch_feedback_until = selected_topic_path
+                .as_ref()
+                .map(|_| Instant::now() + Duration::from_millis(TOPIC_SWITCH_FEEDBACK_MS));
+            self.topic_feedback_frame = 0;
+        }
+
+        self.ensure_topic_feedback_task(cx);
 
         let selected_prop_topic = selected_topic_path
             .as_deref()
@@ -2075,9 +2397,9 @@ impl ConfigView {
                         Some(topic_path) if is_event_topic => self
                             .render_event_table(topic_path, window, cx)
                             .into_any_element(),
-                        Some(_) if is_service_topic => {
-                            self.render_service_panel(window, cx).into_any_element()
-                        }
+                        Some(topic_path) if is_service_topic => self
+                            .render_service_panel(topic_path, window, cx)
+                            .into_any_element(),
                         Some(topic_path) => self
                             .render_unsupported_topic(topic_path, cx)
                             .into_any_element(),
@@ -2147,27 +2469,26 @@ impl ConfigView {
     ) -> impl IntoElement {
         let border = cx.theme().border;
         let header_bg = cx.theme().secondary;
-        let muted_fg = cx.theme().muted_foreground;
 
-        let (topic_path, load_state, page_rows, total_rows) = {
+        let (topic_path, load_state, total_rows) = {
             let state = self.prop_table_state.read(cx);
             (
                 state.topic_path().map(|s| s.to_string()),
                 state.load_state().clone(),
-                state.page_rows_owned(),
                 state.rows_len(),
             )
         };
-
-        if topic_path.as_deref() != Some(selected_topic_path) {
-            return div()
-                .flex_1()
-                .h_0()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .p_4()
-                .child(Label::new("正在切换 Topic…").text_color(muted_fg))
-                .into_any_element();
+        if let Some(feedback) = self.render_topic_feedback_if_needed(
+            selected_topic_path,
+            topic_path.as_deref(),
+            total_rows,
+            matches!(&load_state, PropTableLoadState::Loading),
+            true,
+            "正在停止旧订阅并准备新 Topic",
+            "正在建立订阅并等待首批消息",
+            cx,
+        ) {
+            return feedback;
         }
 
         match &load_state {
@@ -2181,18 +2502,10 @@ impl ConfigView {
                     .child(Label::new(format!("加载失败: {msg}")).text_color(cx.theme().danger))
                     .into_any_element();
             }
-            PropTableLoadState::Loading if total_rows == 0 => {
-                return div()
-                    .flex_1()
-                    .h_0()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    .p_4()
-                    .child(Label::new("等待数据…").text_color(muted_fg))
-                    .into_any_element();
-            }
             _ => {}
         }
+
+        let page_rows = self.prop_table_state.read(cx).page_rows_owned();
 
         // Build rows
         let mut rows = Vec::new();
@@ -2442,28 +2755,27 @@ impl ConfigView {
     ) -> impl IntoElement {
         let border = cx.theme().border;
         let header_bg = cx.theme().secondary;
-        let muted_fg = cx.theme().muted_foreground;
         let table_width = 2_540.0;
 
-        let (topic_path, load_state, page_rows, total_rows) = {
+        let (topic_path, load_state, total_rows) = {
             let state = self.event_table_state.read(cx);
             (
                 state.topic_path().map(|s| s.to_string()),
                 state.load_state().clone(),
-                state.page_rows_owned(),
                 state.rows_len(),
             )
         };
-
-        if topic_path.as_deref() != Some(selected_topic_path) {
-            return div()
-                .flex_1()
-                .h_0()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .p_4()
-                .child(Label::new("正在切换 Topic…").text_color(muted_fg))
-                .into_any_element();
+        if let Some(feedback) = self.render_topic_feedback_if_needed(
+            selected_topic_path,
+            topic_path.as_deref(),
+            total_rows,
+            matches!(&load_state, EventTableLoadState::Loading),
+            true,
+            "正在停止旧订阅并准备新 Topic",
+            "正在建立订阅并等待首批消息",
+            cx,
+        ) {
+            return feedback;
         }
 
         match &load_state {
@@ -2477,18 +2789,10 @@ impl ConfigView {
                     .child(Label::new(format!("加载失败: {msg}")).text_color(cx.theme().danger))
                     .into_any_element();
             }
-            EventTableLoadState::Loading if total_rows == 0 => {
-                return div()
-                    .flex_1()
-                    .h_0()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    .p_4()
-                    .child(Label::new("等待数据…").text_color(muted_fg))
-                    .into_any_element();
-            }
             _ => {}
         }
+
+        let page_rows = self.event_table_state.read(cx).page_rows_owned();
 
         let mut rows = Vec::new();
         for (idx, row) in page_rows.iter().enumerate() {
@@ -2769,6 +3073,7 @@ impl ConfigView {
 
     fn render_service_panel(
         &self,
+        selected_topic_path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2776,15 +3081,31 @@ impl ConfigView {
         let muted_fg = cx.theme().muted_foreground;
         let secondary_bg = cx.theme().secondary;
 
-        let (request_rows, response_rows, total_requests, total_responses, load_state) = {
+        let (topic_path, total_requests, total_responses, load_state) = {
             let state = self.service_table_state.read(cx);
             (
-                state.req_page_rows_owned(),
-                state.resp_page_rows_owned(),
+                state.topic_path().map(|s| s.to_string()),
                 state.requests_len(),
                 state.responses_len(),
                 state.load_state().clone(),
             )
+        };
+        if let Some(feedback) = self.render_topic_feedback_if_needed(
+            selected_topic_path,
+            topic_path.as_deref(),
+            total_requests + total_responses,
+            matches!(&load_state, ServiceTableLoadState::Loading),
+            false,
+            "正在同步 service 请求/响应通道",
+            "正在建立请求/响应监听",
+            cx,
+        ) {
+            return feedback;
+        }
+
+        let (request_rows, response_rows) = {
+            let state = self.service_table_state.read(cx);
+            (state.req_page_rows_owned(), state.resp_page_rows_owned())
         };
 
         let error_banner = if let ServiceTableLoadState::Error(msg) = &load_state {
