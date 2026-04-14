@@ -1,8 +1,12 @@
 //! String manipulation and cryptography utilities.
 //!
 //! This module provides utility functions for:
+//! - Case-insensitive substring matching
+//! - String comparison that prefers numeric ordering when both sides parse as u64
 //! - AES-256-GCM encryption and decryption for sensitive data (e.g., passwords)
 //! - Base64 encoding/decoding for storage and transport
+
+use std::cmp::Ordering;
 
 use crate::error::Error;
 use aes_gcm::{
@@ -12,6 +16,22 @@ use aes_gcm::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Case-insensitive substring containment. Empty needle matches anything.
+pub fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// Compare two strings numerically when both parse as u64; otherwise lexicographically.
+pub fn cmp_u64ish(a: &str, b: &str) -> Ordering {
+    match (a.trim().parse::<u64>(), b.trim().parse::<u64>()) {
+        (Ok(va), Ok(vb)) => va.cmp(&vb),
+        _ => a.cmp(b),
+    }
+}
 
 /// Master encryption key for AES-256-GCM cipher.
 ///

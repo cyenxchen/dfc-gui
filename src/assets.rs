@@ -76,6 +76,8 @@ pub enum CustomIconName {
     ChevronUp,
     /// Equal icon (for query mode)
     Equal,
+    /// Filter funnel icon (for column header filters)
+    Filter,
 }
 
 impl CustomIconName {
@@ -97,6 +99,7 @@ impl CustomIconName {
             CustomIconName::DatabaseZap => "icons/database-zap.svg",
             CustomIconName::ChevronUp => "icons/chevron-up.svg",
             CustomIconName::Equal => "icons/equal.svg",
+            CustomIconName::Filter => "icons/filter.svg",
         }
         .into()
     }

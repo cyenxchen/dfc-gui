@@ -12,15 +12,15 @@ use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, EventRow, EventTableLoadState, EventTableState,
-    KeysState, PropRow, PropSortColumn, PropTableLoadState, PropTableState, ServiceRequestRow,
-    ServiceTableLoadState, ServiceTableState, SortDirection,
+    ConfigState, DfcAppState, DfcGlobalStore, EventRow, EventSortColumn, EventTableLoadState,
+    EventTableState, KeysState, PropRow, PropSortColumn, PropTableLoadState, PropTableState,
+    ServiceRequestRow, ServiceTableLoadState, ServiceTableState, SortDirection,
 };
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
 use gpui::{
-    Action, App, Context, Corner, Entity, ScrollHandle, ScrollWheelEvent,
+    Action, App, Context, Corner, Entity, MouseButton, ScrollHandle, ScrollWheelEvent,
     StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::{
@@ -30,6 +30,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     label::Label,
+    popover::Popover,
     radio::Radio,
     scroll::{Scrollbar, ScrollbarShow},
     tooltip::Tooltip,
@@ -151,6 +152,115 @@ pub struct ServiceFormState {
     pub error_message: Option<String>,
 }
 
+/// Per-column filter input states for the prop topic table.
+struct PropFilterInputs {
+    global_uuid: Entity<InputState>,
+    device: Entity<InputState>,
+    imr: Entity<InputState>,
+    imid: Entity<InputState>,
+    value: Entity<InputState>,
+    quality: Entity<InputState>,
+    bcrid: Entity<InputState>,
+    time: Entity<InputState>,
+    message_time: Entity<InputState>,
+    summary: Entity<InputState>,
+}
+
+impl PropFilterInputs {
+    fn entity(&self, col: PropSortColumn) -> &Entity<InputState> {
+        match col {
+            PropSortColumn::GlobalUuid => &self.global_uuid,
+            PropSortColumn::Device => &self.device,
+            PropSortColumn::Imr => &self.imr,
+            PropSortColumn::Imid => &self.imid,
+            PropSortColumn::Value => &self.value,
+            PropSortColumn::Quality => &self.quality,
+            PropSortColumn::Bcrid => &self.bcrid,
+            PropSortColumn::Time => &self.time,
+            PropSortColumn::MessageTime => &self.message_time,
+            PropSortColumn::Summary => &self.summary,
+        }
+    }
+
+    fn all(&self) -> [&Entity<InputState>; 10] {
+        [
+            &self.global_uuid,
+            &self.device,
+            &self.imr,
+            &self.imid,
+            &self.value,
+            &self.quality,
+            &self.bcrid,
+            &self.time,
+            &self.message_time,
+            &self.summary,
+        ]
+    }
+}
+
+/// Per-column filter input states for the event topic table.
+struct EventFilterInputs {
+    uuid: Entity<InputState>,
+    device: Entity<InputState>,
+    imr: Entity<InputState>,
+    event_type: Entity<InputState>,
+    level: Entity<InputState>,
+    tags: Entity<InputState>,
+    codes: Entity<InputState>,
+    str_codes: Entity<InputState>,
+    happened_time: Entity<InputState>,
+    record_time: Entity<InputState>,
+    bcr_id: Entity<InputState>,
+    context: Entity<InputState>,
+    summary: Entity<InputState>,
+}
+
+impl EventFilterInputs {
+    fn entity(&self, col: EventSortColumn) -> &Entity<InputState> {
+        match col {
+            EventSortColumn::Uuid => &self.uuid,
+            EventSortColumn::Device => &self.device,
+            EventSortColumn::Imr => &self.imr,
+            EventSortColumn::EventType => &self.event_type,
+            EventSortColumn::Level => &self.level,
+            EventSortColumn::Tags => &self.tags,
+            EventSortColumn::Codes => &self.codes,
+            EventSortColumn::StrCodes => &self.str_codes,
+            EventSortColumn::HappenedTime => &self.happened_time,
+            EventSortColumn::RecordTime => &self.record_time,
+            EventSortColumn::BcrId => &self.bcr_id,
+            EventSortColumn::Context => &self.context,
+            EventSortColumn::Summary => &self.summary,
+        }
+    }
+
+    fn all(&self) -> [&Entity<InputState>; 13] {
+        [
+            &self.uuid,
+            &self.device,
+            &self.imr,
+            &self.event_type,
+            &self.level,
+            &self.tags,
+            &self.codes,
+            &self.str_codes,
+            &self.happened_time,
+            &self.record_time,
+            &self.bcr_id,
+            &self.context,
+            &self.summary,
+        ]
+    }
+}
+
+fn new_filter_input(window: &mut Window, cx: &mut Context<ConfigView>) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .clean_on_escape()
+            .placeholder("过滤...")
+    })
+}
+
 /// Configuration view component
 pub struct ConfigView {
     /// App state entity
@@ -164,12 +274,16 @@ pub struct ConfigView {
     agent_query_mode: AgentQueryMode,
     /// Prop topic table state (for `prop_data` topics)
     prop_table_state: Entity<PropTableState>,
+    /// Per-column filter inputs for the prop topic table
+    prop_filter_inputs: PropFilterInputs,
     /// Scroll handle for the visible body scrollbar in the prop table
     prop_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the prop table header and body
     prop_table_horizontal_scroll_handle: ScrollHandle,
     /// Event topic table state (for `thing_event` topics)
     event_table_state: Entity<EventTableState>,
+    /// Per-column filter inputs for the event topic table
+    event_filter_inputs: EventFilterInputs,
     /// Scroll handle for the visible body scrollbar in the event table
     event_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the event table header and body
@@ -268,6 +382,84 @@ impl ConfigView {
             error_message: None,
         };
 
+        let prop_filter_inputs = PropFilterInputs {
+            global_uuid: new_filter_input(window, cx),
+            device: new_filter_input(window, cx),
+            imr: new_filter_input(window, cx),
+            imid: new_filter_input(window, cx),
+            value: new_filter_input(window, cx),
+            quality: new_filter_input(window, cx),
+            bcrid: new_filter_input(window, cx),
+            time: new_filter_input(window, cx),
+            message_time: new_filter_input(window, cx),
+            summary: new_filter_input(window, cx),
+        };
+
+        let event_filter_inputs = EventFilterInputs {
+            uuid: new_filter_input(window, cx),
+            device: new_filter_input(window, cx),
+            imr: new_filter_input(window, cx),
+            event_type: new_filter_input(window, cx),
+            level: new_filter_input(window, cx),
+            tags: new_filter_input(window, cx),
+            codes: new_filter_input(window, cx),
+            str_codes: new_filter_input(window, cx),
+            happened_time: new_filter_input(window, cx),
+            record_time: new_filter_input(window, cx),
+            bcr_id: new_filter_input(window, cx),
+            context: new_filter_input(window, cx),
+            summary: new_filter_input(window, cx),
+        };
+
+        for (col, entity) in [
+            (PropSortColumn::GlobalUuid, prop_filter_inputs.global_uuid.clone()),
+            (PropSortColumn::Device, prop_filter_inputs.device.clone()),
+            (PropSortColumn::Imr, prop_filter_inputs.imr.clone()),
+            (PropSortColumn::Imid, prop_filter_inputs.imid.clone()),
+            (PropSortColumn::Value, prop_filter_inputs.value.clone()),
+            (PropSortColumn::Quality, prop_filter_inputs.quality.clone()),
+            (PropSortColumn::Bcrid, prop_filter_inputs.bcrid.clone()),
+            (PropSortColumn::Time, prop_filter_inputs.time.clone()),
+            (PropSortColumn::MessageTime, prop_filter_inputs.message_time.clone()),
+            (PropSortColumn::Summary, prop_filter_inputs.summary.clone()),
+        ] {
+            subscriptions.push(cx.subscribe(&entity, move |this, state, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = state.read(cx).value().to_string();
+                    this.prop_table_state.update(cx, |s, cx| {
+                        s.set_filter(col, value);
+                        cx.notify();
+                    });
+                }
+            }));
+        }
+
+        for (col, entity) in [
+            (EventSortColumn::Uuid, event_filter_inputs.uuid.clone()),
+            (EventSortColumn::Device, event_filter_inputs.device.clone()),
+            (EventSortColumn::Imr, event_filter_inputs.imr.clone()),
+            (EventSortColumn::EventType, event_filter_inputs.event_type.clone()),
+            (EventSortColumn::Level, event_filter_inputs.level.clone()),
+            (EventSortColumn::Tags, event_filter_inputs.tags.clone()),
+            (EventSortColumn::Codes, event_filter_inputs.codes.clone()),
+            (EventSortColumn::StrCodes, event_filter_inputs.str_codes.clone()),
+            (EventSortColumn::HappenedTime, event_filter_inputs.happened_time.clone()),
+            (EventSortColumn::RecordTime, event_filter_inputs.record_time.clone()),
+            (EventSortColumn::BcrId, event_filter_inputs.bcr_id.clone()),
+            (EventSortColumn::Context, event_filter_inputs.context.clone()),
+            (EventSortColumn::Summary, event_filter_inputs.summary.clone()),
+        ] {
+            subscriptions.push(cx.subscribe(&entity, move |this, state, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = state.read(cx).value().to_string();
+                    this.event_table_state.update(cx, |s, cx| {
+                        s.set_filter(col, value);
+                        cx.notify();
+                    });
+                }
+            }));
+        }
+
         subscriptions.push(cx.observe(&prop_table_state, |_this, _model, cx| {
             cx.notify();
         }));
@@ -278,26 +470,32 @@ impl ConfigView {
             cx.notify();
         }));
 
-        // Subscribe to config state changes
-        subscriptions.push(cx.observe(&config_state, |this, _model, cx| {
-            let query = this.agent_search_state.read(cx).value().trim().to_string();
-            if !query.is_empty() {
-                let selected = this
-                    .config_state
-                    .read(cx)
-                    .selected_agent_id()
-                    .map(|s| s.to_string());
-                if let Some(selected) = selected {
-                    if !this.agent_id_matches_query(&selected, &query) {
-                        this.config_state.update(cx, |state, cx| {
-                            state.select_agent(None, cx);
-                        });
+        // Subscribe to config state changes. We use observe_in (instead of observe) so
+        // that the callback receives a Window — sync_topic_stream_with_selection needs
+        // it to clear filter input fields on topic transitions.
+        subscriptions.push(cx.observe_in(
+            &config_state,
+            window,
+            |this, _model, window, cx| {
+                let query = this.agent_search_state.read(cx).value().trim().to_string();
+                if !query.is_empty() {
+                    let selected = this
+                        .config_state
+                        .read(cx)
+                        .selected_agent_id()
+                        .map(|s| s.to_string());
+                    if let Some(selected) = selected {
+                        if !this.agent_id_matches_query(&selected, &query) {
+                            this.config_state.update(cx, |state, cx| {
+                                state.select_agent(None, cx);
+                            });
+                        }
                     }
                 }
-            }
-            this.sync_topic_stream_with_selection(cx);
-            cx.notify();
-        }));
+                this.sync_topic_stream_with_selection(window, cx);
+                cx.notify();
+            },
+        ));
 
         // Subscribe to agent search input changes for filtering and selection clearing
         subscriptions.push(cx.subscribe(&agent_search_state, |this, state, event, cx| {
@@ -330,9 +528,11 @@ impl ConfigView {
             agent_search_state,
             agent_query_mode: AgentQueryMode::default(),
             prop_table_state,
+            prop_filter_inputs,
             prop_table_scroll_handle: ScrollHandle::default(),
             prop_table_horizontal_scroll_handle: ScrollHandle::default(),
             event_table_state,
+            event_filter_inputs,
             event_table_scroll_handle: ScrollHandle::default(),
             event_table_horizontal_scroll_handle: ScrollHandle::default(),
             service_table_state,
@@ -462,7 +662,11 @@ impl ConfigView {
         Some((req, resp))
     }
 
-    fn sync_topic_stream_with_selection(&mut self, cx: &mut Context<Self>) {
+    fn sync_topic_stream_with_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let selected_topic_path: Option<String> = {
             let state = self.config_state.read(cx);
             match (state.selected_agent(), state.selected_topic_index()) {
@@ -491,6 +695,17 @@ impl ConfigView {
             && self.active_service_topic == selected_service_topic
         {
             return;
+        }
+
+        for entity in self.prop_filter_inputs.all() {
+            entity.update(cx, |state, cx| {
+                state.set_value("".to_string(), window, cx);
+            });
+        }
+        for entity in self.event_filter_inputs.all() {
+            entity.update(cx, |state, cx| {
+                state.set_value("".to_string(), window, cx);
+            });
         }
 
         // Stop any existing stream and reset state if needed.
@@ -1852,61 +2067,61 @@ impl ConfigView {
                                     .bg(header_bg)
                                     .border_b_1()
                                     .border_color(border)
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         180.0,
                                         "全局UUID",
                                         PropSortColumn::GlobalUuid,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         110.0,
                                         "设备号",
                                         PropSortColumn::Device,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         320.0,
                                         "IMR",
                                         PropSortColumn::Imr,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         90.0,
                                         "IMID",
                                         PropSortColumn::Imid,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         120.0,
                                         "值",
                                         PropSortColumn::Value,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         90.0,
                                         "数据质量",
                                         PropSortColumn::Quality,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         140.0,
                                         "BCRID",
                                         PropSortColumn::Bcrid,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         180.0,
                                         "数据时间",
                                         PropSortColumn::Time,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         180.0,
                                         "报文时间",
                                         PropSortColumn::MessageTime,
                                         cx,
                                     ))
-                                    .child(self.render_prop_header_cell_sortable(
+                                    .child(self.render_filterable_prop_header_cell(
                                         240.0,
                                         "报文摘要",
                                         PropSortColumn::Summary,
@@ -2088,19 +2303,84 @@ impl ConfigView {
                                     .bg(header_bg)
                                     .border_b_1()
                                     .border_color(border)
-                                    .child(self.render_event_header_cell(220.0, "UUID", cx))
-                                    .child(self.render_event_header_cell(110.0, "设备", cx))
-                                    .child(self.render_event_header_cell(320.0, "IMR", cx))
-                                    .child(self.render_event_header_cell(140.0, "事件类型", cx))
-                                    .child(self.render_event_header_cell(90.0, "事件级别", cx))
-                                    .child(self.render_event_header_cell(160.0, "标签", cx))
-                                    .child(self.render_event_header_cell(140.0, "事件码(数字)", cx))
-                                    .child(self.render_event_header_cell(160.0, "事件码(KKS)", cx))
-                                    .child(self.render_event_header_cell(180.0, "发生时间", cx))
-                                    .child(self.render_event_header_cell(180.0, "记录时间", cx))
-                                    .child(self.render_event_header_cell(140.0, "BCRID", cx))
-                                    .child(self.render_event_header_cell(260.0, "事件上下文", cx))
-                                    .child(self.render_event_header_cell(240.0, "报文摘要", cx)),
+                                    .child(self.render_filterable_event_header_cell(
+                                        220.0,
+                                        "UUID",
+                                        EventSortColumn::Uuid,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        110.0,
+                                        "设备",
+                                        EventSortColumn::Device,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        320.0,
+                                        "IMR",
+                                        EventSortColumn::Imr,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        140.0,
+                                        "事件类型",
+                                        EventSortColumn::EventType,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        90.0,
+                                        "事件级别",
+                                        EventSortColumn::Level,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        160.0,
+                                        "标签",
+                                        EventSortColumn::Tags,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        140.0,
+                                        "事件码(数字)",
+                                        EventSortColumn::Codes,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        160.0,
+                                        "事件码(KKS)",
+                                        EventSortColumn::StrCodes,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        180.0,
+                                        "发生时间",
+                                        EventSortColumn::HappenedTime,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        180.0,
+                                        "记录时间",
+                                        EventSortColumn::RecordTime,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        140.0,
+                                        "BCRID",
+                                        EventSortColumn::BcrId,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        260.0,
+                                        "事件上下文",
+                                        EventSortColumn::Context,
+                                        cx,
+                                    ))
+                                    .child(self.render_filterable_event_header_cell(
+                                        240.0,
+                                        "报文摘要",
+                                        EventSortColumn::Summary,
+                                        cx,
+                                    )),
                             ),
                     )
                     .child(
@@ -2375,18 +2655,18 @@ impl ConfigView {
                             .bg(cx.theme().secondary.opacity(0.6))
                             .border_b_1()
                             .border_color(border)
-                            .child(self.render_event_header_cell(140.0, "设备号", cx))
-                            .child(self.render_event_header_cell(280.0, "IMR", cx))
-                            .child(self.render_event_header_cell(180.0, "请求时间", cx))
-                            .child(self.render_event_header_cell(110.0, "超时(ms)", cx))
-                            .child(self.render_event_header_cell(90.0, "测试", cx))
-                            .child(self.render_event_header_cell(110.0, "请求者", cx))
-                            .child(self.render_event_header_cell(220.0, "其他参数", cx))
-                            .child(self.render_event_header_cell(280.0, "UUID", cx))
-                            .child(self.render_event_header_cell(180.0, "响应时间", cx))
-                            .child(self.render_event_header_cell(140.0, "响应码(hex)", cx))
-                            .child(self.render_event_header_cell(110.0, "响应人", cx))
-                            .child(self.render_event_header_cell(120.0, "报文摘要", cx)),
+                            .child(self.render_static_header_cell(140.0, "设备号", cx))
+                            .child(self.render_static_header_cell(280.0, "IMR", cx))
+                            .child(self.render_static_header_cell(180.0, "请求时间", cx))
+                            .child(self.render_static_header_cell(110.0, "超时(ms)", cx))
+                            .child(self.render_static_header_cell(90.0, "测试", cx))
+                            .child(self.render_static_header_cell(110.0, "请求者", cx))
+                            .child(self.render_static_header_cell(220.0, "其他参数", cx))
+                            .child(self.render_static_header_cell(280.0, "UUID", cx))
+                            .child(self.render_static_header_cell(180.0, "响应时间", cx))
+                            .child(self.render_static_header_cell(140.0, "响应码(hex)", cx))
+                            .child(self.render_static_header_cell(110.0, "响应人", cx))
+                            .child(self.render_static_header_cell(120.0, "报文摘要", cx)),
                     ),
             )
             .child(
@@ -2474,13 +2754,13 @@ impl ConfigView {
                             .bg(cx.theme().secondary.opacity(0.6))
                             .border_b_1()
                             .border_color(border)
-                            .child(self.render_event_header_cell(280.0, "请求的UUID", cx))
-                            .child(self.render_event_header_cell(280.0, "响应的UUID", cx))
-                            .child(self.render_event_header_cell(180.0, "响应时间", cx))
-                            .child(self.render_event_header_cell(140.0, "响应码(hex)", cx))
-                            .child(self.render_event_header_cell(110.0, "响应人", cx))
-                            .child(self.render_event_header_cell(180.0, "实际接收时间", cx))
-                            .child(self.render_event_header_cell(370.0, "报文摘要", cx)),
+                            .child(self.render_static_header_cell(280.0, "请求的UUID", cx))
+                            .child(self.render_static_header_cell(280.0, "响应的UUID", cx))
+                            .child(self.render_static_header_cell(180.0, "响应时间", cx))
+                            .child(self.render_static_header_cell(140.0, "响应码(hex)", cx))
+                            .child(self.render_static_header_cell(110.0, "响应人", cx))
+                            .child(self.render_static_header_cell(180.0, "实际接收时间", cx))
+                            .child(self.render_static_header_cell(370.0, "报文摘要", cx)),
                     ),
             )
             .child(
@@ -2576,80 +2856,7 @@ impl ConfigView {
         cx.stop_propagation();
     }
 
-    fn render_prop_header_cell_sortable(
-        &self,
-        w: f32,
-        text: &str,
-        column: PropSortColumn,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
-        let hover_bg = if cx.theme().is_dark() {
-            cx.theme().secondary.lighten(0.04)
-        } else {
-            cx.theme().secondary.darken(0.02)
-        };
-
-        let (active_dir, icon) = {
-            let state = self.prop_table_state.read(cx);
-            match state
-                .sort()
-                .filter(|s| s.column == column)
-                .map(|s| s.direction)
-            {
-                Some(SortDirection::Asc) => (Some(SortDirection::Asc), IconName::ChevronUp),
-                Some(SortDirection::Desc) => (Some(SortDirection::Desc), IconName::ChevronDown),
-                None => (None, IconName::ChevronsUpDown),
-            }
-        };
-
-        let icon_color = if active_dir.is_some() { fg } else { muted };
-
-        let column_id = match column {
-            PropSortColumn::GlobalUuid => 0usize,
-            PropSortColumn::Device => 1usize,
-            PropSortColumn::Imr => 2usize,
-            PropSortColumn::Imid => 3usize,
-            PropSortColumn::Value => 4usize,
-            PropSortColumn::Quality => 5usize,
-            PropSortColumn::Bcrid => 6usize,
-            PropSortColumn::Time => 7usize,
-            PropSortColumn::MessageTime => 8usize,
-            PropSortColumn::Summary => 9usize,
-        };
-
-        div()
-            .id(("prop-header", column_id))
-            .w(px(w))
-            .px_2()
-            .py_2()
-            .border_r_1()
-            .border_color(border)
-            .cursor_pointer()
-            .hover(move |this| this.bg(hover_bg))
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        Label::new(text.to_string())
-                            .text_sm()
-                            .text_color(muted)
-                            .text_ellipsis(),
-                    )
-                    .child(Icon::new(icon).size_3().text_color(icon_color)),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.prop_table_state.update(cx, |state, cx| {
-                    state.toggle_sort(column);
-                    cx.notify();
-                });
-            }))
-    }
-
-    fn render_event_header_cell(
+    fn render_static_header_cell(
         &self,
         w: f32,
         text: &str,
@@ -2669,6 +2876,242 @@ impl ConfigView {
             )
     }
 
+    fn render_filterable_prop_header_cell(
+        &self,
+        w: f32,
+        text: &str,
+        column: PropSortColumn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let hover_bg = if cx.theme().is_dark() {
+            cx.theme().secondary.lighten(0.04)
+        } else {
+            cx.theme().secondary.darken(0.02)
+        };
+
+        let (sort_icon, filter_active) = {
+            let state = self.prop_table_state.read(cx);
+            let icon = match state
+                .sort()
+                .filter(|s| s.column == column)
+                .map(|s| s.direction)
+            {
+                Some(SortDirection::Asc) => IconName::ChevronUp,
+                Some(SortDirection::Desc) => IconName::ChevronDown,
+                None => IconName::ChevronsUpDown,
+            };
+            let active = !state.filters().get(column).is_empty();
+            (icon, active)
+        };
+
+        let sort_active = !matches!(sort_icon, IconName::ChevronsUpDown);
+        let sort_icon_color = if sort_active { fg } else { muted };
+        let filter_icon_color = if filter_active { primary } else { muted };
+
+        let column_id = column as usize;
+
+        let input_entity = self.prop_filter_inputs.entity(column).clone();
+
+        let trigger_button = Button::new(("prop-filter-trig", column_id))
+            .ghost()
+            .compact()
+            .icon(Icon::from(CustomIconName::Filter).text_color(filter_icon_color));
+
+        let popover = Popover::new(("prop-filter-pop", column_id))
+            .anchor(Corner::TopRight)
+            .mouse_button(MouseButton::Left)
+            .trigger(trigger_button)
+            .content(move |_state, _window, _cx| {
+                let input_for_clear = input_entity.clone();
+                v_flex()
+                    .gap_2()
+                    .w(px(240.0))
+                    .p_2()
+                    .child(Input::new(&input_entity).cleanable(true).small())
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new(("prop-filter-clear", column_id))
+                                .ghost()
+                                .compact()
+                                .small()
+                                .label("清除")
+                                .on_click(move |_, window, cx| {
+                                    input_for_clear.update(cx, |state, cx| {
+                                        state.set_value("".to_string(), window, cx);
+                                    });
+                                }),
+                        ),
+                    )
+            });
+
+        div()
+            .w(px(w))
+            .h_full()
+            .px_2()
+            .py_2()
+            .border_r_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(("prop-header-sort", column_id))
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(hover_bg))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(text.to_string())
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .text_ellipsis(),
+                                    )
+                                    .child(
+                                        Icon::new(sort_icon)
+                                            .size_3()
+                                            .text_color(sort_icon_color),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.prop_table_state.update(cx, |state, cx| {
+                                    state.toggle_sort(column);
+                                    cx.notify();
+                                });
+                            })),
+                    )
+                    .child(popover),
+            )
+    }
+
+    fn render_filterable_event_header_cell(
+        &self,
+        w: f32,
+        text: &str,
+        column: EventSortColumn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let hover_bg = if cx.theme().is_dark() {
+            cx.theme().secondary.lighten(0.04)
+        } else {
+            cx.theme().secondary.darken(0.02)
+        };
+
+        let (sort_icon, filter_active) = {
+            let state = self.event_table_state.read(cx);
+            let icon = match state
+                .sort()
+                .filter(|s| s.column == column)
+                .map(|s| s.direction)
+            {
+                Some(SortDirection::Asc) => IconName::ChevronUp,
+                Some(SortDirection::Desc) => IconName::ChevronDown,
+                None => IconName::ChevronsUpDown,
+            };
+            let active = !state.filters().get(column).is_empty();
+            (icon, active)
+        };
+
+        let sort_active = !matches!(sort_icon, IconName::ChevronsUpDown);
+        let sort_icon_color = if sort_active { fg } else { muted };
+        let filter_icon_color = if filter_active { primary } else { muted };
+
+        let column_id = column as usize;
+
+        let input_entity = self.event_filter_inputs.entity(column).clone();
+
+        let trigger_button = Button::new(("event-filter-trig", column_id))
+            .ghost()
+            .compact()
+            .icon(Icon::from(CustomIconName::Filter).text_color(filter_icon_color));
+
+        let popover = Popover::new(("event-filter-pop", column_id))
+            .anchor(Corner::TopRight)
+            .mouse_button(MouseButton::Left)
+            .trigger(trigger_button)
+            .content(move |_state, _window, _cx| {
+                let input_for_clear = input_entity.clone();
+                v_flex()
+                    .gap_2()
+                    .w(px(240.0))
+                    .p_2()
+                    .child(Input::new(&input_entity).cleanable(true).small())
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new(("event-filter-clear", column_id))
+                                .ghost()
+                                .compact()
+                                .small()
+                                .label("清除")
+                                .on_click(move |_, window, cx| {
+                                    input_for_clear.update(cx, |state, cx| {
+                                        state.set_value("".to_string(), window, cx);
+                                    });
+                                }),
+                        ),
+                    )
+            });
+
+        div()
+            .w(px(w))
+            .h_full()
+            .px_2()
+            .py_2()
+            .border_r_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(("event-header-sort", column_id))
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .cursor_pointer()
+                            .hover(move |this| this.bg(hover_bg))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        Label::new(text.to_string())
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .text_ellipsis(),
+                                    )
+                                    .child(
+                                        Icon::new(sort_icon)
+                                            .size_3()
+                                            .text_color(sort_icon_color),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.event_table_state.update(cx, |state, cx| {
+                                    state.toggle_sort(column);
+                                    cx.notify();
+                                });
+                            })),
+                    )
+                    .child(popover),
+            )
+    }
+
     fn render_prop_cell(&self, w: f32, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(px(w))
@@ -2680,24 +3123,33 @@ impl ConfigView {
     }
 
     fn render_prop_pagination(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (total, start, end, pages, page_index, page_size) = {
+        let (total_visible, total_all, start, end, pages, page_index, page_size, has_filters) = {
             let state = self.prop_table_state.read(cx);
-            let total = state.rows_len();
+            let total_visible = state.visible_len();
+            let total_all = state.rows_len();
             let (start, end) = state.page_range();
             (
-                total,
+                total_visible,
+                total_all,
                 start,
                 end,
                 state.total_pages(),
                 state.page_index(),
                 state.page_size(),
+                state.has_active_filters(),
             )
         };
 
-        let display_start = if total == 0 { 0 } else { start + 1 };
-        let display_end = if total == 0 { 0 } else { end };
+        let display_start = if total_visible == 0 { 0 } else { start + 1 };
+        let display_end = if total_visible == 0 { 0 } else { end };
 
-        let info = format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total} 条记录");
+        let info = if has_filters {
+            format!(
+                "显示第 {display_start} 到第 {display_end} 条记录, 符合过滤条件 {total_visible} 条 (共 {total_all} 条)"
+            )
+        } else {
+            format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total_all} 条记录")
+        };
         let page_label = format!("第 {} / {} 页", page_index + 1, pages);
 
         let current_size = PropPageSize::from_value(page_size);
@@ -2814,24 +3266,33 @@ impl ConfigView {
     }
 
     fn render_event_pagination(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (total, start, end, pages, page_index, page_size) = {
+        let (total_visible, total_all, start, end, pages, page_index, page_size, has_filters) = {
             let state = self.event_table_state.read(cx);
-            let total = state.rows_len();
+            let total_visible = state.visible_len();
+            let total_all = state.rows_len();
             let (start, end) = state.page_range();
             (
-                total,
+                total_visible,
+                total_all,
                 start,
                 end,
                 state.total_pages(),
                 state.page_index(),
                 state.page_size(),
+                state.has_active_filters(),
             )
         };
 
-        let display_start = if total == 0 { 0 } else { start + 1 };
-        let display_end = if total == 0 { 0 } else { end };
+        let display_start = if total_visible == 0 { 0 } else { start + 1 };
+        let display_end = if total_visible == 0 { 0 } else { end };
 
-        let info = format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total} 条记录");
+        let info = if has_filters {
+            format!(
+                "显示第 {display_start} 到第 {display_end} 条记录, 符合过滤条件 {total_visible} 条 (共 {total_all} 条)"
+            )
+        } else {
+            format!("显示第 {display_start} 到第 {display_end} 条记录，总共 {total_all} 条记录")
+        };
         let page_label = format!("第 {} / {} 页", page_index + 1, pages);
 
         let current_size = PropPageSize::from_value(page_size);

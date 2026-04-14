@@ -6,15 +6,18 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::helpers::cmp_u64ish;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortDirection {
     Asc,
     Desc,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
 pub enum PropSortColumn {
-    GlobalUuid,
+    GlobalUuid = 0,
     Device,
     Imr,
     Imid,
@@ -30,6 +33,94 @@ pub enum PropSortColumn {
 pub struct PropSort {
     pub column: PropSortColumn,
     pub direction: SortDirection,
+}
+
+/// Per-column substring filters for the prop table (case-insensitive contains).
+#[derive(Clone, Debug, Default)]
+pub struct PropFilters {
+    pub global_uuid: String,
+    pub device: String,
+    pub imr: String,
+    pub imid: String,
+    pub value: String,
+    pub quality: String,
+    pub bcrid: String,
+    pub time: String,
+    pub message_time: String,
+    pub summary: String,
+}
+
+impl PropFilters {
+    pub fn is_empty(&self) -> bool {
+        self.global_uuid.is_empty()
+            && self.device.is_empty()
+            && self.imr.is_empty()
+            && self.imid.is_empty()
+            && self.value.is_empty()
+            && self.quality.is_empty()
+            && self.bcrid.is_empty()
+            && self.time.is_empty()
+            && self.message_time.is_empty()
+            && self.summary.is_empty()
+    }
+
+    pub fn get(&self, col: PropSortColumn) -> &str {
+        match col {
+            PropSortColumn::GlobalUuid => &self.global_uuid,
+            PropSortColumn::Device => &self.device,
+            PropSortColumn::Imr => &self.imr,
+            PropSortColumn::Imid => &self.imid,
+            PropSortColumn::Value => &self.value,
+            PropSortColumn::Quality => &self.quality,
+            PropSortColumn::Bcrid => &self.bcrid,
+            PropSortColumn::Time => &self.time,
+            PropSortColumn::MessageTime => &self.message_time,
+            PropSortColumn::Summary => &self.summary,
+        }
+    }
+
+    pub fn set(&mut self, col: PropSortColumn, value: String) {
+        match col {
+            PropSortColumn::GlobalUuid => self.global_uuid = value,
+            PropSortColumn::Device => self.device = value,
+            PropSortColumn::Imr => self.imr = value,
+            PropSortColumn::Imid => self.imid = value,
+            PropSortColumn::Value => self.value = value,
+            PropSortColumn::Quality => self.quality = value,
+            PropSortColumn::Bcrid => self.bcrid = value,
+            PropSortColumn::Time => self.time = value,
+            PropSortColumn::MessageTime => self.message_time = value,
+            PropSortColumn::Summary => self.summary = value,
+        }
+    }
+
+    /// Pre-lowercase non-empty needles for the hot path. Returns one slot per column.
+    fn lowered_needles(&self) -> [Option<String>; 10] {
+        [
+            opt_lower(&self.global_uuid),
+            opt_lower(&self.device),
+            opt_lower(&self.imr),
+            opt_lower(&self.imid),
+            opt_lower(&self.value),
+            opt_lower(&self.quality),
+            opt_lower(&self.bcrid),
+            opt_lower(&self.time),
+            opt_lower(&self.message_time),
+            opt_lower(&self.summary),
+        ]
+    }
+}
+
+fn opt_lower(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_lowercase())
+    }
+}
+
+fn matches_lowered(haystack: &str, lowered_needle: &str) -> bool {
+    haystack.to_lowercase().contains(lowered_needle)
 }
 
 /// A single row in the property data table (aligned with DFC PropHistory columns).
@@ -66,7 +157,9 @@ pub struct PropTableState {
     page_index: usize,
     max_rows: usize,
     sort: Option<PropSort>,
-    sorted_indices: Vec<usize>,
+    filters: PropFilters,
+    /// Indices into `rows` after filtering and sorting, in display order.
+    visible_indices: Vec<usize>,
 }
 
 impl PropTableState {
@@ -79,7 +172,8 @@ impl PropTableState {
             page_index: 0,
             max_rows: 20 * 10_000,
             sort: None,
-            sorted_indices: Vec::new(),
+            filters: PropFilters::default(),
+            visible_indices: Vec::new(),
         }
     }
 
@@ -95,6 +189,14 @@ impl PropTableState {
         self.rows.len()
     }
 
+    pub fn visible_len(&self) -> usize {
+        if self.is_identity_view() {
+            self.rows.len()
+        } else {
+            self.visible_indices.len()
+        }
+    }
+
     pub fn page_size(&self) -> usize {
         self.page_size
     }
@@ -105,6 +207,18 @@ impl PropTableState {
 
     pub fn sort(&self) -> Option<PropSort> {
         self.sort
+    }
+
+    pub fn filters(&self) -> &PropFilters {
+        &self.filters
+    }
+
+    pub fn has_active_filters(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
+    fn is_identity_view(&self) -> bool {
+        self.sort.is_none() && self.filters.is_empty()
     }
 
     pub fn toggle_sort(&mut self, column: PropSortColumn) {
@@ -127,14 +241,32 @@ impl PropTableState {
         };
 
         self.page_index = 0;
-        self.rebuild_sorted_indices();
+        self.rebuild_visible_indices();
+    }
+
+    pub fn set_filter(&mut self, column: PropSortColumn, value: String) {
+        if self.filters.get(column) == value {
+            return;
+        }
+        self.filters.set(column, value);
+        self.page_index = 0;
+        self.rebuild_visible_indices();
+    }
+
+    pub fn clear_filters(&mut self) {
+        if self.filters.is_empty() {
+            return;
+        }
+        self.filters = PropFilters::default();
+        self.page_index = 0;
+        self.rebuild_visible_indices();
     }
 
     pub fn total_pages(&self) -> usize {
         if self.page_size == 0 {
             return 1;
         }
-        let total = self.rows.len();
+        let total = self.visible_len();
         let pages = (total + self.page_size - 1) / self.page_size;
         pages.max(1)
     }
@@ -153,7 +285,8 @@ impl PropTableState {
         self.rows.clear();
         self.page_index = 0;
         self.sort = None;
-        self.sorted_indices.clear();
+        self.filters = PropFilters::default();
+        self.visible_indices.clear();
         self.load_state = if self.topic_path.is_some() {
             PropTableLoadState::Loading
         } else {
@@ -186,9 +319,7 @@ impl PropTableState {
             self.rows.pop_back();
         }
 
-        if self.sort.is_some() {
-            self.rebuild_sorted_indices();
-        }
+        self.rebuild_visible_indices();
 
         // If user is on a later page, keep their position bounded.
         self.page_index = self.page_index.min(self.total_pages().saturating_sub(1));
@@ -196,7 +327,7 @@ impl PropTableState {
     }
 
     pub fn page_range(&self) -> (usize, usize) {
-        let total = self.rows.len();
+        let total = self.visible_len();
         if total == 0 || self.page_size == 0 {
             return (0, 0);
         }
@@ -211,53 +342,51 @@ impl PropTableState {
 
     pub fn page_rows_owned(&self) -> Vec<PropRow> {
         let (start, end) = self.page_range();
-        if start == end {
+        let count = end.saturating_sub(start);
+        if count == 0 {
             return Vec::new();
         }
 
-        if self.sort.is_none() {
-            return self
-                .rows
-                .iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .cloned()
-                .collect();
+        if self.is_identity_view() {
+            return self.rows.iter().skip(start).take(count).cloned().collect();
         }
 
-        let indices = &self.sorted_indices;
-        if indices.len() != self.rows.len() {
-            // Should not happen (we rebuild on mutations), but fallback safely.
-            return self
-                .rows
-                .iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .cloned()
-                .collect();
-        }
-
-        indices
+        self.visible_indices
             .iter()
             .skip(start)
-            .take(end.saturating_sub(start))
+            .take(count)
             .filter_map(|&idx| self.rows.get(idx).cloned())
             .collect()
     }
 
-    fn rebuild_sorted_indices(&mut self) {
-        self.sorted_indices.clear();
+    fn rebuild_visible_indices(&mut self) {
+        self.visible_indices.clear();
+
+        // Identity view (no sort, no filters) bypasses visible_indices entirely
+        // — page_rows_owned reads from `rows` directly.
+        if self.is_identity_view() {
+            return;
+        }
+
+        if self.filters.is_empty() {
+            self.visible_indices.extend(0..self.rows.len());
+        } else {
+            let needles = self.filters.lowered_needles();
+            for (i, row) in self.rows.iter().enumerate() {
+                if row_matches_lowered(row, &needles) {
+                    self.visible_indices.push(i);
+                }
+            }
+        }
 
         let Some(sort) = self.sort else {
             return;
         };
 
-        self.sorted_indices.extend(0..self.rows.len());
-
         let direction = sort.direction;
         let column = sort.column;
 
-        self.sorted_indices.sort_by(|&ia, &ib| {
+        self.visible_indices.sort_by(|&ia, &ib| {
             let a = match self.rows.get(ia) {
                 Some(v) => v,
                 None => return Ordering::Equal,
@@ -283,6 +412,60 @@ impl PropTableState {
     }
 }
 
+fn row_matches_lowered(row: &PropRow, needles: &[Option<String>; 10]) -> bool {
+    if let Some(n) = &needles[0] {
+        if !matches_lowered(&row.global_uuid, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[1] {
+        if !matches_lowered(&row.device, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[2] {
+        if !matches_lowered(&row.imr, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[3] {
+        if !matches_lowered(&row.imid.to_string(), n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[4] {
+        if !matches_lowered(&row.value, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[5] {
+        if !matches_lowered(&row.quality.to_string(), n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[6] {
+        if !matches_lowered(&row.bcrid, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[7] {
+        if !matches_lowered(&row.time, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[8] {
+        if !matches_lowered(&row.message_time, n) {
+            return false;
+        }
+    }
+    if let Some(n) = &needles[9] {
+        if !matches_lowered(&row.summary, n) {
+            return false;
+        }
+    }
+    true
+}
+
 impl Default for PropTableState {
     fn default() -> Self {
         Self::new()
@@ -304,11 +487,3 @@ fn compare_prop_rows(a: &PropRow, b: &PropRow, column: PropSortColumn) -> Orderi
     }
 }
 
-fn cmp_u64ish(a: &str, b: &str) -> Ordering {
-    let pa = a.trim().parse::<u64>();
-    let pb = b.trim().parse::<u64>();
-    match (pa, pb) {
-        (Ok(va), Ok(vb)) => va.cmp(&vb),
-        _ => a.cmp(b),
-    }
-}
