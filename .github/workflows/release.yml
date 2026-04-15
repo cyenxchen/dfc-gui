@@ -43,8 +43,10 @@ jobs:
           set -euo pipefail
           safe_tag="${GITHUB_REF_NAME//\//-}"
           app="dist/DFC-GUI.app"
+          contents="dist/dmg"
+          temp_dmg="dist/DFC-GUI-temp.dmg"
           asset="dfc-gui-${safe_tag}-macos-arm64.dmg"
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$contents"
           cp "target/aarch64-apple-darwin/release/dfc-gui" "$app/Contents/MacOS/dfc-gui"
           chmod +x "$app/Contents/MacOS/dfc-gui"
           cat > "$app/Contents/Info.plist" <<PLIST
@@ -75,7 +77,58 @@ jobs:
           </dict>
           </plist>
           PLIST
-          hdiutil create -volname "DFC-GUI" -srcfolder "$app" -ov -format UDZO "$asset"
+          cp -R "$app" "$contents/DFC-GUI.app"
+          ln -s /Applications "$contents/Applications"
+
+          hdiutil create -volname "DFC-GUI" -srcfolder "$contents" -ov -format UDRW "$temp_dmg"
+
+          device=""
+          mount_point=""
+          volume_name=""
+          cleanup() {
+            if [ -n "$device" ]; then
+              hdiutil detach "$device" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          attach_output="$(hdiutil attach -readwrite -noverify -noautoopen "$temp_dmg")"
+          device="$(printf '%s\n' "$attach_output" | awk -F '\t' '/\/Volumes\// { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); print $1; exit }')"
+          mount_point="$(printf '%s\n' "$attach_output" | awk -F '\t' '/\/Volumes\// { print $NF; exit }')"
+          volume_name="$(basename "$mount_point")"
+          sleep 2
+
+          osascript - "$volume_name" <<'APPLESCRIPT'
+          on run argv
+            set volume_name to item 1 of argv
+          tell application "Finder"
+            tell disk volume_name
+              open
+              set current view of container window to icon view
+              set toolbar visible of container window to false
+              set statusbar visible of container window to false
+              set bounds of container window to {100, 100, 780, 460}
+              set view_options to the icon view options of container window
+              set arrangement of view_options to not arranged
+              set icon size of view_options to 128
+              set text size of view_options to 14
+              set position of item "DFC-GUI.app" of container window to {180, 170}
+              set position of item "Applications" of container window to {500, 170}
+              close
+              open
+              update without registering applications
+            end tell
+          end tell
+          delay 2
+          end run
+          APPLESCRIPT
+
+          sync
+          hdiutil detach "$device"
+          device=""
+
+          hdiutil convert "$temp_dmg" -ov -format UDZO -o "$asset"
+          rm -f "$temp_dmg"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       - name: Upload macOS artifact
