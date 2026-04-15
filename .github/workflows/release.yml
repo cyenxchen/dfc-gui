@@ -14,9 +14,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure Cargo.toml version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -n 1)"
+
+          if [ -z "$cargo_version" ]; then
+            echo "::error title=Missing package version::Failed to read package version from Cargo.toml"
+            exit 1
+          fi
+
+          expected_tag="v${cargo_version}"
+          if [ "$tag" != "$expected_tag" ]; then
+            echo "::error title=Version mismatch::Git tag '$tag' does not match Cargo.toml version '$cargo_version' (expected '$expected_tag')"
+            exit 1
+          fi
+
   build-macos-arm64:
     name: Build macOS arm64
     runs-on: macos-15
+    needs: validate-version
 
     steps:
       - name: Checkout repository
@@ -141,6 +168,7 @@ jobs:
   build-windows-x86:
     name: Build Windows x86
     runs-on: windows-2022
+    needs: validate-version
 
     steps:
       - name: Checkout repository
