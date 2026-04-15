@@ -2696,52 +2696,64 @@ impl ConfigView {
                             ),
                     )
                     .child(
-                        div()
+                        v_flex()
                             .id("prop-table-body")
                             .flex_1()
                             .h_0()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .relative()
                             .overflow_hidden()
                             .child(
                                 div()
-                                    .id("prop-table-body-x-scroll")
-                                    .size_full()
+                                    .flex_1()
+                                    .h_0()
                                     .min_w(px(0.0))
-                                    .overflow_x_scroll()
-                                    .track_scroll(&self.prop_table_horizontal_scroll_handle)
+                                    .min_h(px(0.0))
+                                    .relative()
+                                    .overflow_hidden()
                                     .child(
                                         div()
-                                            .id("prop-table-y-scroll")
-                                            .min_w(px(1_650.0))
-                                            .w(px(1_650.0))
-                                            .h_full()
-                                            .min_h(px(0.0))
-                                            .track_scroll(&self.prop_table_scroll_handle)
+                                            .id("prop-table-body-x-scroll")
+                                            .size_full()
+                                            .min_w(px(0.0))
+                                            .overflow_x_scroll()
+                                            .track_scroll(&self.prop_table_horizontal_scroll_handle)
+                                            .child(
+                                                div()
+                                                    .id("prop-table-y-scroll")
+                                                    .min_w(px(1_650.0))
+                                                    .w(px(1_650.0))
+                                                    .h_full()
+                                                    .min_h(px(0.0))
+                                                    .track_scroll(&self.prop_table_scroll_handle)
+                                                    .on_scroll_wheel(cx.listener(
+                                                        Self::handle_prop_table_vertical_scroll,
+                                                    ))
+                                                    .children(rows),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .right_0()
+                                            .bottom_0()
+                                            .w(px(16.0))
                                             .on_scroll_wheel(
                                                 cx.listener(
                                                     Self::handle_prop_table_vertical_scroll,
                                                 ),
                                             )
-                                            .children(rows),
+                                            .child(
+                                                Scrollbar::vertical(&self.prop_table_scroll_handle)
+                                                    .scrollbar_show(ScrollbarShow::Always),
+                                            ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .w(px(16.0))
-                                    .on_scroll_wheel(
-                                        cx.listener(Self::handle_prop_table_vertical_scroll),
-                                    )
-                                    .child(
-                                        Scrollbar::vertical(&self.prop_table_scroll_handle)
-                                            .scrollbar_show(ScrollbarShow::Always),
-                                    ),
-                            ),
+                            .child(self.render_horizontal_scrollbar_row(
+                                &self.prop_table_horizontal_scroll_handle,
+                                cx,
+                            )),
                     ),
             )
             .into_any_element()
@@ -3020,52 +3032,68 @@ impl ConfigView {
                             ),
                     )
                     .child(
-                        div()
+                        v_flex()
                             .id("event-table-body")
                             .flex_1()
                             .h_0()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .relative()
                             .overflow_hidden()
                             .child(
                                 div()
-                                    .id("event-table-body-x-scroll")
-                                    .size_full()
+                                    .flex_1()
+                                    .h_0()
                                     .min_w(px(0.0))
-                                    .overflow_x_scroll()
-                                    .track_scroll(&self.event_table_horizontal_scroll_handle)
+                                    .min_h(px(0.0))
+                                    .relative()
+                                    .overflow_hidden()
                                     .child(
                                         div()
-                                            .id("event-table-y-scroll")
-                                            .min_w(px(table_width))
-                                            .w(px(table_width))
-                                            .h_full()
-                                            .min_h(px(0.0))
-                                            .track_scroll(&self.event_table_scroll_handle)
+                                            .id("event-table-body-x-scroll")
+                                            .size_full()
+                                            .min_w(px(0.0))
+                                            .overflow_x_scroll()
+                                            .track_scroll(
+                                                &self.event_table_horizontal_scroll_handle,
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("event-table-y-scroll")
+                                                    .min_w(px(table_width))
+                                                    .w(px(table_width))
+                                                    .h_full()
+                                                    .min_h(px(0.0))
+                                                    .track_scroll(&self.event_table_scroll_handle)
+                                                    .on_scroll_wheel(cx.listener(
+                                                        Self::handle_event_table_vertical_scroll,
+                                                    ))
+                                                    .children(rows),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .right_0()
+                                            .bottom_0()
+                                            .w(px(16.0))
                                             .on_scroll_wheel(
                                                 cx.listener(
                                                     Self::handle_event_table_vertical_scroll,
                                                 ),
                                             )
-                                            .children(rows),
+                                            .child(
+                                                Scrollbar::vertical(
+                                                    &self.event_table_scroll_handle,
+                                                )
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                            ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .w(px(16.0))
-                                    .on_scroll_wheel(
-                                        cx.listener(Self::handle_event_table_vertical_scroll),
-                                    )
-                                    .child(
-                                        Scrollbar::vertical(&self.event_table_scroll_handle)
-                                            .scrollbar_show(ScrollbarShow::Always),
-                                    ),
-                            ),
+                            .child(self.render_horizontal_scrollbar_row(
+                                &self.event_table_horizontal_scroll_handle,
+                                cx,
+                            )),
                     ),
             )
             .into_any_element()
@@ -3342,76 +3370,81 @@ impl ConfigView {
             );
         }
 
-        let request_table = v_flex()
-            .w_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .bg(secondary_bg)
-                    .child(
-                        Label::new("请求记录")
-                            .text_sm()
-                            .text_color(cx.theme().foreground),
-                    )
-                    .child(
-                        Label::new(format!("(共 {total_requests} 条)"))
-                            .text_sm()
-                            .text_color(muted_fg)
-                            .ml_2(),
-                    ),
-            )
-            .child(
-                div()
-                    .id("svc-req-header-x-scroll")
-                    .w_full()
-                    .flex_none()
-                    .min_w(px(0.0))
-                    .overflow_x_scroll()
-                    .track_scroll(&self.service_table_horizontal_scroll_handle)
-                    .child(
-                        h_flex()
-                            .min_w(px(request_table_width))
-                            .w(px(request_table_width))
-                            .bg(cx.theme().secondary.opacity(0.6))
-                            .border_b_1()
-                            .border_color(border)
-                            .child(self.render_static_header_cell(140.0, "设备号", cx))
-                            .child(self.render_static_header_cell(280.0, "IMR", cx))
-                            .child(self.render_static_header_cell(180.0, "请求时间", cx))
-                            .child(self.render_static_header_cell(110.0, "超时(ms)", cx))
-                            .child(self.render_static_header_cell(90.0, "测试", cx))
-                            .child(self.render_static_header_cell(110.0, "请求者", cx))
-                            .child(self.render_static_header_cell(220.0, "其他参数", cx))
-                            .child(self.render_static_header_cell(280.0, "UUID", cx))
-                            .child(self.render_static_header_cell(180.0, "响应时间", cx))
-                            .child(self.render_static_header_cell(140.0, "响应码(hex)", cx))
-                            .child(self.render_static_header_cell(110.0, "响应人", cx))
-                            .child(self.render_static_header_cell(120.0, "报文摘要", cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("svc-req-body-x-scroll")
-                    .w_full()
-                    .min_w(px(0.0))
-                    .overflow_x_scroll()
-                    .track_scroll(&self.service_table_horizontal_scroll_handle)
-                    .child(
-                        div()
-                            .min_w(px(request_table_width))
-                            .w(px(request_table_width))
-                            .children(request_body_rows),
-                    ),
-            );
+        let request_table =
+            v_flex()
+                .w_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .bg(secondary_bg)
+                        .child(
+                            Label::new("请求记录")
+                                .text_sm()
+                                .text_color(cx.theme().foreground),
+                        )
+                        .child(
+                            Label::new(format!("(共 {total_requests} 条)"))
+                                .text_sm()
+                                .text_color(muted_fg)
+                                .ml_2(),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("svc-req-header-x-scroll")
+                        .w_full()
+                        .flex_none()
+                        .min_w(px(0.0))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.service_table_horizontal_scroll_handle)
+                        .child(
+                            h_flex()
+                                .min_w(px(request_table_width))
+                                .w(px(request_table_width))
+                                .bg(cx.theme().secondary.opacity(0.6))
+                                .border_b_1()
+                                .border_color(border)
+                                .child(self.render_static_header_cell(140.0, "设备号", cx))
+                                .child(self.render_static_header_cell(280.0, "IMR", cx))
+                                .child(self.render_static_header_cell(180.0, "请求时间", cx))
+                                .child(self.render_static_header_cell(110.0, "超时(ms)", cx))
+                                .child(self.render_static_header_cell(90.0, "测试", cx))
+                                .child(self.render_static_header_cell(110.0, "请求者", cx))
+                                .child(self.render_static_header_cell(220.0, "其他参数", cx))
+                                .child(self.render_static_header_cell(280.0, "UUID", cx))
+                                .child(self.render_static_header_cell(180.0, "响应时间", cx))
+                                .child(self.render_static_header_cell(140.0, "响应码(hex)", cx))
+                                .child(self.render_static_header_cell(110.0, "响应人", cx))
+                                .child(self.render_static_header_cell(120.0, "报文摘要", cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("svc-req-body-x-scroll")
+                        .w_full()
+                        .min_w(px(0.0))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.service_table_horizontal_scroll_handle)
+                        .child(
+                            div()
+                                .min_w(px(request_table_width))
+                                .w(px(request_table_width))
+                                .children(request_body_rows),
+                        ),
+                )
+                .child(self.render_horizontal_scrollbar_row(
+                    &self.service_table_horizontal_scroll_handle,
+                    cx,
+                ));
 
         let mut response_body_rows = Vec::new();
         for (idx, row) in response_rows.iter().enumerate() {
@@ -3547,7 +3580,11 @@ impl ConfigView {
                             .w(px(response_table_width))
                             .children(response_body_rows),
                     ),
-            );
+            )
+            .child(self.render_horizontal_scrollbar_row(
+                &self.service_response_horizontal_scroll_handle,
+                cx,
+            ));
 
         v_flex()
             .flex_1()
@@ -3584,6 +3621,20 @@ impl ConfigView {
                     .child(Label::new(label.to_string()).text_sm().text_color(muted_fg)),
             )
             .child(div().flex_1().min_w(px(0.0)).child(content))
+    }
+
+    fn render_horizontal_scrollbar_row(
+        &self,
+        scroll_handle: &ScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .w_full()
+            .h(px(16.0))
+            .flex_none()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(Scrollbar::horizontal(scroll_handle).scrollbar_show(ScrollbarShow::Always))
     }
 
     fn handle_prop_table_vertical_scroll(
