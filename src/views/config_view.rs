@@ -20,8 +20,9 @@ use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
 use gpui::{
-    Action, App, Context, Corner, Entity, Focusable, MouseButton, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
+    Action, App, Context, Corner, DragMoveEvent, Entity, Focusable, MouseButton, MouseDownEvent,
+    ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement as _, Subscription, Task, Window,
+    div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
@@ -53,6 +54,25 @@ const PANEL_TOPBAR_HEIGHT: f32 = 48.0;
 const TOPIC_FEEDBACK_TICK_MS: u64 = 120;
 const TOPIC_SWITCH_FEEDBACK_MS: u64 = 320;
 const TOPIC_FEEDBACK_FRAME_COUNT: usize = 6;
+const TABLE_COLUMN_MIN_WIDTH: f32 = 72.0;
+const TABLE_COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
+
+const PROP_COLUMN_COUNT: usize = PropSortColumn::Summary as usize + 1;
+const EVENT_COLUMN_COUNT: usize = EventSortColumn::Summary as usize + 1;
+const SERVICE_REQUEST_COLUMN_COUNT: usize = 12;
+const SERVICE_RESPONSE_COLUMN_COUNT: usize = 7;
+
+const PROP_DEFAULT_COLUMN_WIDTHS: [f32; PROP_COLUMN_COUNT] = [
+    180.0, 110.0, 320.0, 90.0, 120.0, 90.0, 140.0, 180.0, 180.0, 240.0,
+];
+const EVENT_DEFAULT_COLUMN_WIDTHS: [f32; EVENT_COLUMN_COUNT] = [
+    220.0, 110.0, 320.0, 140.0, 90.0, 160.0, 140.0, 160.0, 180.0, 180.0, 140.0, 260.0, 240.0,
+];
+const SERVICE_REQUEST_DEFAULT_COLUMN_WIDTHS: [f32; SERVICE_REQUEST_COLUMN_COUNT] = [
+    140.0, 280.0, 180.0, 110.0, 90.0, 110.0, 220.0, 280.0, 180.0, 140.0, 110.0, 120.0,
+];
+const SERVICE_RESPONSE_DEFAULT_COLUMN_WIDTHS: [f32; SERVICE_RESPONSE_COLUMN_COUNT] =
+    [280.0, 280.0, 180.0, 140.0, 110.0, 180.0, 370.0];
 
 #[derive(Debug)]
 enum PropStreamEvent {
@@ -70,6 +90,89 @@ enum EventStreamEvent {
 enum TopicFeedbackKind {
     Switching,
     Loading,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum ServiceRequestColumn {
+    Device = 0,
+    Imr,
+    RequestTime,
+    TimeoutMs,
+    IsTest,
+    Requester,
+    ArgsJson,
+    Uuid,
+    ResponseTime,
+    ResponseCode,
+    Responser,
+    Summary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum ServiceResponseColumn {
+    RequestUuid = 0,
+    ResponseUuid,
+    ResponseTime,
+    ResponseCode,
+    Responser,
+    ReceiveTime,
+    Summary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+enum ResizableTableKind {
+    Prop,
+    Event,
+    ServiceRequest,
+    ServiceResponse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColumnResizeToken {
+    table: ResizableTableKind,
+    column_ix: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveColumnResize {
+    token: ColumnResizeToken,
+    start_mouse_x: f32,
+    start_width: f32,
+}
+
+#[derive(Clone, Debug)]
+struct TableColumnWidths<const N: usize> {
+    widths: [f32; N],
+}
+
+impl<const N: usize> TableColumnWidths<N> {
+    const fn new(widths: [f32; N]) -> Self {
+        Self { widths }
+    }
+
+    fn get(&self, index: usize) -> f32 {
+        self.widths[index]
+    }
+
+    fn total(&self) -> f32 {
+        self.widths.iter().sum()
+    }
+
+    fn resize_from_drag(&mut self, index: usize, start_width: f32, delta_x: f32) {
+        self.widths[index] = (start_width + delta_x).max(TABLE_COLUMN_MIN_WIDTH);
+    }
+}
+
+#[derive(Default)]
+struct ColumnResizeGhost;
+
+impl Render for ColumnResizeGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(0.0)).h(px(0.0))
+    }
 }
 
 type TopicSelectionKey = (Option<String>, Option<String>);
@@ -357,6 +460,8 @@ pub struct ConfigView {
     prop_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the prop table header and body
     prop_table_horizontal_scroll_handle: ScrollHandle,
+    /// Runtime-resizable prop table column widths
+    prop_column_widths: TableColumnWidths<PROP_COLUMN_COUNT>,
     /// Event topic table state (for `thing_event` topics)
     event_table_state: Entity<EventTableState>,
     /// Per-column filter inputs for the event topic table
@@ -365,6 +470,8 @@ pub struct ConfigView {
     event_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the event table header and body
     event_table_horizontal_scroll_handle: ScrollHandle,
+    /// Runtime-resizable event table column widths
+    event_column_widths: TableColumnWidths<EVENT_COLUMN_COUNT>,
     /// Shared editor used when a table cell enters copy/select mode
     table_cell_input: Entity<InputState>,
     /// Currently active table cell in copy/select mode
@@ -374,6 +481,9 @@ pub struct ConfigView {
     service_form: ServiceFormState,
     service_table_horizontal_scroll_handle: ScrollHandle,
     service_response_horizontal_scroll_handle: ScrollHandle,
+    service_request_column_widths: TableColumnWidths<SERVICE_REQUEST_COLUMN_COUNT>,
+    service_response_column_widths: TableColumnWidths<SERVICE_RESPONSE_COLUMN_COUNT>,
+    active_column_resize: Option<ActiveColumnResize>,
     active_service_topic: Option<String>,
     service_stream_stop: Option<watch::Sender<bool>>,
     service_publish_tx: Option<Sender<ServicePublishRequest>>,
@@ -713,16 +823,25 @@ impl ConfigView {
             prop_filter_inputs,
             prop_table_scroll_handle: ScrollHandle::default(),
             prop_table_horizontal_scroll_handle: ScrollHandle::default(),
+            prop_column_widths: TableColumnWidths::new(PROP_DEFAULT_COLUMN_WIDTHS),
             event_table_state,
             event_filter_inputs,
             event_table_scroll_handle: ScrollHandle::default(),
             event_table_horizontal_scroll_handle: ScrollHandle::default(),
+            event_column_widths: TableColumnWidths::new(EVENT_DEFAULT_COLUMN_WIDTHS),
             table_cell_input,
             active_table_cell: None,
             service_table_state,
             service_form,
             service_table_horizontal_scroll_handle: ScrollHandle::default(),
             service_response_horizontal_scroll_handle: ScrollHandle::default(),
+            service_request_column_widths: TableColumnWidths::new(
+                SERVICE_REQUEST_DEFAULT_COLUMN_WIDTHS,
+            ),
+            service_response_column_widths: TableColumnWidths::new(
+                SERVICE_RESPONSE_DEFAULT_COLUMN_WIDTHS,
+            ),
+            active_column_resize: None,
             active_service_topic: None,
             service_stream_stop: None,
             service_publish_tx: None,
@@ -776,6 +895,182 @@ impl ConfigView {
             AgentQueryMode::Prefix => agent_id.starts_with(query),
             AgentQueryMode::Exact => agent_id == query,
         }
+    }
+
+    fn prop_column_width(&self, column: PropSortColumn) -> f32 {
+        self.prop_column_widths.get(column as usize)
+    }
+
+    fn event_column_width(&self, column: EventSortColumn) -> f32 {
+        self.event_column_widths.get(column as usize)
+    }
+
+    fn service_request_column_width(&self, column: ServiceRequestColumn) -> f32 {
+        self.service_request_column_widths.get(column as usize)
+    }
+
+    fn service_response_column_width(&self, column: ServiceResponseColumn) -> f32 {
+        self.service_response_column_widths.get(column as usize)
+    }
+
+    fn start_column_resize(
+        &mut self,
+        table: ResizableTableKind,
+        column_ix: usize,
+        start_mouse_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let start_width = match table {
+            ResizableTableKind::Prop => self.prop_column_widths.get(column_ix),
+            ResizableTableKind::Event => self.event_column_widths.get(column_ix),
+            ResizableTableKind::ServiceRequest => self.service_request_column_widths.get(column_ix),
+            ResizableTableKind::ServiceResponse => {
+                self.service_response_column_widths.get(column_ix)
+            }
+        };
+
+        self.active_column_resize = Some(ActiveColumnResize {
+            token: ColumnResizeToken { table, column_ix },
+            start_mouse_x,
+            start_width,
+        });
+        cx.notify();
+    }
+
+    fn apply_column_resize(
+        &mut self,
+        table: ResizableTableKind,
+        column_ix: usize,
+        mouse_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.active_column_resize else {
+            return;
+        };
+
+        if active.token.table != table || active.token.column_ix != column_ix {
+            return;
+        }
+
+        let delta_x = mouse_x - active.start_mouse_x;
+        match table {
+            ResizableTableKind::Prop => {
+                self.prop_column_widths
+                    .resize_from_drag(column_ix, active.start_width, delta_x);
+            }
+            ResizableTableKind::Event => {
+                self.event_column_widths
+                    .resize_from_drag(column_ix, active.start_width, delta_x);
+            }
+            ResizableTableKind::ServiceRequest => {
+                self.service_request_column_widths.resize_from_drag(
+                    column_ix,
+                    active.start_width,
+                    delta_x,
+                );
+            }
+            ResizableTableKind::ServiceResponse => {
+                self.service_response_column_widths.resize_from_drag(
+                    column_ix,
+                    active.start_width,
+                    delta_x,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_column_resize(
+        &mut self,
+        table: ResizableTableKind,
+        column_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.active_column_resize.is_some_and(|active| {
+            active.token.table == table && active.token.column_ix == column_ix
+        }) {
+            self.active_column_resize = None;
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_column_resizing(&self, table: ResizableTableKind, column_ix: usize) -> bool {
+        self.active_column_resize.is_some_and(|active| {
+            active.token.table == table && active.token.column_ix == column_ix
+        })
+    }
+
+    fn render_column_resize_handle(
+        &self,
+        table: ResizableTableKind,
+        column_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let token = ColumnResizeToken { table, column_ix };
+        let handle_id = match table {
+            ResizableTableKind::Prop => ("prop-col-resize", column_ix),
+            ResizableTableKind::Event => ("event-col-resize", column_ix),
+            ResizableTableKind::ServiceRequest => ("svc-req-col-resize", column_ix),
+            ResizableTableKind::ServiceResponse => ("svc-resp-col-resize", column_ix),
+        };
+        let line_color = if self.is_column_resizing(table, column_ix) {
+            cx.theme().primary
+        } else {
+            cx.theme().border.opacity(0.8)
+        };
+
+        div()
+            .id(handle_id)
+            .absolute()
+            .top_0()
+            .right(px(-(TABLE_COLUMN_RESIZE_HANDLE_WIDTH / 2.0)))
+            .h_full()
+            .w(px(TABLE_COLUMN_RESIZE_HANDLE_WIDTH))
+            .occlude()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.start_column_resize(table, column_ix, f32::from(event.position.x), cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<ColumnResizeToken>, _, cx| {
+                    let active = *event.drag(cx);
+                    this.apply_column_resize(
+                        active.table,
+                        active.column_ix,
+                        f32::from(event.event.position.x),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                },
+            ))
+            .on_drag(token, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| ColumnResizeGhost)
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if this.finish_column_resize(table, column_ix, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if this.finish_column_resize(table, column_ix, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .child(div().mx_auto().h_full().w(px(1.0)).bg(line_color))
     }
 
     fn clear_selected_agent_if_filtered_out(&self, cx: &mut Context<Self>) {
@@ -2518,6 +2813,7 @@ impl ConfigView {
         }
 
         let page_rows = self.prop_table_state.read(cx).page_rows_owned();
+        let table_width = self.prop_column_widths.total();
 
         // Build rows
         let mut rows = Vec::new();
@@ -2541,70 +2837,70 @@ impl ConfigView {
                     .border_color(border)
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-global-uuid"),
-                        180.0,
+                        self.prop_column_width(PropSortColumn::GlobalUuid),
                         &row.global_uuid,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-device"),
-                        110.0,
+                        self.prop_column_width(PropSortColumn::Device),
                         &row.device,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-imr"),
-                        320.0,
+                        self.prop_column_width(PropSortColumn::Imr),
                         &row.imr,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-imid"),
-                        90.0,
+                        self.prop_column_width(PropSortColumn::Imid),
                         &row.imid.to_string(),
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-value"),
-                        120.0,
+                        self.prop_column_width(PropSortColumn::Value),
                         &row.value,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-quality"),
-                        90.0,
+                        self.prop_column_width(PropSortColumn::Quality),
                         &row.quality.to_string(),
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-bcrid"),
-                        140.0,
+                        self.prop_column_width(PropSortColumn::Bcrid),
                         &row.bcrid,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-time"),
-                        180.0,
+                        self.prop_column_width(PropSortColumn::Time),
                         &row.time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-message-time"),
-                        180.0,
+                        self.prop_column_width(PropSortColumn::MessageTime),
                         &row.message_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "prop-summary"),
-                        240.0,
+                        self.prop_column_width(PropSortColumn::Summary),
                         &row.summary,
                         window,
                         cx,
@@ -2640,67 +2936,67 @@ impl ConfigView {
                             .track_scroll(&self.prop_table_horizontal_scroll_handle)
                             .child(
                                 h_flex()
-                                    .min_w(px(1_650.0))
-                                    .w(px(1_650.0))
+                                    .min_w(px(table_width))
+                                    .w(px(table_width))
                                     .bg(header_bg)
                                     .border_b_1()
                                     .border_color(border)
                                     .child(self.render_filterable_prop_header_cell(
-                                        180.0,
+                                        self.prop_column_width(PropSortColumn::GlobalUuid),
                                         "全局UUID",
                                         PropSortColumn::GlobalUuid,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        110.0,
+                                        self.prop_column_width(PropSortColumn::Device),
                                         "设备号",
                                         PropSortColumn::Device,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        320.0,
+                                        self.prop_column_width(PropSortColumn::Imr),
                                         "IMR",
                                         PropSortColumn::Imr,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        90.0,
+                                        self.prop_column_width(PropSortColumn::Imid),
                                         "IMID",
                                         PropSortColumn::Imid,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        120.0,
+                                        self.prop_column_width(PropSortColumn::Value),
                                         "值",
                                         PropSortColumn::Value,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        90.0,
+                                        self.prop_column_width(PropSortColumn::Quality),
                                         "数据质量",
                                         PropSortColumn::Quality,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        140.0,
+                                        self.prop_column_width(PropSortColumn::Bcrid),
                                         "BCRID",
                                         PropSortColumn::Bcrid,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        180.0,
+                                        self.prop_column_width(PropSortColumn::Time),
                                         "数据时间",
                                         PropSortColumn::Time,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        180.0,
+                                        self.prop_column_width(PropSortColumn::MessageTime),
                                         "报文时间",
                                         PropSortColumn::MessageTime,
                                         cx,
                                     ))
                                     .child(self.render_filterable_prop_header_cell(
-                                        240.0,
+                                        self.prop_column_width(PropSortColumn::Summary),
                                         "报文摘要",
                                         PropSortColumn::Summary,
                                         cx,
@@ -2733,8 +3029,8 @@ impl ConfigView {
                                             .child(
                                                 div()
                                                     .id("prop-table-y-scroll")
-                                                    .min_w(px(1_650.0))
-                                                    .w(px(1_650.0))
+                                                    .min_w(px(table_width))
+                                                    .w(px(table_width))
                                                     .h_full()
                                                     .min_h(px(0.0))
                                                     .track_scroll(&self.prop_table_scroll_handle)
@@ -2779,7 +3075,7 @@ impl ConfigView {
     ) -> impl IntoElement {
         let border = cx.theme().border;
         let header_bg = cx.theme().secondary;
-        let table_width = 2_540.0;
+        let table_width = self.event_column_widths.total();
 
         let (topic_path, load_state, total_rows) = {
             let state = self.event_table_state.read(cx);
@@ -2839,91 +3135,91 @@ impl ConfigView {
                     .border_color(border)
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-uuid"),
-                        220.0,
+                        self.event_column_width(EventSortColumn::Uuid),
                         &row.uuid,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-device"),
-                        110.0,
+                        self.event_column_width(EventSortColumn::Device),
                         &row.device,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-imr"),
-                        320.0,
+                        self.event_column_width(EventSortColumn::Imr),
                         &row.imr,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-type"),
-                        140.0,
+                        self.event_column_width(EventSortColumn::EventType),
                         &row.event_type,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-level"),
-                        90.0,
+                        self.event_column_width(EventSortColumn::Level),
                         &row.level,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-tags"),
-                        160.0,
+                        self.event_column_width(EventSortColumn::Tags),
                         &row.tags,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-codes"),
-                        140.0,
+                        self.event_column_width(EventSortColumn::Codes),
                         &row.codes,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-str-codes"),
-                        160.0,
+                        self.event_column_width(EventSortColumn::StrCodes),
                         &row.str_codes,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-happened-time"),
-                        180.0,
+                        self.event_column_width(EventSortColumn::HappenedTime),
                         &row.happened_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-record-time"),
-                        180.0,
+                        self.event_column_width(EventSortColumn::RecordTime),
                         &row.record_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-bcr-id"),
-                        140.0,
+                        self.event_column_width(EventSortColumn::BcrId),
                         &row.bcr_id,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-context"),
-                        260.0,
+                        self.event_column_width(EventSortColumn::Context),
                         &row.context,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "event-summary"),
-                        240.0,
+                        self.event_column_width(EventSortColumn::Summary),
                         &row.summary,
                         window,
                         cx,
@@ -2964,79 +3260,79 @@ impl ConfigView {
                                     .border_b_1()
                                     .border_color(border)
                                     .child(self.render_filterable_event_header_cell(
-                                        220.0,
+                                        self.event_column_width(EventSortColumn::Uuid),
                                         "UUID",
                                         EventSortColumn::Uuid,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        110.0,
+                                        self.event_column_width(EventSortColumn::Device),
                                         "设备",
                                         EventSortColumn::Device,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        320.0,
+                                        self.event_column_width(EventSortColumn::Imr),
                                         "IMR",
                                         EventSortColumn::Imr,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        140.0,
+                                        self.event_column_width(EventSortColumn::EventType),
                                         "事件类型",
                                         EventSortColumn::EventType,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        90.0,
+                                        self.event_column_width(EventSortColumn::Level),
                                         "事件级别",
                                         EventSortColumn::Level,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        160.0,
+                                        self.event_column_width(EventSortColumn::Tags),
                                         "标签",
                                         EventSortColumn::Tags,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        140.0,
+                                        self.event_column_width(EventSortColumn::Codes),
                                         "事件码(数字)",
                                         EventSortColumn::Codes,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        160.0,
+                                        self.event_column_width(EventSortColumn::StrCodes),
                                         "事件码(KKS)",
                                         EventSortColumn::StrCodes,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        180.0,
+                                        self.event_column_width(EventSortColumn::HappenedTime),
                                         "发生时间",
                                         EventSortColumn::HappenedTime,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        180.0,
+                                        self.event_column_width(EventSortColumn::RecordTime),
                                         "记录时间",
                                         EventSortColumn::RecordTime,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        140.0,
+                                        self.event_column_width(EventSortColumn::BcrId),
                                         "BCRID",
                                         EventSortColumn::BcrId,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        260.0,
+                                        self.event_column_width(EventSortColumn::Context),
                                         "事件上下文",
                                         EventSortColumn::Context,
                                         cx,
                                     ))
                                     .child(self.render_filterable_event_header_cell(
-                                        240.0,
+                                        self.event_column_width(EventSortColumn::Summary),
                                         "报文摘要",
                                         EventSortColumn::Summary,
                                         cx,
@@ -3273,8 +3569,8 @@ impl ConfigView {
                     ),
             );
 
-        let request_table_width = 1_960.0;
-        let response_table_width = 1_540.0;
+        let request_table_width = self.service_request_column_widths.total();
+        let response_table_width = self.service_response_column_widths.total();
 
         let mut request_body_rows = Vec::new();
         for (idx, row) in request_rows.iter().enumerate() {
@@ -3297,84 +3593,84 @@ impl ConfigView {
                     .border_color(border)
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-device"),
-                        140.0,
+                        self.service_request_column_width(ServiceRequestColumn::Device),
                         &row.device,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-imr"),
-                        280.0,
+                        self.service_request_column_width(ServiceRequestColumn::Imr),
                         &row.imr,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-request-time"),
-                        180.0,
+                        self.service_request_column_width(ServiceRequestColumn::RequestTime),
                         &row.request_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-timeout-ms"),
-                        110.0,
+                        self.service_request_column_width(ServiceRequestColumn::TimeoutMs),
                         &row.timeout_ms.to_string(),
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-is-test"),
-                        90.0,
+                        self.service_request_column_width(ServiceRequestColumn::IsTest),
                         is_test_text,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-requester"),
-                        110.0,
+                        self.service_request_column_width(ServiceRequestColumn::Requester),
                         &row.requester,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-args-json"),
-                        220.0,
+                        self.service_request_column_width(ServiceRequestColumn::ArgsJson),
                         &row.args_json,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-uuid"),
-                        280.0,
+                        self.service_request_column_width(ServiceRequestColumn::Uuid),
                         &row.uuid,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-response-time"),
-                        180.0,
+                        self.service_request_column_width(ServiceRequestColumn::ResponseTime),
                         &row.response_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-response-code"),
-                        140.0,
+                        self.service_request_column_width(ServiceRequestColumn::ResponseCode),
                         &row.response_code_hex,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-responser"),
-                        110.0,
+                        self.service_request_column_width(ServiceRequestColumn::Responser),
                         &row.responser,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-req-summary"),
-                        120.0,
+                        self.service_request_column_width(ServiceRequestColumn::Summary),
                         &row.summary,
                         window,
                         cx,
@@ -3382,81 +3678,160 @@ impl ConfigView {
             );
         }
 
-        let request_table =
-            v_flex()
-                .w_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .rounded_md()
-                .border_1()
-                .border_color(border)
-                .overflow_hidden()
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(border)
-                        .bg(secondary_bg)
-                        .child(
-                            Label::new("请求记录")
-                                .text_sm()
-                                .text_color(cx.theme().foreground),
-                        )
-                        .child(
-                            Label::new(format!("(共 {total_requests} 条)"))
-                                .text_sm()
-                                .text_color(muted_fg)
-                                .ml_2(),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("svc-req-header-x-scroll")
-                        .w_full()
-                        .flex_none()
-                        .min_w(px(0.0))
-                        .overflow_x_scroll()
-                        .track_scroll(&self.service_table_horizontal_scroll_handle)
-                        .child(
-                            h_flex()
-                                .min_w(px(request_table_width))
-                                .w(px(request_table_width))
-                                .bg(cx.theme().secondary.opacity(0.6))
-                                .border_b_1()
-                                .border_color(border)
-                                .child(self.render_static_header_cell(140.0, "设备号", cx))
-                                .child(self.render_static_header_cell(280.0, "IMR", cx))
-                                .child(self.render_static_header_cell(180.0, "请求时间", cx))
-                                .child(self.render_static_header_cell(110.0, "超时(ms)", cx))
-                                .child(self.render_static_header_cell(90.0, "测试", cx))
-                                .child(self.render_static_header_cell(110.0, "请求者", cx))
-                                .child(self.render_static_header_cell(220.0, "其他参数", cx))
-                                .child(self.render_static_header_cell(280.0, "UUID", cx))
-                                .child(self.render_static_header_cell(180.0, "响应时间", cx))
-                                .child(self.render_static_header_cell(140.0, "响应码(hex)", cx))
-                                .child(self.render_static_header_cell(110.0, "响应人", cx))
-                                .child(self.render_static_header_cell(120.0, "报文摘要", cx)),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("svc-req-body-x-scroll")
-                        .w_full()
-                        .min_w(px(0.0))
-                        .overflow_x_scroll()
-                        .track_scroll(&self.service_table_horizontal_scroll_handle)
-                        .child(
-                            div()
-                                .min_w(px(request_table_width))
-                                .w(px(request_table_width))
-                                .children(request_body_rows),
-                        ),
-                )
-                .child(self.render_horizontal_scrollbar_row(
+        let request_table = v_flex()
+            .w_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(secondary_bg)
+                    .child(
+                        Label::new("请求记录")
+                            .text_sm()
+                            .text_color(cx.theme().foreground),
+                    )
+                    .child(
+                        Label::new(format!("(共 {total_requests} 条)"))
+                            .text_sm()
+                            .text_color(muted_fg)
+                            .ml_2(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("svc-req-header-x-scroll")
+                    .w_full()
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.service_table_horizontal_scroll_handle)
+                    .child(
+                        h_flex()
+                            .min_w(px(request_table_width))
+                            .w(px(request_table_width))
+                            .bg(cx.theme().secondary.opacity(0.6))
+                            .border_b_1()
+                            .border_color(border)
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::Device),
+                                "设备号",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::Device as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::Imr),
+                                "IMR",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::Imr as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(
+                                    ServiceRequestColumn::RequestTime,
+                                ),
+                                "请求时间",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::RequestTime as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::TimeoutMs),
+                                "超时(ms)",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::TimeoutMs as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::IsTest),
+                                "测试",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::IsTest as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::Requester),
+                                "请求者",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::Requester as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::ArgsJson),
+                                "其他参数",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::ArgsJson as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::Uuid),
+                                "UUID",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::Uuid as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(
+                                    ServiceRequestColumn::ResponseTime,
+                                ),
+                                "响应时间",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::ResponseTime as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(
+                                    ServiceRequestColumn::ResponseCode,
+                                ),
+                                "响应码(hex)",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::ResponseCode as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::Responser),
+                                "响应人",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::Responser as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_request_column_width(ServiceRequestColumn::Summary),
+                                "报文摘要",
+                                ResizableTableKind::ServiceRequest,
+                                ServiceRequestColumn::Summary as usize,
+                                cx,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id("svc-req-body-x-scroll")
+                    .w_full()
+                    .min_w(px(0.0))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.service_table_horizontal_scroll_handle)
+                    .child(
+                        div()
+                            .min_w(px(request_table_width))
+                            .w(px(request_table_width))
+                            .children(request_body_rows),
+                    ),
+            )
+            .child(
+                self.render_horizontal_scrollbar_row(
                     &self.service_table_horizontal_scroll_handle,
                     cx,
-                ));
+                ),
+            );
 
         let mut response_body_rows = Vec::new();
         for (idx, row) in response_rows.iter().enumerate() {
@@ -3478,49 +3853,49 @@ impl ConfigView {
                     .border_color(border)
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-request-uuid"),
-                        280.0,
+                        self.service_response_column_width(ServiceResponseColumn::RequestUuid),
                         &row.request_uuid,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-response-uuid"),
-                        280.0,
+                        self.service_response_column_width(ServiceResponseColumn::ResponseUuid),
                         &row.response_uuid,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-response-time"),
-                        180.0,
+                        self.service_response_column_width(ServiceResponseColumn::ResponseTime),
                         &row.response_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-response-code"),
-                        140.0,
+                        self.service_response_column_width(ServiceResponseColumn::ResponseCode),
                         &row.response_code_hex,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-responser"),
-                        110.0,
+                        self.service_response_column_width(ServiceResponseColumn::Responser),
                         &row.responser,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-receive-time"),
-                        180.0,
+                        self.service_response_column_width(ServiceResponseColumn::ReceiveTime),
                         &row.receive_time,
                         window,
                         cx,
                     ))
                     .child(self.render_prop_cell(
                         TableCellId::new(row.uid, "svc-resp-summary"),
-                        370.0,
+                        self.service_response_column_width(ServiceResponseColumn::Summary),
                         &row.summary,
                         window,
                         cx,
@@ -3570,13 +3945,67 @@ impl ConfigView {
                             .bg(cx.theme().secondary.opacity(0.6))
                             .border_b_1()
                             .border_color(border)
-                            .child(self.render_static_header_cell(280.0, "请求的UUID", cx))
-                            .child(self.render_static_header_cell(280.0, "响应的UUID", cx))
-                            .child(self.render_static_header_cell(180.0, "响应时间", cx))
-                            .child(self.render_static_header_cell(140.0, "响应码(hex)", cx))
-                            .child(self.render_static_header_cell(110.0, "响应人", cx))
-                            .child(self.render_static_header_cell(180.0, "实际接收时间", cx))
-                            .child(self.render_static_header_cell(370.0, "报文摘要", cx)),
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(
+                                    ServiceResponseColumn::RequestUuid,
+                                ),
+                                "请求的UUID",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::RequestUuid as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(
+                                    ServiceResponseColumn::ResponseUuid,
+                                ),
+                                "响应的UUID",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::ResponseUuid as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(
+                                    ServiceResponseColumn::ResponseTime,
+                                ),
+                                "响应时间",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::ResponseTime as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(
+                                    ServiceResponseColumn::ResponseCode,
+                                ),
+                                "响应码(hex)",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::ResponseCode as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(
+                                    ServiceResponseColumn::Responser,
+                                ),
+                                "响应人",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::Responser as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(
+                                    ServiceResponseColumn::ReceiveTime,
+                                ),
+                                "实际接收时间",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::ReceiveTime as usize,
+                                cx,
+                            ))
+                            .child(self.render_static_header_cell(
+                                self.service_response_column_width(ServiceResponseColumn::Summary),
+                                "报文摘要",
+                                ResizableTableKind::ServiceResponse,
+                                ServiceResponseColumn::Summary as usize,
+                                cx,
+                            )),
                     ),
             )
             .child(
@@ -3694,9 +4123,12 @@ impl ConfigView {
         &self,
         w: f32,
         text: &str,
+        table: ResizableTableKind,
+        column_ix: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
+            .relative()
             .w(px(w))
             .px_2()
             .py_2()
@@ -3708,6 +4140,7 @@ impl ConfigView {
                     .text_color(cx.theme().muted_foreground)
                     .text_ellipsis(),
             )
+            .child(self.render_column_resize_handle(table, column_ix, cx))
     }
 
     fn render_filterable_prop_header_cell(
@@ -3800,6 +4233,7 @@ impl ConfigView {
             });
 
         div()
+            .relative()
             .w(px(w))
             .h_full()
             .px_2()
@@ -3841,6 +4275,7 @@ impl ConfigView {
                     )
                     .child(popover),
             )
+            .child(self.render_column_resize_handle(ResizableTableKind::Prop, column_id, cx))
     }
 
     fn render_filterable_event_header_cell(
@@ -3933,6 +4368,7 @@ impl ConfigView {
             });
 
         div()
+            .relative()
             .w(px(w))
             .h_full()
             .px_2()
@@ -3974,6 +4410,7 @@ impl ConfigView {
                     )
                     .child(popover),
             )
+            .child(self.render_column_resize_handle(ResizableTableKind::Event, column_id, cx))
     }
 
     fn render_prop_cell(
@@ -5231,7 +5668,10 @@ async fn run_event_topic_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_event_rows_from_payload, parse_prop_rows_from_payload, topic_display_name};
+    use super::{
+        TABLE_COLUMN_MIN_WIDTH, TableColumnWidths, parse_event_rows_from_payload,
+        parse_prop_rows_from_payload, topic_display_name,
+    };
     use crate::proto::iothub::{
         AnyValue, ClockTime, DataFrame, DataHeader, DataRecord, DataRecordSet, EnumValue,
         EventRecord, EventRecordList, HiClockTime, any_value, data_record, enum_value,
@@ -5397,6 +5837,23 @@ mod tests {
         assert_eq!(rows[0].codes, "42");
         assert_eq!(rows[0].str_codes, "KKS-A");
         assert_eq!(rows[0].summary, "per");
+    }
+
+    #[test]
+    fn table_column_widths_resize_updates_total_width() {
+        let mut widths = TableColumnWidths::new([180.0, 120.0, 90.0]);
+        widths.resize_from_drag(1, 120.0, 35.0);
+
+        assert_eq!(widths.get(1), 155.0);
+        assert_eq!(widths.total(), 425.0);
+    }
+
+    #[test]
+    fn table_column_widths_resize_clamps_to_minimum() {
+        let mut widths = TableColumnWidths::new([180.0, 120.0]);
+        widths.resize_from_drag(0, 180.0, -500.0);
+
+        assert_eq!(widths.get(0), TABLE_COLUMN_MIN_WIDTH);
     }
 }
 

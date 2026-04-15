@@ -5,8 +5,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use crate::helpers::{
-    DeviceAction, MenuAction, ServerAction, get_or_create_log_dir, is_app_store_build,
-    is_development, new_key_bindings, supports_auto_update,
+    DeviceAction, MenuAction, ServerAction, WindowAction, get_or_create_log_dir,
+    handle_window_action, install_native_window_menu_shortcuts, is_app_store_build, is_development,
+    new_key_bindings, supports_auto_update,
 };
 use crate::services::ServiceHub;
 use crate::states::{
@@ -170,6 +171,10 @@ impl Render for DfcApp {
 
         // Action handlers
         content
+            .capture_action(cx.listener(|_this, e: &WindowAction, window, cx| {
+                handle_window_action(e, window);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(|_this, e: &ThemeAction, _window, cx| {
                 let mode = match e {
                     ThemeAction::Light => Some(ThemeMode::Light),
@@ -403,21 +408,30 @@ fn main() {
                 check_for_updates(true, cx);
             }
         });
-
         // Set up application menu
         let mut app_menu_items = vec![MenuItem::action("About DFC-GUI", MenuAction::About)];
-        if supports_auto_update() {
-            app_menu_items.push(MenuItem::action(
-                "Check for Updates...",
-                MenuAction::CheckForUpdates,
-            ));
-        }
+        app_menu_items.push(MenuItem::action(
+            "Check for Updates...",
+            MenuAction::CheckForUpdates,
+        ));
         app_menu_items.push(MenuItem::action("Quit", MenuAction::Quit));
 
-        cx.set_menus(vec![Menu {
-            name: "DFC-GUI".into(),
-            items: app_menu_items,
-        }]);
+        let window_menu = Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", WindowAction::Minimize),
+                MenuItem::action("Toggle Full Screen", WindowAction::ToggleFullscreen),
+            ],
+        };
+
+        cx.set_menus(vec![
+            Menu {
+                name: "DFC-GUI".into(),
+                items: app_menu_items,
+            },
+            window_menu,
+        ]);
+        install_native_window_menu_shortcuts();
 
         // Start services
         services.start();

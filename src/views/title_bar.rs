@@ -2,11 +2,11 @@
 //!
 //! Custom title bar with settings menu and branding.
 
+use crate::helpers::MenuAction;
 use crate::states::{
     DfcGlobalStore, FontSize, FontSizeAction, LocaleAction, SettingsAction, ThemeAction,
     i18n_sidebar, i18n_update,
 };
-use crate::{helpers::MenuAction, helpers::supports_auto_update};
 use gpui::{App, Context, Corner, Window, prelude::*};
 use gpui_component::{
     Icon, IconName, Sizable, ThemeMode, TitleBar,
@@ -72,15 +72,11 @@ impl DfcTitleBar {
                 Box::new(ThemeAction::System),
             );
 
-        if supports_auto_update() {
-            menu = menu.separator().menu_element_with_icon(
-                Icon::new(IconName::Globe),
-                Box::new(MenuAction::CheckForUpdates),
-                move |_window, cx| Label::new(i18n_update(cx, "check_for_updates")),
-            );
-        } else {
-            menu = menu.separator();
-        }
+        menu = menu.separator().menu_element_with_icon(
+            Icon::new(IconName::Globe),
+            Box::new(MenuAction::CheckForUpdates),
+            move |_window, cx| Label::new(i18n_update(cx, "check_for_updates")),
+        );
 
         menu.menu_element_with_icon(
             Icon::new(IconName::Info),

@@ -2,7 +2,7 @@
 //!
 //! Defines global keyboard shortcuts and action dispatching.
 
-use gpui::{Action, KeyBinding};
+use gpui::{Action, KeyBinding, Window};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -15,6 +15,15 @@ pub enum MenuAction {
     About,
     /// Check for application updates
     CheckForUpdates,
+}
+
+/// Window-level actions
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+pub enum WindowAction {
+    /// Minimize the active window
+    Minimize,
+    /// Toggle fullscreen for the active window
+    ToggleFullscreen,
 }
 
 /// Navigation actions
@@ -151,9 +160,17 @@ pub fn humanize_keystroke(keystroke: &str) -> String {
     display_text
 }
 
+/// Execute a window action against the currently active native window.
+pub fn handle_window_action(action: &WindowAction, window: &mut Window) {
+    match action {
+        WindowAction::Minimize => window.minimize_window(),
+        WindowAction::ToggleFullscreen => window.toggle_fullscreen(),
+    }
+}
+
 /// Create global keyboard bindings
 pub fn new_key_bindings() -> Vec<KeyBinding> {
-    vec![
+    let mut bindings = vec![
         // Application
         KeyBinding::new("secondary-q", MenuAction::Quit, None),
         // Navigation
@@ -170,5 +187,22 @@ pub fn new_key_bindings() -> Vec<KeyBinding> {
         // Commands
         KeyBinding::new("secondary-enter", CommandAction::Send, None),
         KeyBinding::new("escape", CommandAction::Cancel, None),
-    ]
+    ];
+
+    #[cfg(target_os = "macos")]
+    {
+        bindings.push(KeyBinding::new("secondary-m", WindowAction::Minimize, None));
+        bindings.push(KeyBinding::new(
+            "secondary-ctrl-f",
+            WindowAction::ToggleFullscreen,
+            None,
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        bindings.push(KeyBinding::new("f11", WindowAction::ToggleFullscreen, None));
+    }
+
+    bindings
 }
