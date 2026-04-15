@@ -339,12 +339,25 @@ impl ConfigState {
         cx.notify();
     }
 
-    /// Select a TopicAgentId
-    pub fn select_agent(&mut self, agent_id: Option<String>, cx: &mut Context<Self>) {
+    fn apply_agent_selection(&mut self, agent_id: Option<String>) -> bool {
+        if self.selected_agent_id == agent_id {
+            return false;
+        }
+
         self.selected_agent_id = agent_id;
         self.selected_topic_index = self
             .selected_agent()
             .and_then(Self::default_topic_index_for_agent);
+
+        true
+    }
+
+    /// Select a TopicAgentId
+    pub fn select_agent(&mut self, agent_id: Option<String>, cx: &mut Context<Self>) {
+        if !self.apply_agent_selection(agent_id) {
+            return;
+        }
+
         if let Some(agent) = self.selected_agent() {
             tracing::info!(
                 agent_id = %agent.agent_id,
@@ -739,5 +752,28 @@ mod tests {
         assert_eq!(state.selected_agent_id(), Some("B"));
         assert_eq!(state.selected_topic_index(), Some(0));
         assert_eq!(state.selected_topic_path(), Some("/b/prop"));
+    }
+
+    #[test]
+    fn apply_agent_selection_is_noop_for_same_agent() {
+        let mut state = ConfigState::new();
+
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent(
+                "A",
+                vec![(0, "/a/prop", true, "prop"), (1, "/a/event", true, "event")],
+                1,
+            )],
+        )]);
+        state.selected_agent_id = Some("A".to_string());
+        state.selected_topic_index = Some(1);
+
+        let changed = state.apply_agent_selection(Some("A".to_string()));
+
+        assert!(!changed);
+        assert_eq!(state.selected_agent_id(), Some("A"));
+        assert_eq!(state.selected_topic_index(), Some(1));
+        assert_eq!(state.selected_topic_path(), Some("/a/event"));
     }
 }
