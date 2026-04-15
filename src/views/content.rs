@@ -288,6 +288,34 @@ impl DfcContent {
         });
     }
 
+    fn showing_keys_browser(&self, cx: &App) -> bool {
+        let keys_state = self.keys_state.read(cx);
+        !keys_state.connected_servers().is_empty() && !keys_state.keys().is_empty()
+    }
+
+    fn showing_config_view(&self, cx: &App) -> bool {
+        self.app_state.read(cx).selected_server_id().is_some() && !self.showing_keys_browser(cx)
+    }
+
+    pub fn handle_filter_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.current_route, Route::Home) {
+            return;
+        }
+
+        if self.showing_keys_browser(cx) {
+            return;
+        }
+
+        if self.showing_config_view(cx) {
+            self.config_view.update(cx, |config_view, cx| {
+                let _ = config_view.handle_filter_shortcut(window, cx);
+            });
+            return;
+        }
+
+        self.focus_search(window, cx);
+    }
+
     /// Check if a server matches the current filter keyword
     fn server_matches_filter(&self, server: &DfcServerConfig) -> bool {
         if self.filter_keyword.is_empty() {
@@ -1130,13 +1158,12 @@ impl DfcContent {
     /// Render the home view with server cards, config view, or keys browser
     fn render_home(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Priority 1: If we have connected servers with keys loaded - show KeysBrowserView
-        let keys_state = self.keys_state.read(cx);
-        if !keys_state.connected_servers().is_empty() && !keys_state.keys().is_empty() {
+        if self.showing_keys_browser(cx) {
             return self.keys_browser_view.clone().into_any_element();
         }
 
         // Priority 2: If a server is selected - show ConfigView (config list)
-        if self.app_state.read(cx).selected_server_id().is_some() {
+        if self.showing_config_view(cx) {
             return self.config_view.clone().into_any_element();
         }
 
@@ -1252,9 +1279,10 @@ impl Render for DfcContent {
             .track_focus(&self.focus_handle)
             .bg(cx.theme().background)
             .child(content)
-            .on_action(cx.listener(|this, _: &DeviceAction, window, cx| {
-                // Focus the search input when Cmd+F / Ctrl+F is pressed
-                this.focus_search(window, cx);
+            .on_action(cx.listener(|this, action: &DeviceAction, window, cx| {
+                if matches!(action, DeviceAction::Filter) {
+                    this.handle_filter_shortcut(window, cx);
+                }
             }))
     }
 }

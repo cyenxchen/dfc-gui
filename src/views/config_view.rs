@@ -20,8 +20,9 @@ use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
 use futures::StreamExt;
 use gpui::{
-    Action, App, Context, Corner, Entity, Focusable, MouseButton, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*, px,
+    Action, App, Context, Corner, Entity, FocusHandle, Focusable, MouseButton, ScrollHandle,
+    ScrollWheelEvent, StatefulInteractiveElement as _, Subscription, Task, Window, div, prelude::*,
+    px,
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
@@ -349,6 +350,8 @@ pub struct ConfigView {
     /// Search input state for filtering TopicAgentIds
     agent_search_state: Entity<InputState>,
     agent_query_mode: AgentQueryMode,
+    agent_list_focus_handle: FocusHandle,
+    topic_content_focus_handle: FocusHandle,
     /// Prop topic table state (for `prop_data` topics)
     prop_table_state: Entity<PropTableState>,
     /// Per-column filter inputs for the prop topic table
@@ -414,6 +417,8 @@ impl ConfigView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut subscriptions = Vec::new();
+        let agent_list_focus_handle = cx.focus_handle();
+        let topic_content_focus_handle = cx.focus_handle();
 
         // Create agent search input
         let agent_search_state = cx.new(|cx| {
@@ -709,6 +714,8 @@ impl ConfigView {
             keys_state,
             agent_search_state,
             agent_query_mode: AgentQueryMode::default(),
+            agent_list_focus_handle,
+            topic_content_focus_handle,
             prop_table_state,
             prop_filter_inputs,
             prop_table_scroll_handle: ScrollHandle::default(),
@@ -796,6 +803,21 @@ impl ConfigView {
                 });
             }
         }
+    }
+
+    pub fn handle_filter_shortcut(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.agent_list_focus_handle.contains_focused(window, cx) {
+            return false;
+        }
+
+        let input = self.agent_search_state.clone();
+        window.defer(cx, move |window, cx| {
+            let handle = input.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+        });
+
+        true
     }
 
     fn stop_prop_stream(&mut self) {
@@ -2270,6 +2292,7 @@ impl ConfigView {
             .w(px(AGENT_LIST_WIDTH))
             .h_full()
             .bg(secondary_bg)
+            .track_focus(&self.agent_list_focus_handle)
             // Search input
             .child(
                 h_flex()
@@ -2370,6 +2393,7 @@ impl ConfigView {
             .min_h(px(0.0))
             .h_full()
             .overflow_hidden()
+            .track_focus(&self.topic_content_focus_handle)
             // Top bar spacer (align with left search bar)
             .child(
                 h_flex()

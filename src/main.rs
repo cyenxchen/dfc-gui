@@ -222,7 +222,7 @@ impl Render for DfcApp {
             .on_action(cx.listener(|this, e: &DeviceAction, window, cx| {
                 if matches!(e, DeviceAction::Filter) {
                     this.content.update(cx, |content, cx| {
-                        content.focus_search(window, cx);
+                        content.handle_filter_shortcut(window, cx);
                     });
                 }
             }))
