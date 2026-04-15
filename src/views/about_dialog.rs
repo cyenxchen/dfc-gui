@@ -1,5 +1,6 @@
 //! About dialog window.
 
+use crate::helpers::{WindowAction, handle_window_action};
 use crate::states::i18n_about;
 use chrono::{Datelike, Local};
 use gpui::{
@@ -34,6 +35,10 @@ impl Render for AboutDialog {
             .justify_center()
             .bg(cx.theme().background)
             .gap_4()
+            .capture_action(cx.listener(|_this, e: &WindowAction, window, cx| {
+                handle_window_action(e, window);
+                cx.stop_propagation();
+            }))
             .child(
                 h_flex().items_center().justify_center().child(
                     Label::new("DFC-GUI")
@@ -53,7 +58,7 @@ impl Render for AboutDialog {
                     .text_color(cx.theme().muted_foreground),
             )
             .child(
-                Label::new(format!("© {years} Goldwind. All rights reserved."))
+                Label::new(format!("© {years} Cyenx. All rights reserved."))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground),
             )

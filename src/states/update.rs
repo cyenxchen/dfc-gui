@@ -212,12 +212,27 @@ fn extract_release_notes(html: &str) -> Option<String> {
     let end = remainder.find("</div>")?;
     let fragment = &remainder[..end];
     let text = html_to_text(fragment);
-    let trimmed = text.trim();
+    let filtered = filter_release_notes(&text);
+    let trimmed = filtered.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn filter_release_notes(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .skip_while(|line| is_release_notes_heading(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_release_notes_heading(line: &str) -> bool {
+    let normalized = line.trim().trim_end_matches(':').to_ascii_lowercase();
+    normalized == "changes" || normalized.starts_with("changes since v")
 }
 
 fn html_to_text(fragment: &str) -> String {
@@ -694,5 +709,27 @@ pub fn restart_app(cx: &mut App) {
     #[cfg(not(target_os = "macos"))]
     {
         cx.quit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_release_notes;
+
+    #[test]
+    fn filter_release_notes_removes_leading_changes_headers() {
+        let notes = "Changes\nChanges since v0.0.5:\n9ec8cc9 fix: preserve reconnect state\n5a5bd2e fix: improve macOS DMG packaging layout";
+
+        assert_eq!(
+            filter_release_notes(notes),
+            "9ec8cc9 fix: preserve reconnect state\n5a5bd2e fix: improve macOS DMG packaging layout"
+        );
+    }
+
+    #[test]
+    fn filter_release_notes_preserves_normal_content() {
+        let notes = "9ec8cc9 fix: preserve reconnect state\n5a5bd2e fix: improve macOS DMG packaging layout";
+
+        assert_eq!(filter_release_notes(notes), notes);
     }
 }

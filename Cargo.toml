@@ -2,7 +2,7 @@
 name = "dfc-gui"
 version = "0.0.5"
 edition = "2024"
-authors = ["Goldwind DFC Team"]
+authors = ["Cyenx"]
 description = "DFC GUI - A native GUI client for device fleet control"
 license = "Apache-2.0"
 build = "build.rs"
@@ -70,6 +70,10 @@ prost-types = "0.13"
 winres = "0.1"
 prost-build = "0.13"
 protoc-bin-vendored = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
 
 [lints.clippy]
 unwrap_used = "deny"

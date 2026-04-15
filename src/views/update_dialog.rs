@@ -1,5 +1,6 @@
 //! Standalone update dialog window.
 
+use crate::helpers::{WindowAction, handle_window_action};
 use crate::states::i18n_update;
 use crate::states::update::{
     DfcUpdateState, DfcUpdateStore, ReleaseInfo, UpdateStatus, check_for_updates, current_version,
@@ -76,10 +77,14 @@ impl UpdateDialog {
             );
         }
 
-        let mut layout = v_flex()
-            .gap_3()
-            .size_full()
-            .p_4()
+        let mut layout = v_flex().gap_3().size_full().px_4().pb_4().pt(px(16.0));
+
+        #[cfg(target_os = "macos")]
+        {
+            layout = layout.pt(px(28.0));
+        }
+
+        let mut layout = layout
             .child(
                 Label::new(i18n_update(cx, "new_version_available"))
                     .text_lg()
@@ -416,6 +421,10 @@ impl Render for UpdateDialog {
         v_flex()
             .size_full()
             .bg(cx.theme().background)
+            .capture_action(cx.listener(|_this, e: &WindowAction, window, cx| {
+                handle_window_action(e, window);
+                cx.stop_propagation();
+            }))
             .child(content)
     }
 }
