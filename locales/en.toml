@@ -175,6 +175,7 @@ delete_tooltip = "Delete server"
 switch_to_grid_tooltip = "Switch to grid view"
 switch_to_list_tooltip = "Switch to list view"
 save_config = "Add Configuration"
+update_config = "Save Configuration"
 
 # Messages
 remove_prompt = "Are you sure you want to remove server \"{server}\"?"

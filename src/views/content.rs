@@ -602,7 +602,11 @@ impl DfcContent {
                 .footer({
                     let handle = handle_submit.clone();
                     move |_, _, _, cx| {
-                        let submit_label = i18n_servers(cx, "save_config");
+                        let submit_label = if is_new {
+                            i18n_servers(cx, "save_config")
+                        } else {
+                            i18n_servers(cx, "update_config")
+                        };
                         let cancel_label = i18n_common(cx, "cancel");
 
                         vec![

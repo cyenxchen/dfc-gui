@@ -175,6 +175,7 @@ delete_tooltip = "删除服务器"
 switch_to_grid_tooltip = "切换到平铺视图"
 switch_to_list_tooltip = "切换到列表视图"
 save_config = "添加配置"
+update_config = "保存配置"
 
 # 消息
 remove_prompt = "确定要删除服务器 \"{server}\" 吗？"
