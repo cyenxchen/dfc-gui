@@ -2446,6 +2446,7 @@ impl ConfigView {
             cx.theme().border
         };
         let agent_id_for_click = agent_id.clone();
+        let is_selected_for_click = is_selected;
 
         let count_color = if is_selected {
             cx.theme().foreground.opacity(0.72)
@@ -2488,6 +2489,10 @@ impl ConfigView {
                     ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
+                if is_selected_for_click {
+                    return;
+                }
+
                 this.config_state.update(cx, |state, cx| {
                     state.select_agent(Some(agent_id_for_click.clone()), cx);
                 });
