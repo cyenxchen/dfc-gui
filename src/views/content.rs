@@ -427,6 +427,7 @@ impl DfcContent {
         let cfgid_state = self.cfgid_state.clone();
         let device_filter_state = self.device_filter_state.clone();
         let pulsar_token_state = self.pulsar_token_state.clone();
+        let config_state = self.config_state.clone();
         let server_id = self.editing_server_id.clone();
         let is_new = server_id.is_empty();
 
@@ -438,6 +439,7 @@ impl DfcContent {
         let cfgid_state_clone = cfgid_state.clone();
         let device_filter_state_clone = device_filter_state.clone();
         let pulsar_token_state_clone = pulsar_token_state.clone();
+        let config_state_clone = config_state.clone();
         let app_state_clone = app_state.clone();
         let server_id_clone = server_id.clone();
 
@@ -531,6 +533,19 @@ impl DfcContent {
             app_state_clone.update(cx, |state, cx| {
                 state.upsert_server(candidate.clone(), cx);
             });
+
+            let should_reconnect = !server_id_clone.is_empty()
+                && config_state_clone
+                    .read(cx)
+                    .connected_server_ids()
+                    .iter()
+                    .any(|id| id == &server_id_clone);
+
+            if should_reconnect {
+                let store = cx.global::<DfcGlobalStore>().clone();
+                store.set_pending_server(server_id_clone.clone());
+                window.dispatch_action(Box::new(crate::helpers::ServerAction::Reconnect), cx);
+            }
 
             true
         });

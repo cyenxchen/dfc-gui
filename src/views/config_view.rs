@@ -647,6 +647,18 @@ impl ConfigView {
         // it to clear filter input fields on topic transitions.
         subscriptions.push(
             cx.observe_in(&config_state, window, |this, _model, window, cx| {
+                let load_state = this.config_state.read(cx).load_state().clone();
+                if matches!(
+                    load_state,
+                    ConfigLoadState::Loading | ConfigLoadState::Error(_)
+                ) {
+                    this.stop_prop_stream();
+                    this.stop_event_stream();
+                    this.stop_service_stream();
+                    cx.notify();
+                    return;
+                }
+
                 let query = this.agent_search_state.read(cx).value().trim().to_string();
                 if !query.is_empty() {
                     let selected = this

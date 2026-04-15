@@ -33,6 +33,19 @@ pub struct DfcSidebar {
 }
 
 impl DfcSidebar {
+    fn is_home_overview_active(&self, cx: &mut Context<Self>) -> bool {
+        if self.current_route != Route::Home {
+            return false;
+        }
+
+        if self.app_state.read(cx).selected_server_id().is_some() {
+            return false;
+        }
+
+        let keys_state = self.keys_state.read(cx);
+        keys_state.connected_servers().is_empty() || keys_state.keys().is_empty()
+    }
+
     /// Create a new sidebar
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = Vec::new();
@@ -82,7 +95,11 @@ impl DfcSidebar {
         label_key: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_active = self.current_route == route;
+        let is_active = if route == Route::Home {
+            self.is_home_overview_active(cx)
+        } else {
+            self.current_route == route
+        };
         let label = i18n_sidebar(cx, label_key);
         let tooltip_label = label.clone();
         let list_active = cx.theme().list_active;

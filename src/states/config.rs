@@ -164,6 +164,50 @@ impl ConfigState {
             })
     }
 
+    fn selected_topic_path(&self) -> Option<&str> {
+        let idx = self.selected_topic_index? as usize;
+        self.selected_agent()
+            .and_then(|agent| agent.topics.get(idx))
+            .map(|topic| topic.path.as_str())
+    }
+
+    fn topic_index_by_path(agent: &TopicAgentItem, topic_path: &str) -> Option<i32> {
+        agent
+            .topics
+            .iter()
+            .position(|topic| topic.path == topic_path)
+            .map(|idx| idx as i32)
+    }
+
+    fn restore_previous_selection(
+        &mut self,
+        previous_agent_id: Option<&str>,
+        previous_topic_path: Option<&str>,
+    ) -> bool {
+        let Some(previous_agent_id) = previous_agent_id else {
+            return false;
+        };
+
+        let Some(agent) = self
+            .topic_agents_merged
+            .iter()
+            .find(|agent| agent.agent_id == previous_agent_id)
+        else {
+            return false;
+        };
+
+        if agent.topics.is_empty() {
+            return false;
+        }
+
+        self.selected_agent_id = Some(agent.agent_id.clone());
+        self.selected_topic_index = previous_topic_path
+            .and_then(|topic_path| Self::topic_index_by_path(agent, topic_path))
+            .or_else(|| Self::default_topic_index_for_agent(agent));
+
+        true
+    }
+
     fn rebuild_topic_agents_merged(&mut self) {
         #[derive(Clone, Debug)]
         struct MergedTopicMeta {
@@ -232,9 +276,20 @@ impl ConfigState {
     // ==================== Setters ====================
 
     fn apply_configs(&mut self, configs: Vec<ConfigItem>) {
+        let previous_agent_id = self.selected_agent_id.clone();
+        let previous_topic_path = self.selected_topic_path().map(ToOwned::to_owned);
+
         self.configs = configs;
         self.rebuild_topic_agents_merged();
         self.selected_config_id = None;
+
+        if self.restore_previous_selection(
+            previous_agent_id.as_deref(),
+            previous_topic_path.as_deref(),
+        ) {
+            self.load_state = ConfigLoadState::Loaded;
+            return;
+        }
 
         // Initialize selection to first agent/topic when available
         if let Some((agent_id, topic_index)) = self.default_agent_selection() {
@@ -600,5 +655,89 @@ mod tests {
 
         assert_eq!(state.selected_agent_id(), Some("B"));
         assert_eq!(state.selected_topic_index(), Some(0));
+    }
+
+    #[test]
+    fn apply_configs_restores_previous_agent_and_topic_by_path() {
+        let mut state = ConfigState::new();
+
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent(
+                "A",
+                vec![(0, "/a/prop", true, "prop"), (1, "/a/event", true, "event")],
+                1,
+            )],
+        )]);
+        state.selected_agent_id = Some("A".to_string());
+        state.selected_topic_index = Some(1);
+
+        state.apply_configs(vec![make_config(
+            2,
+            vec![make_agent(
+                "A",
+                vec![
+                    (10, "/a/other", true, "prop"),
+                    (20, "/a/event", true, "event"),
+                ],
+                2,
+            )],
+        )]);
+
+        assert_eq!(state.selected_agent_id(), Some("A"));
+        assert_eq!(state.selected_topic_index(), Some(1));
+        assert_eq!(state.selected_topic_path(), Some("/a/event"));
+    }
+
+    #[test]
+    fn apply_configs_restores_previous_agent_and_falls_back_when_topic_missing() {
+        let mut state = ConfigState::new();
+
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent(
+                "A",
+                vec![(0, "/a/event", true, "event"), (1, "/a/prop", true, "prop")],
+                1,
+            )],
+        )]);
+        state.selected_agent_id = Some("A".to_string());
+        state.selected_topic_index = Some(0);
+
+        state.apply_configs(vec![make_config(
+            2,
+            vec![make_agent("A", vec![(5, "/a/prop", true, "prop")], 2)],
+        )]);
+
+        assert_eq!(state.selected_agent_id(), Some("A"));
+        assert_eq!(state.selected_topic_index(), Some(0));
+        assert_eq!(state.selected_topic_path(), Some("/a/prop"));
+    }
+
+    #[test]
+    fn apply_configs_skips_restoring_empty_previous_agent() {
+        let mut state = ConfigState::new();
+
+        state.apply_configs(vec![make_config(
+            1,
+            vec![
+                make_agent("A", vec![(0, "/a/event", true, "event")], 1),
+                make_agent("B", vec![(0, "/b/prop", true, "prop")], 1),
+            ],
+        )]);
+        state.selected_agent_id = Some("A".to_string());
+        state.selected_topic_index = Some(0);
+
+        state.apply_configs(vec![make_config(
+            2,
+            vec![
+                make_agent("A", vec![], 2),
+                make_agent("B", vec![(0, "/b/prop", true, "prop")], 2),
+            ],
+        )]);
+
+        assert_eq!(state.selected_agent_id(), Some("B"));
+        assert_eq!(state.selected_topic_index(), Some(0));
+        assert_eq!(state.selected_topic_path(), Some("/b/prop"));
     }
 }
