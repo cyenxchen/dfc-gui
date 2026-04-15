@@ -54,6 +54,96 @@ pub const REQUEST_TYPES: &[(&str, &str)] = &[
 /// Index of the "自定义" entry — used as the default selection.
 pub const CUSTOM_TYPE_INDEX: usize = REQUEST_TYPES.len() - 1;
 
+pub(super) fn normalize_pulsar_service_url(raw: &str) -> Option<String> {
+    let cleaned = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    (!pulsar_service_url_candidates(cleaned).is_empty()).then(|| cleaned.to_string())
+}
+
+pub(super) fn pulsar_service_url_candidates(raw: &str) -> Vec<String> {
+    let cleaned = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some((scheme, rest)) = cleaned.split_once("://") {
+        return pulsar_service_url_candidates_with_scheme(rest, &format!("{scheme}://"));
+    }
+
+    pulsar_service_url_candidates_with_scheme(cleaned, "pulsar://")
+}
+
+fn pulsar_service_url_candidates_with_scheme(raw: &str, scheme: &str) -> Vec<String> {
+    let (authority_list, path) = match raw.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (raw, None),
+    };
+
+    if path.is_some_and(|path| !path.is_empty()) {
+        return Vec::new();
+    }
+
+    authority_list
+        .split(',')
+        .map(str::trim)
+        .filter(|authority| !authority.is_empty())
+        .filter_map(|authority| normalize_pulsar_authority(authority, scheme))
+        .collect()
+}
+
+fn normalize_pulsar_authority(authority: &str, scheme: &str) -> Option<String> {
+    if authority.is_empty()
+        || authority.contains('{')
+        || authority.contains('}')
+        || authority.contains('/')
+        || authority.contains(';')
+        || authority.contains(',')
+        || authority.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+
+    Some(format!("{scheme}{authority}"))
+}
+
+pub(super) async fn build_pulsar_client_with_fallbacks(
+    service_urls: &[String],
+    token: Option<&str>,
+) -> Result<(pulsar::Pulsar<pulsar::TokioExecutor>, String), String> {
+    if service_urls.is_empty() {
+        return Err("无法解析 Pulsar service URL".to_string());
+    }
+
+    let mut errors = Vec::new();
+
+    for service_url in service_urls {
+        let mut builder = pulsar::Pulsar::builder(service_url.clone(), pulsar::TokioExecutor);
+        if let Some(token) = token {
+            builder = builder.with_auth(pulsar::Authentication {
+                name: "token".to_string(),
+                data: token.as_bytes().to_vec(),
+            });
+        }
+
+        match builder.build().await {
+            Ok(client) => return Ok((client, service_url.clone())),
+            Err(err) => {
+                tracing::warn!(
+                    service_url = %service_url,
+                    "Failed to connect Pulsar client: {}",
+                    err
+                );
+                errors.push(format!("{service_url}: {err}"));
+            }
+        }
+    }
+
+    Err(errors.join(" | "))
+}
+
 /// Events emitted by the background stream loop into the GPUI side.
 #[derive(Debug)]
 pub enum ServiceStreamEvent {
@@ -192,36 +282,41 @@ pub async fn run_service_topic_stream(
     tx: Sender<ServiceStreamEvent>,
     uid: Arc<AtomicU64>,
 ) {
-    let mut builder = pulsar::Pulsar::builder(service_url.clone(), pulsar::TokioExecutor);
-    if let Some(token) = token {
-        builder = builder.with_auth(pulsar::Authentication {
-            name: "token".to_string(),
-            data: token.into_bytes(),
-        });
+    let service_urls = pulsar_service_url_candidates(&service_url);
+    if service_urls.is_empty() {
+        let _ = tx.send(ServiceStreamEvent::Error(format!(
+            "Pulsar 连接失败: 无法解析 service URL: {service_url}"
+        )));
+        return;
     }
 
-    let client: pulsar::Pulsar<_> = match builder.build().await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(ServiceStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
-            return;
-        }
-    };
+    let (client, connected_service_url): (pulsar::Pulsar<_>, String) =
+        match build_pulsar_client_with_fallbacks(&service_urls, token.as_deref()).await {
+            Ok(client) => client,
+            Err(e) => {
+                let _ = tx.send(ServiceStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
+                return;
+            }
+        };
 
-    let subscription = format!("dfc-gui-svc-{}", uuid::Uuid::new_v4());
-    let consumer_name = format!("dfc-gui-svc-consumer-{}", uuid::Uuid::new_v4());
-
-    let consumer_options = pulsar::ConsumerOptions::default()
-        .durable(false)
-        .with_receiver_queue_size(1000);
+    tracing::info!(
+        service_url = %connected_service_url,
+        request_topic = %request_topic,
+        response_topic = %response_topic,
+        "connected service topic stream"
+    );
 
     let mut consumer: pulsar::Consumer<Vec<u8>, _> = match client
         .consumer()
         .with_topic(&response_topic)
-        .with_subscription(subscription)
+        .with_subscription(format!("dfc-gui-svc-{}", uuid::Uuid::new_v4()))
         .with_subscription_type(pulsar::SubType::Shared)
-        .with_consumer_name(consumer_name)
-        .with_options(consumer_options)
+        .with_consumer_name(format!("dfc-gui-svc-consumer-{}", uuid::Uuid::new_v4()))
+        .with_options(
+            pulsar::ConsumerOptions::default()
+                .durable(false)
+                .with_receiver_queue_size(1000),
+        )
         .build()
         .await
     {
@@ -354,6 +449,25 @@ mod tests {
         assert_eq!(decoded.time_out, 5000);
         assert_eq!(decoded.requester, "V8Test");
         assert_eq!(decoded.args.len(), 1);
+    }
+
+    #[test]
+    fn pulsar_service_url_candidates_expand_multi_broker_list() {
+        assert_eq!(
+            pulsar_service_url_candidates(
+                "pulsar://10.10.4.101:6650,10.10.4.102:6650,10.10.4.103:6650"
+            ),
+            vec![
+                "pulsar://10.10.4.101:6650".to_string(),
+                "pulsar://10.10.4.102:6650".to_string(),
+                "pulsar://10.10.4.103:6650".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pulsar_service_url_candidates_reject_bus_style_addresses() {
+        assert!(pulsar_service_url_candidates("10.10.4.101:15000;10.10.4.102:15000").is_empty());
     }
 
     #[test]

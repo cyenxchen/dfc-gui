@@ -6,7 +6,8 @@
 
 use super::service_panel::{
     self, CUSTOM_TYPE_INDEX, REQUEST_TYPES, ServicePublishRequest, ServiceStreamEvent,
-    run_service_topic_stream,
+    build_pulsar_client_with_fallbacks, normalize_pulsar_service_url,
+    pulsar_service_url_candidates, run_service_topic_stream,
 };
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
@@ -4957,7 +4958,8 @@ fn find_topic_origin(configs: &[ConfigItem], topic_path: &str) -> Option<(String
             for topic in &agent.topics {
                 if topic.path == topic_path {
                     let cfgid = extract_cfgid_from_source(&config.source)?;
-                    return Some((config.service_url.clone(), cfgid));
+                    let service_url = resolve_pulsar_service_url(configs, config, Some(&cfgid))?;
+                    return Some((service_url, cfgid));
                 }
             }
         }
@@ -4970,12 +4972,30 @@ fn find_topic_service_url(configs: &[ConfigItem], topic_path: &str) -> Option<St
         for agent in &config.topic_agents {
             for topic in &agent.topics {
                 if topic.path == topic_path {
-                    return Some(config.service_url.clone());
+                    let cfgid = extract_cfgid_from_source(&config.source);
+                    return resolve_pulsar_service_url(configs, config, cfgid.as_deref());
                 }
             }
         }
     }
     None
+}
+
+fn resolve_pulsar_service_url(
+    configs: &[ConfigItem],
+    matched_config: &ConfigItem,
+    cfgid: Option<&str>,
+) -> Option<String> {
+    normalize_pulsar_service_url(&matched_config.service_url).or_else(|| {
+        cfgid.and_then(|cfgid| {
+            configs
+                .iter()
+                .filter(|config| {
+                    extract_cfgid_from_source(&config.source).as_deref() == Some(cfgid)
+                })
+                .find_map(|config| normalize_pulsar_service_url(&config.service_url))
+        })
+    })
 }
 
 fn extract_cfgid_from_source(source: &str) -> Option<String> {
@@ -5272,54 +5292,12 @@ async fn run_prop_topic_stream(
             std::collections::HashMap::new()
         }
     };
-
-    let mut builder = pulsar::Pulsar::builder(service_url.clone(), pulsar::TokioExecutor);
-    if let Some(token) = token {
-        builder = builder.with_auth(pulsar::Authentication {
-            name: "token".to_string(),
-            data: token.into_bytes(),
-        });
-    }
-
-    let client: pulsar::Pulsar<_> = match builder.build().await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(PropStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
-            return;
-        }
-    };
-
-    // Diagnostic: list broker topics to verify target exists.
-    if let Some(namespace) = topic_path.split("://").nth(1).and_then(|rest| {
-        let mut parts = rest.splitn(3, '/');
-        let tenant = parts.next()?;
-        let ns = parts.next()?;
-        Some(format!("{tenant}/{ns}"))
-    }) {
-        use pulsar::message::proto::command_get_topics_of_namespace::Mode;
-        let mode = if topic_path.starts_with("persistent://") {
-            Mode::Persistent
-        } else {
-            Mode::NonPersistent
-        };
-        match client
-            .get_topics_of_namespace(namespace.clone(), mode)
-            .await
-        {
-            Ok(topics) => {
-                let found = topics.iter().any(|t| *t == topic_path);
-                tracing::debug!(
-                    namespace = %namespace,
-                    total = topics.len(),
-                    target = %topic_path,
-                    found,
-                    "Topic namespace listing"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e)
-            }
-        }
+    let service_urls = pulsar_service_url_candidates(&service_url);
+    if service_urls.is_empty() {
+        let _ = tx.send(PropStreamEvent::Error(format!(
+            "无法解析 Pulsar service URL: {service_url}"
+        )));
+        return;
     }
     let subscription = format!("dfc-gui-prop-{}", uuid::Uuid::new_v4());
 
@@ -5346,6 +5324,55 @@ async fn run_prop_topic_stream(
             tokio::time::sleep(backoff).await;
             if *stop.borrow() {
                 return;
+            }
+        }
+
+        let (client, connected_service_url): (pulsar::Pulsar<_>, String) =
+            match build_pulsar_client_with_fallbacks(&service_urls, token.as_deref()).await {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = tx.send(PropStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
+                    continue;
+                }
+            };
+
+        tracing::info!(
+            topic = %topic_path,
+            service_url = %connected_service_url,
+            attempt = connect_attempt,
+            "connected prop topic client"
+        );
+
+        // Diagnostic: list broker topics to verify target exists.
+        if let Some(namespace) = topic_path.split("://").nth(1).and_then(|rest| {
+            let mut parts = rest.splitn(3, '/');
+            let tenant = parts.next()?;
+            let ns = parts.next()?;
+            Some(format!("{tenant}/{ns}"))
+        }) {
+            use pulsar::message::proto::command_get_topics_of_namespace::Mode;
+            let mode = if topic_path.starts_with("persistent://") {
+                Mode::Persistent
+            } else {
+                Mode::NonPersistent
+            };
+            match client
+                .get_topics_of_namespace(namespace.clone(), mode)
+                .await
+            {
+                Ok(topics) => {
+                    let found = topics.iter().any(|t| *t == topic_path);
+                    tracing::debug!(
+                        namespace = %namespace,
+                        total = topics.len(),
+                        target = %topic_path,
+                        found,
+                        "Topic namespace listing"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e)
+                }
             }
         }
 
@@ -5488,52 +5515,12 @@ async fn run_event_topic_stream(
     tx: Sender<EventStreamEvent>,
     uid: Arc<AtomicU64>,
 ) {
-    let mut builder = pulsar::Pulsar::builder(service_url.clone(), pulsar::TokioExecutor);
-    if let Some(token) = token {
-        builder = builder.with_auth(pulsar::Authentication {
-            name: "token".to_string(),
-            data: token.into_bytes(),
-        });
-    }
-
-    let client: pulsar::Pulsar<_> = match builder.build().await {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(EventStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
-            return;
-        }
-    };
-
-    if let Some(namespace) = topic_path.split("://").nth(1).and_then(|rest| {
-        let mut parts = rest.splitn(3, '/');
-        let tenant = parts.next()?;
-        let ns = parts.next()?;
-        Some(format!("{tenant}/{ns}"))
-    }) {
-        use pulsar::message::proto::command_get_topics_of_namespace::Mode;
-        let mode = if topic_path.starts_with("persistent://") {
-            Mode::Persistent
-        } else {
-            Mode::NonPersistent
-        };
-        match client
-            .get_topics_of_namespace(namespace.clone(), mode)
-            .await
-        {
-            Ok(topics) => {
-                let found = topics.iter().any(|t| *t == topic_path);
-                tracing::debug!(
-                    namespace = %namespace,
-                    total = topics.len(),
-                    target = %topic_path,
-                    found,
-                    "Topic namespace listing"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e)
-            }
-        }
+    let service_urls = pulsar_service_url_candidates(&service_url);
+    if service_urls.is_empty() {
+        let _ = tx.send(EventStreamEvent::Error(format!(
+            "无法解析 Pulsar service URL: {service_url}"
+        )));
+        return;
     }
     let subscription = format!("dfc-gui-event-{}", uuid::Uuid::new_v4());
 
@@ -5559,6 +5546,54 @@ async fn run_event_topic_stream(
             tokio::time::sleep(backoff).await;
             if *stop.borrow() {
                 return;
+            }
+        }
+
+        let (client, connected_service_url): (pulsar::Pulsar<_>, String) =
+            match build_pulsar_client_with_fallbacks(&service_urls, token.as_deref()).await {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = tx.send(EventStreamEvent::Error(format!("Pulsar 连接失败: {e}")));
+                    continue;
+                }
+            };
+
+        tracing::info!(
+            topic = %topic_path,
+            service_url = %connected_service_url,
+            attempt = connect_attempt,
+            "connected event topic client"
+        );
+
+        if let Some(namespace) = topic_path.split("://").nth(1).and_then(|rest| {
+            let mut parts = rest.splitn(3, '/');
+            let tenant = parts.next()?;
+            let ns = parts.next()?;
+            Some(format!("{tenant}/{ns}"))
+        }) {
+            use pulsar::message::proto::command_get_topics_of_namespace::Mode;
+            let mode = if topic_path.starts_with("persistent://") {
+                Mode::Persistent
+            } else {
+                Mode::NonPersistent
+            };
+            match client
+                .get_topics_of_namespace(namespace.clone(), mode)
+                .await
+            {
+                Ok(topics) => {
+                    let found = topics.iter().any(|t| *t == topic_path);
+                    tracing::debug!(
+                        namespace = %namespace,
+                        total = topics.len(),
+                        target = %topic_path,
+                        found,
+                        "Topic namespace listing"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(namespace = %namespace, "Failed to list namespace topics: {}", e)
+                }
             }
         }
 
@@ -5692,9 +5727,11 @@ async fn run_event_topic_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        TABLE_COLUMN_MIN_WIDTH, TableColumnWidths, parse_event_rows_from_payload,
-        parse_prop_rows_from_payload, topic_display_name,
+        TABLE_COLUMN_MIN_WIDTH, TableColumnWidths, find_topic_service_url,
+        normalize_pulsar_service_url, parse_event_rows_from_payload, parse_prop_rows_from_payload,
+        topic_display_name,
     };
+    use crate::connection::{ConfigItem, TopicAgentItem, TopicDetail};
     use crate::proto::iothub::{
         AnyValue, ClockTime, DataFrame, DataHeader, DataRecord, DataRecordSet, EnumValue,
         EventRecord, EventRecordList, HiClockTime, any_value, data_record, enum_value,
@@ -5746,6 +5783,57 @@ mod tests {
         assert_eq!(
             topic_display_name("persistent://goldwind/iothub/thing_event-BZ-626221420272574464"),
             "thing_event-BZ"
+        );
+    }
+
+    #[test]
+    fn normalize_pulsar_service_url_rejects_redis_key_fallback() {
+        assert_eq!(
+            normalize_pulsar_service_url("pulsar://CMC/{DCC0001}/sg.og.output.iothub"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_pulsar_service_url_preserves_multi_endpoint_input() {
+        assert_eq!(
+            normalize_pulsar_service_url("10.10.4.101:6650,10.10.4.102:6650"),
+            Some("10.10.4.101:6650,10.10.4.102:6650".to_string())
+        );
+    }
+
+    #[test]
+    fn find_topic_service_url_falls_back_to_sibling_cfgid_config() {
+        let topic_path = "persistent://goldwind/iothub/thing_event-BZ-650412879542296576";
+        let configs = vec![
+            ConfigItem {
+                group_id: 1,
+                service_url: "pulsar://CMC/{DCC0001}/sg.og.output.iothub".to_string(),
+                source: "CMC_{DCC0001}_sg.og.output.iothub".to_string(),
+                details: Vec::new(),
+                topic_agents: vec![TopicAgentItem {
+                    agent_id: "650412879542296576".to_string(),
+                    topics: vec![TopicDetail {
+                        index: 0,
+                        path: topic_path.to_string(),
+                        visibility: true,
+                        topic_type: "event".to_string(),
+                    }],
+                    group_id: 1,
+                }],
+            },
+            ConfigItem {
+                group_id: 2,
+                service_url: "10.10.4.101:6650,10.10.4.102:6650".to_string(),
+                source: "CMC_{DCC0001}_sg.bus".to_string(),
+                details: Vec::new(),
+                topic_agents: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            find_topic_service_url(&configs, topic_path),
+            Some("10.10.4.101:6650,10.10.4.102:6650".to_string())
         );
     }
 
