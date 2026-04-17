@@ -21,6 +21,16 @@ use tokio::sync::RwLock;
 
 use super::ServiceEvent;
 
+struct ActiveRedisClient {
+    client: FredClient,
+}
+
+impl ActiveRedisClient {
+    fn new(client: FredClient) -> Self {
+        Self { client }
+    }
+}
+
 /// Configuration for Redis connection
 #[derive(Clone, Debug)]
 pub struct RedisConfig {
@@ -50,19 +60,18 @@ pub struct RedisRepo {
     config: RedisConfig,
     tx: Sender<ServiceEvent>,
     /// Redis client instance
-    client: Arc<RwLock<Option<FredClient>>>,
-    /// Prevent swapping the active client while requests are still using it.
-    client_access: Arc<RwLock<()>>,
+    client: Arc<RwLock<Option<Arc<ActiveRedisClient>>>>,
 }
 
 impl RedisRepo {
+    const RETIRED_CLIENT_MAX_WAIT_SECS: u64 = 60;
+
     /// Create a new Redis repository
     pub fn new(config: &RedisConfig, tx: Sender<ServiceEvent>) -> Result<Self> {
         Ok(Self {
             config: config.clone(),
             tx,
             client: Arc::new(RwLock::new(None)),
-            client_access: Arc::new(RwLock::new(())),
         })
     }
 
@@ -162,7 +171,7 @@ impl RedisRepo {
         Err(err)
     }
 
-    async fn current_client(&self) -> Result<FredClient> {
+    async fn current_client(&self) -> Result<Arc<ActiveRedisClient>> {
         let guard = self.client.read().await;
         guard.as_ref().cloned().ok_or_else(|| Error::Connection {
             message: "Not connected to Redis".to_string(),
@@ -175,9 +184,72 @@ impl RedisRepo {
         Fut: Future<Output = Result<T>> + Send + 'static,
         T: Send + 'static,
     {
-        let _access_guard = self.client_access.read().await;
-        let client = self.current_client().await?;
-        super::run_in_tokio(async move { f(client).await }).await
+        // Clone the current client handle first so reconnects can swap in a new
+        // client even if an older request is still blocked on network I/O.
+        let client_handle = self.current_client().await?;
+        super::run_in_tokio(async move {
+            let _client_handle = client_handle;
+            let client = _client_handle.client.clone();
+            f(client).await
+        })
+        .await
+    }
+
+    async fn shutdown_client(client: FredClient, reason: &'static str) {
+        match tokio::time::timeout(Duration::from_secs(2), client.quit()).await {
+            Ok(Ok(())) => {
+                tracing::debug!(reason, "Redis client closed");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(reason, error = %err, "Failed to close Redis client");
+            }
+            Err(_) => {
+                tracing::warn!(reason, timeout_secs = 2, "Timed out closing Redis client");
+            }
+        }
+    }
+
+    fn retired_client_max_wait(&self) -> Duration {
+        Duration::from_secs(
+            self.config
+                .timeout_secs
+                .max(Self::RETIRED_CLIENT_MAX_WAIT_SECS),
+        )
+    }
+
+    async fn retire_client(
+        client_handle: Arc<ActiveRedisClient>,
+        max_wait: Duration,
+        reason: &'static str,
+    ) {
+        let mut wait_logged = false;
+        let deadline = tokio::time::Instant::now() + max_wait;
+
+        while Arc::strong_count(&client_handle) > 1 {
+            if !wait_logged {
+                tracing::info!(
+                    reason,
+                    max_wait_secs = max_wait.as_secs(),
+                    outstanding_handles = Arc::strong_count(&client_handle) - 1,
+                    "Waiting for in-flight Redis requests before closing retired client"
+                );
+                wait_logged = true;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    reason,
+                    max_wait_secs = max_wait.as_secs(),
+                    outstanding_handles = Arc::strong_count(&client_handle) - 1,
+                    "Timed out waiting for retired Redis client; forcing shutdown"
+                );
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Self::shutdown_client(client_handle.client.clone(), reason).await;
     }
 
     /// Store a successfully connected client and notify
@@ -187,9 +259,29 @@ impl RedisRepo {
         server_name: &str,
         via: &str,
     ) -> Result<()> {
-        let _access_guard = self.client_access.write().await;
-        let mut guard = self.client.write().await;
-        *guard = Some(client);
+        let next_client = Arc::new(ActiveRedisClient::new(client));
+        let retire_wait_timeout = self.retired_client_max_wait();
+        let previous_client = {
+            let mut guard = self.client.write().await;
+            guard.replace(next_client)
+        };
+
+        tracing::info!(
+            server_name,
+            via,
+            replaced_previous = previous_client.is_some(),
+            "Stored active Redis client"
+        );
+
+        if let Some(previous_client) = previous_client {
+            tracing::info!(
+                server_name,
+                "Closing previous Redis client after successful reconnect"
+            );
+            super::spawn_named_in_tokio("redis-close-previous-client", async move {
+                Self::retire_client(previous_client, retire_wait_timeout, "reconnect").await;
+            });
+        }
 
         let _ = self.tx.send(ServiceEvent::ConnectionState {
             service: "redis".into(),
@@ -298,17 +390,17 @@ impl RedisRepo {
 
     /// Disconnect from current server
     pub async fn disconnect(&self) {
-        let _access_guard = self.client_access.write().await;
-        let client = {
+        let retire_wait_timeout = self.retired_client_max_wait();
+        let client_handle = {
             let mut guard = self.client.write().await;
             guard.take()
         };
 
-        if let Some(client) = client {
-            let _ = super::run_in_tokio(async move {
-                let _ = client.quit().await;
-            })
-            .await;
+        if let Some(client_handle) = client_handle {
+            tracing::info!("Disconnecting active Redis client");
+            super::spawn_named_in_tokio("redis-disconnect-client", async move {
+                Self::retire_client(client_handle, retire_wait_timeout, "disconnect").await;
+            });
         }
 
         let _ = self.tx.send(ServiceEvent::ConnectionState {
@@ -1711,14 +1803,14 @@ mod tests {
     }
 
     #[test]
-    fn switching_client_waits_for_inflight_request() {
+    fn switching_client_does_not_wait_for_inflight_request() {
         crate::services::block_on(async {
             let (tx, _rx) = crossbeam_channel::unbounded();
             let repo = Arc::new(RedisRepo::new(&RedisConfig::default(), tx).expect("repo"));
 
             {
                 let mut guard = repo.client.write().await;
-                *guard = Some(FredClient::default());
+                *guard = Some(Arc::new(ActiveRedisClient::new(FredClient::default())));
             }
 
             let (started_tx, started_rx) = oneshot::channel();
@@ -1750,16 +1842,32 @@ mod tests {
             });
 
             sleep(Duration::from_millis(50)).await;
-            assert!(!swapped.load(Ordering::SeqCst));
+            assert!(swapped.load(Ordering::SeqCst));
+
+            swap_task.await.expect("swap join").expect("swap ok");
 
             let _ = release_tx.send(());
-
             request_task
                 .await
                 .expect("request join")
                 .expect("request ok");
-            swap_task.await.expect("swap join").expect("swap ok");
-            assert!(swapped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn retired_client_forces_shutdown_after_grace_period() {
+        crate::services::block_on(async {
+            let client_handle = Arc::new(ActiveRedisClient::new(FredClient::default()));
+            let leaked_handle = client_handle.clone();
+
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                RedisRepo::retire_client(client_handle, Duration::from_millis(50), "test"),
+            )
+            .await
+            .expect("retire client timed out");
+
+            drop(leaked_handle);
         });
     }
 }

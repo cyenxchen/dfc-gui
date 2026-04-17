@@ -145,8 +145,14 @@ impl KeysBrowserView {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 let key_clone = key.clone();
-                this.keys_state.update(cx, |state, cx| {
+                let active_server_id = this
+                    .keys_state
+                    .read(cx)
+                    .active_server_id()
+                    .map(str::to_string);
+                let value_generation = this.keys_state.update(cx, |state, cx| {
                     state.select_key(Some(key_clone.clone()), cx);
+                    state.value_generation()
                 });
 
                 // Fetch the key value
@@ -159,13 +165,41 @@ impl KeysBrowserView {
                     match redis.get_key_value(&key_for_fetch).await {
                         Ok(value) => {
                             let _ = keys_state.update(cx, |state, cx| {
-                                state.set_selected_value(value, cx);
+                                if state.active_server_id() == active_server_id.as_deref()
+                                    && state.selected_key() == Some(key_for_fetch.as_str())
+                                    && state.value_generation() == value_generation
+                                {
+                                    state.set_selected_value(value, cx);
+                                } else {
+                                    tracing::info!(
+                                        server_id = ?active_server_id.as_deref(),
+                                        key = %key_for_fetch,
+                                        value_generation,
+                                        "Ignoring stale key value response after active selection changed"
+                                    );
+                                }
                             });
                         }
                         Err(e) => {
                             tracing::error!("Failed to get key value: {}", e);
                             let _ = keys_state.update(cx, |state, cx| {
-                                state.set_selected_value(RedisKeyValue::Error(e.to_string()), cx);
+                                if state.active_server_id() == active_server_id.as_deref()
+                                    && state.selected_key() == Some(key_for_fetch.as_str())
+                                    && state.value_generation() == value_generation
+                                {
+                                    state.set_selected_value(
+                                        RedisKeyValue::Error(e.to_string()),
+                                        cx,
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        server_id = ?active_server_id.as_deref(),
+                                        key = %key_for_fetch,
+                                        value_generation,
+                                        error = %e,
+                                        "Ignoring stale key value error after active selection changed"
+                                    );
+                                }
                             });
                         }
                     }
@@ -259,6 +293,13 @@ impl KeysBrowserView {
                                     .label(load_more_label)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let cursor = this.keys_state.read(cx).scan_cursor();
+                                        let active_server_id = this
+                                            .keys_state
+                                            .read(cx)
+                                            .active_server_id()
+                                            .map(str::to_string);
+                                        let list_generation =
+                                            this.keys_state.read(cx).list_generation();
                                         let store = cx.global::<DfcGlobalStore>().clone();
                                         let keys_state = this.keys_state.clone();
 
@@ -267,7 +308,22 @@ impl KeysBrowserView {
                                             match redis.scan_keys("*", cursor, 100).await {
                                                 Ok((keys, next_cursor)) => {
                                                     let _ = keys_state.update(cx, |state, cx| {
-                                                        state.append_keys(keys, next_cursor, cx);
+                                                        if state.active_server_id()
+                                                            == active_server_id.as_deref()
+                                                            && state.scan_cursor() == cursor
+                                                            && state.list_generation()
+                                                                == list_generation
+                                                        {
+                                                            state.append_keys(keys, next_cursor, cx);
+                                                        } else {
+                                                            tracing::info!(
+                                                                server_id = ?active_server_id.as_deref(),
+                                                                list_generation,
+                                                                cursor,
+                                                                next_cursor,
+                                                                "Ignoring stale key pagination response after active server changed"
+                                                            );
+                                                        }
                                                     });
                                                 }
                                                 Err(e) => {

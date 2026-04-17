@@ -2134,9 +2134,10 @@ impl ConfigView {
                 let config_source = config_source_for_click.clone();
 
                 if let Some(server) = server {
+                    let server_id = server.id.clone();
                     // Add to connected servers
                     let server_info = ConnectedServerInfo {
-                        server_id: server.id.clone(),
+                        server_id: server_id.clone(),
                         server_name: server.name.clone(),
                         config_source: Some(config_source.clone()),
                     };
@@ -2145,6 +2146,7 @@ impl ConfigView {
                         state.add_connected_server(server_info, cx);
                         state.set_loading(cx);
                     });
+                    let list_generation = this.keys_state.read(cx).list_generation();
 
                     // Load keys for this config pattern
                     let keys_state = this.keys_state.clone();
@@ -2159,13 +2161,35 @@ impl ConfigView {
                             Ok((keys, cursor)) => {
                                 tracing::info!("Loaded {} keys, cursor: {}", keys.len(), cursor);
                                 let _ = keys_state.update(cx, |state, cx| {
-                                    state.set_keys(keys, cursor, cx);
+                                    if state.active_server_id() == Some(server_id.as_str())
+                                        && state.list_generation() == list_generation
+                                    {
+                                        state.set_keys(keys, cursor, cx);
+                                    } else {
+                                        tracing::info!(
+                                            server_id,
+                                            list_generation,
+                                            cursor,
+                                            "Ignoring stale key scan response after active server changed"
+                                        );
+                                    }
                                 });
                             }
                             Err(e) => {
                                 tracing::error!("Failed to scan keys: {}", e);
                                 let _ = keys_state.update(cx, |state, cx| {
-                                    state.set_error(e.to_string(), cx);
+                                    if state.active_server_id() == Some(server_id.as_str())
+                                        && state.list_generation() == list_generation
+                                    {
+                                        state.set_error(e.to_string(), cx);
+                                    } else {
+                                        tracing::info!(
+                                            server_id,
+                                            list_generation,
+                                            error = %e,
+                                            "Ignoring stale key scan error after active server changed"
+                                        );
+                                    }
                                 });
                             }
                         }

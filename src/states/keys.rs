@@ -53,6 +53,10 @@ pub struct KeysState {
     scan_cursor: u64,
     /// Whether more keys are available to load
     has_more_keys: bool,
+    /// Monotonic generation for async key list requests.
+    list_generation: u64,
+    /// Monotonic generation for async selected-value requests.
+    value_generation: u64,
 }
 
 impl KeysState {
@@ -68,6 +72,8 @@ impl KeysState {
             active_server_id: None,
             scan_cursor: 0,
             has_more_keys: false,
+            list_generation: 0,
+            value_generation: 0,
         }
     }
 
@@ -143,6 +149,24 @@ impl KeysState {
         self.scan_cursor
     }
 
+    /// Get the current async key-list request generation.
+    pub fn list_generation(&self) -> u64 {
+        self.list_generation
+    }
+
+    /// Get the current async selected-value request generation.
+    pub fn value_generation(&self) -> u64 {
+        self.value_generation
+    }
+
+    fn bump_list_generation(&mut self) {
+        self.list_generation = self.list_generation.wrapping_add(1);
+    }
+
+    fn bump_value_generation(&mut self) {
+        self.value_generation = self.value_generation.wrapping_add(1);
+    }
+
     // ==================== Setters ====================
 
     /// Set keys list
@@ -165,6 +189,7 @@ impl KeysState {
 
     /// Set loading state
     pub fn set_loading(&mut self, cx: &mut Context<Self>) {
+        self.bump_list_generation();
         self.load_state = KeysLoadState::Loading;
         cx.notify();
     }
@@ -177,6 +202,7 @@ impl KeysState {
 
     /// Select a key
     pub fn select_key(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        self.bump_value_generation();
         self.selected_key = key;
         // Reset value when changing selection
         self.selected_value = RedisKeyValue::Loading;
@@ -237,6 +263,8 @@ impl KeysState {
 
     /// Clear keys (but keep connected servers)
     pub fn clear_keys(&mut self, cx: &mut Context<Self>) {
+        self.bump_list_generation();
+        self.bump_value_generation();
         self.keys.clear();
         self.selected_key = None;
         self.selected_value = RedisKeyValue::Empty;
@@ -249,6 +277,8 @@ impl KeysState {
 
     /// Clear all state
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.bump_list_generation();
+        self.bump_value_generation();
         self.keys.clear();
         self.load_state = KeysLoadState::Idle;
         self.selected_key = None;
