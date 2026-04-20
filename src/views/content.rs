@@ -694,19 +694,8 @@ impl DfcContent {
             }
         });
 
-        self.config_state.update(cx, |state, cx| {
-            state.set_loading(cx);
-            state.add_connected_server(server_id.clone(), cx);
-        });
-
         self.app_state.update(cx, |state, cx| {
             state.select_server(Some(server_id.clone()), cx);
-        });
-
-        cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
-            store.update(cx, |state, cx| {
-                state.go_to(Route::Home, cx);
-            });
         });
 
         let config_state = self.config_state.clone();
@@ -714,6 +703,17 @@ impl DfcContent {
         let store = cx.global::<DfcGlobalStore>().clone();
         let reconnect_request_id = self.reconnect_request_id.clone();
         let request_id = reconnect_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+
+        self.config_state.update(cx, |state, cx| {
+            state.add_connected_server(server_id.clone(), cx);
+            state.set_loading_for_server_request(&server_id, request_id, cx);
+        });
+
+        cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
+            store.update(cx, |state, cx| {
+                state.go_to(Route::Home, cx);
+            });
+        });
 
         cx.spawn(async move |_, cx| {
             let redis = store.services().redis();
@@ -734,15 +734,23 @@ impl DfcContent {
                         error = %e,
                         "Ignoring stale reconnect error after server selection changed"
                     );
+                    let _ = config_state.update(cx, |state, cx| {
+                        state.restore_stale_loading_for_server_request(&server_id, request_id, cx);
+                    });
                     return;
                 }
                 tracing::error!("Failed to connect to Redis: {}", e);
                 let _ = config_state.update(cx, |state, cx| {
                     if reconnect_request_id.load(Ordering::Acquire) == request_id {
-                        state.set_error(e.to_string(), cx);
+                        state.set_error_for_server_request(
+                            &server_id,
+                            request_id,
+                            e.to_string(),
+                            cx,
+                        );
                     } else {
                         tracing::info!(
-                            server_id,
+                                server_id,
                             request_id,
                             error = %e,
                             "Ignoring stale reconnect error during state write"
@@ -768,12 +776,17 @@ impl DfcContent {
                             config_count = configs.len(),
                             "Ignoring stale reconnect configs after newer request completed"
                         );
+                        let _ = config_state.update(cx, |state, cx| {
+                            state.restore_stale_loading_for_server_request(
+                                &server_id, request_id, cx,
+                            );
+                        });
                         return;
                     }
                     tracing::info!("Fetched {} configs", configs.len());
                     let _ = config_state.update(cx, |state, cx| {
                         if reconnect_request_id.load(Ordering::Acquire) == request_id {
-                            state.set_configs(configs, cx);
+                            state.set_configs_for_server(&server_id, configs, cx);
                         } else {
                             tracing::info!(
                                 server_id,
@@ -799,12 +812,22 @@ impl DfcContent {
                             error = %e,
                             "Ignoring stale reconnect fetch error after newer request completed"
                         );
+                        let _ = config_state.update(cx, |state, cx| {
+                            state.restore_stale_loading_for_server_request(
+                                &server_id, request_id, cx,
+                            );
+                        });
                         return;
                     }
                     tracing::error!("Failed to fetch configs: {}", e);
                     let _ = config_state.update(cx, |state, cx| {
                         if reconnect_request_id.load(Ordering::Acquire) == request_id {
-                            state.set_error(e.to_string(), cx);
+                            state.set_error_for_server_request(
+                                &server_id,
+                                request_id,
+                                e.to_string(),
+                                cx,
+                            );
                         } else {
                             tracing::info!(
                                 server_id,

@@ -42,6 +42,7 @@ use gpui_component::{
 use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -91,6 +92,23 @@ enum EventStreamEvent {
 enum TopicFeedbackKind {
     Switching,
     Loading,
+}
+
+#[derive(Default)]
+struct ServerTopicRuntime {
+    active_prop_topic: Option<String>,
+    prop_state: PropTableState,
+    prop_stream_stop: Option<watch::Sender<bool>>,
+    prop_ingest_task: Option<Task<()>>,
+    active_event_topic: Option<String>,
+    event_state: EventTableState,
+    event_stream_stop: Option<watch::Sender<bool>>,
+    event_ingest_task: Option<Task<()>>,
+    active_service_topic: Option<String>,
+    service_state: ServiceTableState,
+    service_stream_stop: Option<watch::Sender<bool>>,
+    service_publish_tx: Option<Sender<ServicePublishRequest>>,
+    service_ingest_task: Option<Task<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +194,7 @@ impl Render for ColumnResizeGhost {
     }
 }
 
-type TopicSelectionKey = (Option<String>, Option<String>);
+type TopicSelectionKey = (Option<String>, Option<String>, Option<String>);
 
 fn topic_display_name(topic_path: &str) -> String {
     if topic_path.contains("thing_service-BZ-RESPONSE")
@@ -487,23 +505,17 @@ pub struct ConfigView {
     service_request_column_widths: TableColumnWidths<SERVICE_REQUEST_COLUMN_COUNT>,
     service_response_column_widths: TableColumnWidths<SERVICE_RESPONSE_COLUMN_COUNT>,
     active_column_resize: Option<ActiveColumnResize>,
-    active_service_topic: Option<String>,
-    service_stream_stop: Option<watch::Sender<bool>>,
+    /// Service publish sender for the currently visible server/topic session.
     service_publish_tx: Option<Sender<ServicePublishRequest>>,
-    service_ingest_task: Option<Task<()>>,
+    /// Per-server topic runtimes keep their own table caches and background streams alive.
+    server_topic_runtimes: BTreeMap<String, ServerTopicRuntime>,
+    /// Skip pushing visible state back into the runtime cache for the next prop-state observe.
+    suppress_prop_state_persist: bool,
+    /// Skip pushing visible state back into the runtime cache for the next event-state observe.
+    suppress_event_state_persist: bool,
+    /// Skip pushing visible state back into the runtime cache for the next service-state observe.
+    suppress_service_state_persist: bool,
     service_row_uid: Arc<AtomicU64>,
-    /// Active prop topic path (to avoid restarting streams on every notify)
-    active_prop_topic: Option<String>,
-    /// Stop signal for the active prop topic stream (tokio)
-    prop_stream_stop: Option<watch::Sender<bool>>,
-    /// UI-side ingest task draining prop rows from channel
-    prop_ingest_task: Option<Task<()>>,
-    /// Active event topic path (to avoid restarting streams on every notify)
-    active_event_topic: Option<String>,
-    /// Stop signal for the active event topic stream (tokio)
-    event_stream_stop: Option<watch::Sender<bool>>,
-    /// UI-side ingest task draining event rows from channel
-    event_ingest_task: Option<Task<()>>,
     /// Monotonic row id generator
     prop_row_uid: Arc<AtomicU64>,
     /// Monotonic event row id generator
@@ -738,13 +750,28 @@ impl ConfigView {
             ));
         }
 
-        subscriptions.push(cx.observe(&prop_table_state, |_this, _model, cx| {
+        subscriptions.push(cx.observe(&prop_table_state, |this, _model, cx| {
+            if this.suppress_prop_state_persist {
+                this.suppress_prop_state_persist = false;
+            } else {
+                this.persist_visible_prop_state_for_current_server(cx);
+            }
             cx.notify();
         }));
-        subscriptions.push(cx.observe(&event_table_state, |_this, _model, cx| {
+        subscriptions.push(cx.observe(&event_table_state, |this, _model, cx| {
+            if this.suppress_event_state_persist {
+                this.suppress_event_state_persist = false;
+            } else {
+                this.persist_visible_event_state_for_current_server(cx);
+            }
             cx.notify();
         }));
-        subscriptions.push(cx.observe(&service_table_state, |_this, _model, cx| {
+        subscriptions.push(cx.observe(&service_table_state, |this, _model, cx| {
+            if this.suppress_service_state_persist {
+                this.suppress_service_state_persist = false;
+            } else {
+                this.persist_visible_service_state_for_current_server(cx);
+            }
             cx.notify();
         }));
         subscriptions.push(cx.on_blur(
@@ -762,16 +789,33 @@ impl ConfigView {
         // it to clear filter input fields on topic transitions.
         subscriptions.push(
             cx.observe_in(&config_state, window, |this, _model, window, cx| {
-                let load_state = this.config_state.read(cx).load_state().clone();
-                if matches!(
-                    load_state,
-                    ConfigLoadState::Loading | ConfigLoadState::Error(_)
-                ) {
-                    this.stop_prop_stream();
-                    this.stop_event_stream();
-                    this.stop_service_stream();
-                    cx.notify();
-                    return;
+                let connected_server_ids =
+                    this.config_state.read(cx).connected_server_ids().to_vec();
+                let stale_server_ids: Vec<String> = this
+                    .server_topic_runtimes
+                    .keys()
+                    .filter(|server_id| !connected_server_ids.iter().any(|id| id == *server_id))
+                    .cloned()
+                    .collect();
+                for server_id in stale_server_ids {
+                    this.stop_prop_stream_for_server(&server_id);
+                    this.stop_event_stream_for_server(&server_id);
+                    this.stop_service_stream_for_server(&server_id);
+                    this.server_topic_runtimes.remove(&server_id);
+                }
+
+                let load_state = this.config_state.read(cx).load_state();
+                if let Some(server_id) = this.current_server_id(cx) {
+                    if matches!(
+                        load_state,
+                        ConfigLoadState::Loading | ConfigLoadState::Error(_)
+                    ) {
+                        this.stop_prop_stream_for_server(&server_id);
+                        this.stop_event_stream_for_server(&server_id);
+                        this.stop_service_stream_for_server(&server_id);
+                        cx.notify();
+                        return;
+                    }
                 }
 
                 let query = this.agent_search_state.read(cx).value().trim().to_string();
@@ -849,22 +893,17 @@ impl ConfigView {
                 SERVICE_RESPONSE_DEFAULT_COLUMN_WIDTHS,
             ),
             active_column_resize: None,
-            active_service_topic: None,
-            service_stream_stop: None,
             service_publish_tx: None,
-            service_ingest_task: None,
+            server_topic_runtimes: BTreeMap::new(),
+            suppress_prop_state_persist: false,
+            suppress_event_state_persist: false,
+            suppress_service_state_persist: false,
             service_row_uid,
-            active_prop_topic: None,
-            prop_stream_stop: None,
-            prop_ingest_task: None,
-            active_event_topic: None,
-            event_stream_stop: None,
-            event_ingest_task: None,
             prop_row_uid,
             event_row_uid,
             topic_feedback_frame: 0,
             _topic_feedback_task: None,
-            last_selection_key: (None, None),
+            last_selection_key: (None, None, None),
             switch_feedback_until: None,
             _subscriptions: subscriptions,
         }
@@ -1115,35 +1154,286 @@ impl ConfigView {
         true
     }
 
-    fn stop_prop_stream(&mut self) {
-        if let Some(stop) = self.prop_stream_stop.take() {
-            let _ = stop.send(true);
-        }
-        if let Some(task) = self.prop_ingest_task.take() {
-            drop(task);
-        }
-        self.active_prop_topic = None;
+    fn current_server_id(&self, cx: &App) -> Option<String> {
+        self.app_state
+            .read(cx)
+            .selected_server_id()
+            .map(str::to_string)
     }
 
-    fn stop_event_stream(&mut self) {
-        if let Some(stop) = self.event_stream_stop.take() {
-            let _ = stop.send(true);
+    fn current_selected_topic_path_raw(&self, cx: &App) -> Option<String> {
+        let state = self.config_state.read(cx);
+        match (state.selected_agent(), state.selected_topic_index()) {
+            (Some(agent), Some(idx)) => agent.topics.get(idx as usize).map(|t| t.path.clone()),
+            _ => None,
         }
-        if let Some(task) = self.event_ingest_task.take() {
-            drop(task);
-        }
-        self.active_event_topic = None;
     }
 
-    fn stop_service_stream(&mut self) {
-        if let Some(stop) = self.service_stream_stop.take() {
+    fn current_runtime_mut(&mut self, server_id: &str) -> &mut ServerTopicRuntime {
+        self.server_topic_runtimes
+            .entry(server_id.to_string())
+            .or_default()
+    }
+
+    fn stop_prop_stream_for_server(&mut self, server_id: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        if let Some(stop) = runtime.prop_stream_stop.take() {
             let _ = stop.send(true);
         }
-        if let Some(task) = self.service_ingest_task.take() {
+        if let Some(task) = runtime.prop_ingest_task.take() {
             drop(task);
         }
-        self.active_service_topic = None;
-        self.service_publish_tx = None;
+        runtime.active_prop_topic = None;
+    }
+
+    fn stop_event_stream_for_server(&mut self, server_id: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        if let Some(stop) = runtime.event_stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = runtime.event_ingest_task.take() {
+            drop(task);
+        }
+        runtime.active_event_topic = None;
+    }
+
+    fn stop_service_stream_for_server(&mut self, server_id: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        if let Some(stop) = runtime.service_stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = runtime.service_ingest_task.take() {
+            drop(task);
+        }
+        runtime.active_service_topic = None;
+        runtime.service_publish_tx = None;
+    }
+
+    fn persist_visible_prop_state_for_current_server(&mut self, cx: &mut Context<Self>) {
+        let Some(server_id) = self.current_server_id(cx) else {
+            return;
+        };
+        let Some(topic_path) = self.current_selected_topic_path_raw(cx) else {
+            return;
+        };
+        if !Self::is_prop_topic_path(&topic_path) {
+            return;
+        }
+
+        let snapshot = self.prop_table_state.read(cx).clone();
+        let runtime = self.current_runtime_mut(&server_id);
+        runtime.prop_state = snapshot;
+        runtime.active_prop_topic = Some(topic_path);
+    }
+
+    fn persist_visible_event_state_for_current_server(&mut self, cx: &mut Context<Self>) {
+        let Some(server_id) = self.current_server_id(cx) else {
+            return;
+        };
+        let Some(topic_path) = self.current_selected_topic_path_raw(cx) else {
+            return;
+        };
+        if !Self::is_event_topic_path(&topic_path) {
+            return;
+        }
+
+        let snapshot = self.event_table_state.read(cx).clone();
+        let runtime = self.current_runtime_mut(&server_id);
+        runtime.event_state = snapshot;
+        runtime.active_event_topic = Some(topic_path);
+    }
+
+    fn persist_visible_service_state_for_current_server(&mut self, cx: &mut Context<Self>) {
+        let Some(server_id) = self.current_server_id(cx) else {
+            return;
+        };
+        let Some(topic_path) = self.current_selected_topic_path_raw(cx) else {
+            return;
+        };
+        if !Self::is_service_topic_path(&topic_path) {
+            return;
+        }
+
+        let snapshot = self.service_table_state.read(cx).clone();
+        let runtime = self.current_runtime_mut(&server_id);
+        runtime.service_state = snapshot;
+        runtime.active_service_topic = Some(topic_path);
+    }
+
+    fn sync_prop_filter_inputs_from_visible_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let filters = self.prop_table_state.read(cx).filters().clone();
+        for (column, entity) in [
+            (
+                PropSortColumn::GlobalUuid,
+                self.prop_filter_inputs.global_uuid.clone(),
+            ),
+            (
+                PropSortColumn::Device,
+                self.prop_filter_inputs.device.clone(),
+            ),
+            (PropSortColumn::Imr, self.prop_filter_inputs.imr.clone()),
+            (PropSortColumn::Imid, self.prop_filter_inputs.imid.clone()),
+            (PropSortColumn::Value, self.prop_filter_inputs.value.clone()),
+            (
+                PropSortColumn::Quality,
+                self.prop_filter_inputs.quality.clone(),
+            ),
+            (PropSortColumn::Bcrid, self.prop_filter_inputs.bcrid.clone()),
+            (PropSortColumn::Time, self.prop_filter_inputs.time.clone()),
+            (
+                PropSortColumn::MessageTime,
+                self.prop_filter_inputs.message_time.clone(),
+            ),
+            (
+                PropSortColumn::Summary,
+                self.prop_filter_inputs.summary.clone(),
+            ),
+        ] {
+            let value = filters.get(column).to_string();
+            entity.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+            });
+        }
+    }
+
+    fn sync_event_filter_inputs_from_visible_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let filters = self.event_table_state.read(cx).filters().clone();
+        for (column, entity) in [
+            (EventSortColumn::Uuid, self.event_filter_inputs.uuid.clone()),
+            (
+                EventSortColumn::Device,
+                self.event_filter_inputs.device.clone(),
+            ),
+            (EventSortColumn::Imr, self.event_filter_inputs.imr.clone()),
+            (
+                EventSortColumn::EventType,
+                self.event_filter_inputs.event_type.clone(),
+            ),
+            (
+                EventSortColumn::Level,
+                self.event_filter_inputs.level.clone(),
+            ),
+            (EventSortColumn::Tags, self.event_filter_inputs.tags.clone()),
+            (
+                EventSortColumn::Codes,
+                self.event_filter_inputs.codes.clone(),
+            ),
+            (
+                EventSortColumn::StrCodes,
+                self.event_filter_inputs.str_codes.clone(),
+            ),
+            (
+                EventSortColumn::HappenedTime,
+                self.event_filter_inputs.happened_time.clone(),
+            ),
+            (
+                EventSortColumn::RecordTime,
+                self.event_filter_inputs.record_time.clone(),
+            ),
+            (
+                EventSortColumn::BcrId,
+                self.event_filter_inputs.bcr_id.clone(),
+            ),
+            (
+                EventSortColumn::Context,
+                self.event_filter_inputs.context.clone(),
+            ),
+            (
+                EventSortColumn::Summary,
+                self.event_filter_inputs.summary.clone(),
+            ),
+        ] {
+            let value = filters.get(column).to_string();
+            entity.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+            });
+        }
+    }
+
+    fn load_visible_prop_state_for_server(
+        &mut self,
+        server_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self
+            .server_topic_runtimes
+            .get(server_id)
+            .map(|runtime| runtime.prop_state.clone())
+            .unwrap_or_default();
+        self.replace_visible_prop_state(snapshot, cx);
+        self.sync_prop_filter_inputs_from_visible_state(window, cx);
+    }
+
+    fn load_visible_event_state_for_server(
+        &mut self,
+        server_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self
+            .server_topic_runtimes
+            .get(server_id)
+            .map(|runtime| runtime.event_state.clone())
+            .unwrap_or_default();
+        self.replace_visible_event_state(snapshot, cx);
+        self.sync_event_filter_inputs_from_visible_state(window, cx);
+    }
+
+    fn load_visible_service_state_for_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        let snapshot = self
+            .server_topic_runtimes
+            .get(server_id)
+            .map(|runtime| runtime.service_state.clone())
+            .unwrap_or_default();
+        let publish_tx = self
+            .server_topic_runtimes
+            .get(server_id)
+            .and_then(|runtime| runtime.service_publish_tx.clone());
+        self.replace_visible_service_state(snapshot, cx);
+        self.service_publish_tx = publish_tx;
+    }
+
+    fn replace_visible_prop_state(&mut self, snapshot: PropTableState, cx: &mut Context<Self>) {
+        self.suppress_prop_state_persist = true;
+        self.prop_table_state.update(cx, |state, cx| {
+            *state = snapshot;
+            cx.notify();
+        });
+    }
+
+    fn replace_visible_event_state(&mut self, snapshot: EventTableState, cx: &mut Context<Self>) {
+        self.suppress_event_state_persist = true;
+        self.event_table_state.update(cx, |state, cx| {
+            *state = snapshot;
+            cx.notify();
+        });
+    }
+
+    fn replace_visible_service_state(
+        &mut self,
+        snapshot: ServiceTableState,
+        cx: &mut Context<Self>,
+    ) {
+        self.suppress_service_state_persist = true;
+        self.service_table_state.update(cx, |state, cx| {
+            *state = snapshot;
+            cx.notify();
+        });
     }
 
     fn is_prop_topic_path(topic_path: &str) -> bool {
@@ -1168,6 +1458,11 @@ impl ConfigView {
     }
 
     fn current_selection_key(&self, cx: &App) -> TopicSelectionKey {
+        let server_id = self
+            .app_state
+            .read(cx)
+            .selected_server_id()
+            .map(str::to_string);
         let state = self.config_state.read(cx);
         let agent_id = state.selected_agent_id().map(str::to_string);
         let topic_path = match (state.selected_agent(), state.selected_topic_index()) {
@@ -1175,7 +1470,7 @@ impl ConfigView {
             _ => None,
         };
 
-        (agent_id, topic_path)
+        (server_id, agent_id, topic_path)
     }
 
     fn topic_feedback_kind_for_panel(
@@ -1198,7 +1493,7 @@ impl ConfigView {
     }
 
     fn current_topic_feedback_kind(&self, cx: &App) -> Option<TopicFeedbackKind> {
-        let (_, selected_topic_path) = self.current_selection_key(cx);
+        let (_, _, selected_topic_path) = self.current_selection_key(cx);
 
         match selected_topic_path.as_deref() {
             Some(topic_path) if Self::is_prop_topic_path(topic_path) => {
@@ -1485,9 +1780,122 @@ impl ConfigView {
         Some((req, resp))
     }
 
+    fn ensure_prop_stream_for_server(
+        &mut self,
+        server_id: &str,
+        service_url: String,
+        cfgid: String,
+        topic_path: String,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let same_topic_running = self
+            .server_topic_runtimes
+            .get(server_id)
+            .is_some_and(|runtime| {
+                runtime.active_prop_topic.as_deref() == Some(topic_path.as_str())
+                    && runtime.prop_stream_stop.is_some()
+            });
+        if same_topic_running {
+            return;
+        }
+
+        self.stop_prop_stream_for_server(server_id);
+
+        let runtime = self.current_runtime_mut(server_id);
+        if runtime.prop_state.topic_path() != Some(topic_path.as_str()) {
+            runtime.prop_state.reset_for_topic(Some(topic_path.clone()));
+        }
+        runtime.active_prop_topic = Some(topic_path.clone());
+
+        self.start_prop_stream(
+            server_id.to_string(),
+            service_url,
+            cfgid,
+            topic_path,
+            token,
+            cx,
+        );
+    }
+
+    fn ensure_event_stream_for_server(
+        &mut self,
+        server_id: &str,
+        service_url: String,
+        topic_path: String,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let same_topic_running = self
+            .server_topic_runtimes
+            .get(server_id)
+            .is_some_and(|runtime| {
+                runtime.active_event_topic.as_deref() == Some(topic_path.as_str())
+                    && runtime.event_stream_stop.is_some()
+            });
+        if same_topic_running {
+            return;
+        }
+
+        self.stop_event_stream_for_server(server_id);
+
+        let runtime = self.current_runtime_mut(server_id);
+        if runtime.event_state.topic_path() != Some(topic_path.as_str()) {
+            runtime
+                .event_state
+                .reset_for_topic(Some(topic_path.clone()));
+        }
+        runtime.active_event_topic = Some(topic_path.clone());
+
+        self.start_event_stream(server_id.to_string(), service_url, topic_path, token, cx);
+    }
+
+    fn ensure_service_stream_for_server(
+        &mut self,
+        server_id: &str,
+        service_url: String,
+        topic_path: String,
+        request_topic: String,
+        response_topic: String,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let same_topic_running = self
+            .server_topic_runtimes
+            .get(server_id)
+            .is_some_and(|runtime| {
+                runtime.active_service_topic.as_deref() == Some(topic_path.as_str())
+                    && runtime.service_stream_stop.is_some()
+            });
+        if same_topic_running {
+            return;
+        }
+
+        self.stop_service_stream_for_server(server_id);
+
+        let runtime = self.current_runtime_mut(server_id);
+        if runtime.service_state.topic_path() != Some(topic_path.as_str()) {
+            runtime
+                .service_state
+                .reset_for_topic(Some(topic_path.clone()));
+        }
+        runtime.active_service_topic = Some(topic_path.clone());
+
+        self.start_service_stream(
+            server_id.to_string(),
+            service_url,
+            topic_path,
+            request_topic,
+            response_topic,
+            token,
+            cx,
+        );
+    }
+
     fn sync_topic_stream_with_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selection_key = self.current_selection_key(cx);
-        let selected_topic_path = selection_key.1.clone();
+        let server_id = selection_key.0.clone();
+        let selected_topic_path = selection_key.2.clone();
 
         if self.last_selection_key != selection_key {
             self.last_selection_key = selection_key.clone();
@@ -1498,152 +1906,105 @@ impl ConfigView {
         }
 
         self.ensure_topic_feedback_task(cx);
-
-        let selected_prop_topic = selected_topic_path
-            .as_deref()
-            .filter(|path| Self::is_prop_topic_path(path))
-            .map(|s| s.to_string());
-
-        let selected_event_topic = selected_topic_path
-            .as_deref()
-            .filter(|path| Self::is_event_topic_path(path))
-            .map(|s| s.to_string());
-
-        let selected_service_topic = selected_topic_path
-            .as_deref()
-            .filter(|path| Self::is_service_topic_path(path))
-            .map(|s| s.to_string());
-
-        if self.active_prop_topic == selected_prop_topic
-            && self.active_event_topic == selected_event_topic
-            && self.active_service_topic == selected_service_topic
-        {
-            return;
-        }
-
-        for entity in self.prop_filter_inputs.all() {
-            entity.update(cx, |state, cx| {
-                state.set_value("".to_string(), window, cx);
-            });
-        }
-        for calendar in self.prop_filter_inputs.calendars() {
-            calendar.update(cx, |state, cx| {
-                state.set_date(Date::Single(None), window, cx);
-            });
-        }
-        for entity in self.event_filter_inputs.all() {
-            entity.update(cx, |state, cx| {
-                state.set_value("".to_string(), window, cx);
-            });
-        }
-        for calendar in self.event_filter_inputs.calendars() {
-            calendar.update(cx, |state, cx| {
-                state.set_date(Date::Single(None), window, cx);
-            });
-        }
         self.active_table_cell = None;
+        let Some(server_id) = server_id else {
+            self.service_publish_tx = None;
+            return;
+        };
 
-        // Stop any existing stream and reset state if needed.
-        self.stop_prop_stream();
-        self.stop_event_stream();
-        self.stop_service_stream();
+        let token = cx
+            .global::<DfcGlobalStore>()
+            .read(cx)
+            .selected_server()
+            .and_then(|s| s.pulsar_token.clone())
+            .filter(|t| !t.trim().is_empty());
 
-        if let Some(topic_path) = selected_prop_topic {
-            let _ = self.event_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(None);
-                cx.notify();
-            });
+        if let Some(topic_path) = selected_topic_path
+            .clone()
+            .filter(|path| Self::is_prop_topic_path(path))
+        {
+            self.stop_event_stream_for_server(&server_id);
+            self.stop_service_stream_for_server(&server_id);
 
-            // Locate the Pulsar service URL + cfgid for this topic.
             let (service_url, cfgid) = {
                 let config_state = self.config_state.read(cx);
                 match find_topic_origin(config_state.configs(), &topic_path) {
                     Some(v) => v,
                     None => {
-                        let _ = self.prop_table_state.update(cx, |state, cx| {
-                            state.reset_for_topic(Some(topic_path.clone()));
-                            state.set_error("无法定位该 Topic 对应的 service_url/cfgid");
-                            cx.notify();
-                        });
+                        let runtime = self.current_runtime_mut(&server_id);
+                        runtime.prop_state.reset_for_topic(Some(topic_path.clone()));
+                        runtime
+                            .prop_state
+                            .set_error("无法定位该 Topic 对应的 service_url/cfgid");
+                        self.load_visible_prop_state_for_server(&server_id, window, cx);
+                        self.service_publish_tx = None;
                         return;
                     }
                 }
             };
 
-            let token = cx
-                .global::<DfcGlobalStore>()
-                .read(cx)
-                .selected_server()
-                .and_then(|s| s.pulsar_token.clone())
-                .filter(|t| !t.trim().is_empty());
-
-            self.active_prop_topic = Some(topic_path.clone());
-
-            let _ = self.prop_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(Some(topic_path.clone()));
-                cx.notify();
-            });
-
-            self.start_prop_stream(service_url, cfgid, topic_path, token, cx);
+            self.ensure_prop_stream_for_server(
+                &server_id,
+                service_url,
+                cfgid,
+                topic_path,
+                token,
+                cx,
+            );
+            self.load_visible_prop_state_for_server(&server_id, window, cx);
+            self.service_publish_tx = None;
             return;
         }
 
-        if let Some(topic_path) = selected_event_topic {
-            let _ = self.prop_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(None);
-                cx.notify();
-            });
-            // Locate the Pulsar service URL for this topic.
+        if let Some(topic_path) = selected_topic_path
+            .clone()
+            .filter(|path| Self::is_event_topic_path(path))
+        {
+            self.stop_prop_stream_for_server(&server_id);
+            self.stop_service_stream_for_server(&server_id);
+
             let service_url = {
                 let config_state = self.config_state.read(cx);
                 match find_topic_service_url(config_state.configs(), &topic_path) {
                     Some(service_url) => service_url,
                     None => {
-                        let _ = self.event_table_state.update(cx, |state, cx| {
-                            state.reset_for_topic(Some(topic_path.clone()));
-                            state.set_error("无法定位该 Topic 对应的 service_url");
-                            cx.notify();
-                        });
+                        let runtime = self.current_runtime_mut(&server_id);
+                        runtime
+                            .event_state
+                            .reset_for_topic(Some(topic_path.clone()));
+                        runtime
+                            .event_state
+                            .set_error("无法定位该 Topic 对应的 service_url");
+                        self.load_visible_event_state_for_server(&server_id, window, cx);
+                        self.service_publish_tx = None;
                         return;
                     }
                 }
             };
 
-            let token = cx
-                .global::<DfcGlobalStore>()
-                .read(cx)
-                .selected_server()
-                .and_then(|s| s.pulsar_token.clone())
-                .filter(|t| !t.trim().is_empty());
-
-            self.active_event_topic = Some(topic_path.clone());
-
-            let _ = self.event_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(Some(topic_path.clone()));
-                cx.notify();
-            });
-
-            self.start_event_stream(service_url, topic_path, token, cx);
+            self.ensure_event_stream_for_server(&server_id, service_url, topic_path, token, cx);
+            self.load_visible_event_state_for_server(&server_id, window, cx);
+            self.service_publish_tx = None;
             return;
         }
 
-        if let Some(topic_path) = selected_service_topic {
-            let _ = self.prop_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(None);
-                cx.notify();
-            });
-            let _ = self.event_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(None);
-                cx.notify();
-            });
+        if let Some(topic_path) = selected_topic_path
+            .clone()
+            .filter(|path| Self::is_service_topic_path(path))
+        {
+            self.stop_prop_stream_for_server(&server_id);
+            self.stop_event_stream_for_server(&server_id);
 
             let Some((request_topic, response_topic)) = Self::split_service_topic_path(&topic_path)
             else {
-                let _ = self.service_table_state.update(cx, |state, cx| {
-                    state.reset_for_topic(Some(topic_path.clone()));
-                    state.set_error("无法解析 service topic 路径");
-                    cx.notify();
-                });
+                let runtime = self.current_runtime_mut(&server_id);
+                runtime
+                    .service_state
+                    .reset_for_topic(Some(topic_path.clone()));
+                runtime
+                    .service_state
+                    .set_error("无法解析 service topic 路径");
+                self.load_visible_service_state_for_server(&server_id, cx);
                 return;
             };
 
@@ -1652,50 +2013,38 @@ impl ConfigView {
                 match find_topic_service_url(config_state.configs(), &topic_path) {
                     Some(url) => url,
                     None => {
-                        let _ = self.service_table_state.update(cx, |state, cx| {
-                            state.reset_for_topic(Some(topic_path.clone()));
-                            state.set_error("无法定位该 Topic 对应的 service_url");
-                            cx.notify();
-                        });
+                        let runtime = self.current_runtime_mut(&server_id);
+                        runtime
+                            .service_state
+                            .reset_for_topic(Some(topic_path.clone()));
+                        runtime
+                            .service_state
+                            .set_error("无法定位该 Topic 对应的 service_url");
+                        self.load_visible_service_state_for_server(&server_id, cx);
                         return;
                     }
                 }
             };
 
-            let token = cx
-                .global::<DfcGlobalStore>()
-                .read(cx)
-                .selected_server()
-                .and_then(|s| s.pulsar_token.clone())
-                .filter(|t| !t.trim().is_empty());
-
-            self.active_service_topic = Some(topic_path.clone());
-
-            let _ = self.service_table_state.update(cx, |state, cx| {
-                state.reset_for_topic(Some(topic_path.clone()));
-                cx.notify();
-            });
-
-            self.start_service_stream(service_url, request_topic, response_topic, token, cx);
+            self.ensure_service_stream_for_server(
+                &server_id,
+                service_url,
+                topic_path,
+                request_topic,
+                response_topic,
+                token,
+                cx,
+            );
+            self.load_visible_service_state_for_server(&server_id, cx);
             return;
         }
 
-        let _ = self.prop_table_state.update(cx, |state, cx| {
-            state.reset_for_topic(None);
-            cx.notify();
-        });
-        let _ = self.event_table_state.update(cx, |state, cx| {
-            state.reset_for_topic(None);
-            cx.notify();
-        });
-        let _ = self.service_table_state.update(cx, |state, cx| {
-            state.reset_for_topic(None);
-            cx.notify();
-        });
+        self.service_publish_tx = None;
     }
 
     fn start_prop_stream(
         &mut self,
+        server_id: String,
         service_url: String,
         cfgid: String,
         topic_path: String,
@@ -1705,15 +2054,17 @@ impl ConfigView {
         let (tx, rx): (Sender<PropStreamEvent>, Receiver<PropStreamEvent>) =
             crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = watch::channel(false);
-        self.prop_stream_stop = Some(stop_tx);
+        self.current_runtime_mut(&server_id).prop_stream_stop = Some(stop_tx);
 
         let redis = cx.global::<DfcGlobalStore>().services().redis().clone();
         let uid = self.prop_row_uid.clone();
+        let stream_topic_path = topic_path.clone();
+        let runtime_server_id = server_id.clone();
 
         spawn_named_in_tokio("prop-topic-stream", async move {
             run_prop_topic_stream(
                 service_url,
-                topic_path,
+                stream_topic_path,
                 token,
                 cfgid,
                 redis,
@@ -1724,8 +2075,7 @@ impl ConfigView {
             .await;
         });
 
-        let prop_state = self.prop_table_state.clone();
-        let task = cx.spawn(async move |_, cx| {
+        let task = cx.spawn(async move |handle, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(120))
@@ -1742,9 +2092,29 @@ impl ConfigView {
                 }
 
                 if let Some(msg) = error {
-                    let _ = prop_state.update(cx, |state, cx| {
-                        state.set_error(msg);
-                        cx.notify();
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(runtime) =
+                            this.server_topic_runtimes.get_mut(&runtime_server_id)
+                        {
+                            if runtime.active_prop_topic.as_deref() == Some(topic_path.as_str()) {
+                                runtime.prop_state.set_error(msg);
+                                if is_visible {
+                                    snapshot = Some(runtime.prop_state.clone());
+                                }
+                            }
+                        }
+
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_prop_state(snapshot, cx);
+                        }
                     });
                     continue;
                 }
@@ -1753,18 +2123,37 @@ impl ConfigView {
                     continue;
                 }
 
-                let _ = prop_state.update(cx, |state, cx| {
-                    state.push_rows_front(rows);
-                    cx.notify();
+                let _ = handle.update(cx, |this, cx| {
+                    let is_visible = this.current_server_id(cx).as_deref()
+                        == Some(runtime_server_id.as_str())
+                        && this.current_selected_topic_path_raw(cx).as_deref()
+                            == Some(topic_path.as_str());
+                    let mut snapshot = None;
+                    if let Some(runtime) = this.server_topic_runtimes.get_mut(&runtime_server_id) {
+                        if runtime.active_prop_topic.as_deref() == Some(topic_path.as_str()) {
+                            runtime.prop_state.push_rows_front(rows);
+                            if is_visible {
+                                snapshot = Some(runtime.prop_state.clone());
+                            }
+                        }
+                    }
+
+                    if is_visible {
+                        let Some(snapshot) = snapshot else {
+                            return;
+                        };
+                        this.replace_visible_prop_state(snapshot, cx);
+                    }
                 });
             }
         });
 
-        self.prop_ingest_task = Some(task);
+        self.current_runtime_mut(&server_id).prop_ingest_task = Some(task);
     }
 
     fn start_event_stream(
         &mut self,
+        server_id: String,
         service_url: String,
         topic_path: String,
         token: Option<String>,
@@ -1773,16 +2162,17 @@ impl ConfigView {
         let (tx, rx): (Sender<EventStreamEvent>, Receiver<EventStreamEvent>) =
             crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = watch::channel(false);
-        self.event_stream_stop = Some(stop_tx);
+        self.current_runtime_mut(&server_id).event_stream_stop = Some(stop_tx);
 
         let uid = self.event_row_uid.clone();
+        let stream_topic_path = topic_path.clone();
+        let runtime_server_id = server_id.clone();
 
         spawn_named_in_tokio("event-topic-stream", async move {
-            run_event_topic_stream(service_url, topic_path, token, stop_rx, tx, uid).await;
+            run_event_topic_stream(service_url, stream_topic_path, token, stop_rx, tx, uid).await;
         });
 
-        let event_state = self.event_table_state.clone();
-        let task = cx.spawn(async move |_, cx| {
+        let task = cx.spawn(async move |handle, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(120))
@@ -1799,9 +2189,29 @@ impl ConfigView {
                 }
 
                 if let Some(msg) = error {
-                    let _ = event_state.update(cx, |state, cx| {
-                        state.set_error(msg);
-                        cx.notify();
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(runtime) =
+                            this.server_topic_runtimes.get_mut(&runtime_server_id)
+                        {
+                            if runtime.active_event_topic.as_deref() == Some(topic_path.as_str()) {
+                                runtime.event_state.set_error(msg);
+                                if is_visible {
+                                    snapshot = Some(runtime.event_state.clone());
+                                }
+                            }
+                        }
+
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_event_state(snapshot, cx);
+                        }
                     });
                     continue;
                 }
@@ -1810,19 +2220,39 @@ impl ConfigView {
                     continue;
                 }
 
-                let _ = event_state.update(cx, |state, cx| {
-                    state.push_rows_front(rows);
-                    cx.notify();
+                let _ = handle.update(cx, |this, cx| {
+                    let is_visible = this.current_server_id(cx).as_deref()
+                        == Some(runtime_server_id.as_str())
+                        && this.current_selected_topic_path_raw(cx).as_deref()
+                            == Some(topic_path.as_str());
+                    let mut snapshot = None;
+                    if let Some(runtime) = this.server_topic_runtimes.get_mut(&runtime_server_id) {
+                        if runtime.active_event_topic.as_deref() == Some(topic_path.as_str()) {
+                            runtime.event_state.push_rows_front(rows);
+                            if is_visible {
+                                snapshot = Some(runtime.event_state.clone());
+                            }
+                        }
+                    }
+
+                    if is_visible {
+                        let Some(snapshot) = snapshot else {
+                            return;
+                        };
+                        this.replace_visible_event_state(snapshot, cx);
+                    }
                 });
             }
         });
 
-        self.event_ingest_task = Some(task);
+        self.current_runtime_mut(&server_id).event_ingest_task = Some(task);
     }
 
     fn start_service_stream(
         &mut self,
+        server_id: String,
         service_url: String,
+        topic_path: String,
         request_topic: String,
         response_topic: String,
         token: Option<String>,
@@ -1835,10 +2265,15 @@ impl ConfigView {
             Receiver<ServicePublishRequest>,
         ) = crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = watch::channel(false);
-        self.service_stream_stop = Some(stop_tx);
+        {
+            let runtime = self.current_runtime_mut(&server_id);
+            runtime.service_stream_stop = Some(stop_tx);
+            runtime.service_publish_tx = Some(publish_tx.clone());
+        }
         self.service_publish_tx = Some(publish_tx);
 
         let uid = self.service_row_uid.clone();
+        let runtime_server_id = server_id.clone();
 
         spawn_named_in_tokio("service-topic-stream", async move {
             run_service_topic_stream(
@@ -1854,8 +2289,7 @@ impl ConfigView {
             .await;
         });
 
-        let service_state = self.service_table_state.clone();
-        let task = cx.spawn(async move |_, cx| {
+        let task = cx.spawn(async move |handle, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(120))
@@ -1872,9 +2306,30 @@ impl ConfigView {
                 }
 
                 if let Some(msg) = error {
-                    let _ = service_state.update(cx, |state, cx| {
-                        state.set_error(msg);
-                        cx.notify();
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(runtime) =
+                            this.server_topic_runtimes.get_mut(&runtime_server_id)
+                        {
+                            if runtime.active_service_topic.as_deref() == Some(topic_path.as_str())
+                            {
+                                runtime.service_state.set_error(msg);
+                                if is_visible {
+                                    snapshot = Some(runtime.service_state.clone());
+                                }
+                            }
+                        }
+
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_service_state(snapshot, cx);
+                        }
                     });
                     continue;
                 }
@@ -1883,16 +2338,34 @@ impl ConfigView {
                     continue;
                 }
 
-                let _ = service_state.update(cx, |state, cx| {
-                    for row in responses {
-                        state.push_response_front(row);
+                let _ = handle.update(cx, |this, cx| {
+                    let is_visible = this.current_server_id(cx).as_deref()
+                        == Some(runtime_server_id.as_str())
+                        && this.current_selected_topic_path_raw(cx).as_deref()
+                            == Some(topic_path.as_str());
+                    let mut snapshot = None;
+                    if let Some(runtime) = this.server_topic_runtimes.get_mut(&runtime_server_id) {
+                        if runtime.active_service_topic.as_deref() == Some(topic_path.as_str()) {
+                            for row in responses {
+                                runtime.service_state.push_response_front(row);
+                            }
+                            if is_visible {
+                                snapshot = Some(runtime.service_state.clone());
+                            }
+                        }
                     }
-                    cx.notify();
+
+                    if is_visible {
+                        let Some(snapshot) = snapshot else {
+                            return;
+                        };
+                        this.replace_visible_service_state(snapshot, cx);
+                    }
                 });
             }
         });
 
-        self.service_ingest_task = Some(task);
+        self.current_runtime_mut(&server_id).service_ingest_task = Some(task);
     }
 
     fn on_submit_service_request(&mut self, cx: &mut Context<Self>) {

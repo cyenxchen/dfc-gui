@@ -178,6 +178,7 @@ pub enum PropTableLoadState {
 }
 
 /// State for rendering prop topic data as a paginated table.
+#[derive(Clone)]
 pub struct PropTableState {
     topic_path: Option<String>,
     rows: VecDeque<PropRow>,

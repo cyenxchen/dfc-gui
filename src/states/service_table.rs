@@ -44,6 +44,7 @@ pub enum ServiceTableLoadState {
     Error(Arc<str>),
 }
 
+#[derive(Clone)]
 pub struct ServiceTableState {
     topic_path: Option<String>,
     requests: VecDeque<ServiceRequestRow>,

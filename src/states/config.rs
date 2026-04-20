@@ -7,8 +7,10 @@ use gpui::Context;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::Arc;
 
-/// Configuration state for managing Redis config items
-pub struct ConfigState {
+const DEFAULT_SESSION_ID: &str = "__default__";
+
+#[derive(Default)]
+struct ServerConfigSession {
     /// List of configuration items
     configs: Vec<ConfigItem>,
     /// TopicAgentId items merged from all configs
@@ -19,10 +21,24 @@ pub struct ConfigState {
     selected_config_id: Option<i32>,
     /// Currently selected topic index within the config
     selected_topic_index: Option<i32>,
-    /// IDs of all connected servers (supports multiple)
-    connected_server_ids: Vec<String>,
     /// Currently selected TopicAgentId
     selected_agent_id: Option<String>,
+    /// Whether the current topic selection should auto-drive topic consumption.
+    topic_sync_enabled: bool,
+    /// In-flight reconnect request id for this server session, if any.
+    pending_request_id: Option<u64>,
+    /// Stable load state to restore if an in-flight reconnect becomes stale.
+    resume_load_state: Option<ConfigLoadState>,
+}
+
+/// Configuration state for managing Redis config items
+pub struct ConfigState {
+    /// Cached config session for each connected server.
+    sessions: BTreeMap<String, ServerConfigSession>,
+    /// IDs of all connected servers (supports multiple)
+    connected_server_ids: Vec<String>,
+    /// Currently active config session's server ID
+    active_server_id: Option<String>,
 }
 
 impl ConfigState {
@@ -32,41 +48,110 @@ impl ConfigState {
     /// Create a new empty config state
     pub fn new() -> Self {
         Self {
-            configs: Vec::new(),
-            topic_agents_merged: Vec::new(),
-            load_state: ConfigLoadState::Idle,
-            selected_config_id: None,
-            selected_topic_index: None,
+            sessions: BTreeMap::new(),
             connected_server_ids: Vec::new(),
-            selected_agent_id: None,
+            active_server_id: None,
         }
+    }
+
+    fn current_session(&self) -> Option<&ServerConfigSession> {
+        self.active_server_id
+            .as_deref()
+            .and_then(|server_id| self.sessions.get(server_id))
+            .or_else(|| self.sessions.get(DEFAULT_SESSION_ID))
+    }
+
+    fn current_session_mut(&mut self) -> &mut ServerConfigSession {
+        let session_id = self
+            .active_server_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SESSION_ID.to_string());
+        self.sessions.entry(session_id).or_default()
+    }
+
+    fn session_for_server_mut(&mut self, server_id: &str) -> &mut ServerConfigSession {
+        self.sessions.entry(server_id.to_string()).or_default()
+    }
+
+    fn fallback_restored_load_state(session: &ServerConfigSession) -> ConfigLoadState {
+        session.resume_load_state.clone().unwrap_or_else(|| {
+            if session.configs.is_empty() {
+                ConfigLoadState::Idle
+            } else {
+                ConfigLoadState::Loaded
+            }
+        })
+    }
+
+    fn mark_session_loading(session: &mut ServerConfigSession, request_id: Option<u64>) {
+        if !matches!(session.load_state, ConfigLoadState::Loading) {
+            session.resume_load_state = Some(session.load_state.clone());
+        } else if session.resume_load_state.is_none() {
+            session.resume_load_state = Some(Self::fallback_restored_load_state(session));
+        }
+
+        session.pending_request_id = request_id;
+        session.load_state = ConfigLoadState::Loading;
+    }
+
+    fn finalize_session_request(session: &mut ServerConfigSession) {
+        session.pending_request_id = None;
+        session.resume_load_state = None;
+    }
+
+    fn restore_stale_loading_for_session(
+        session: &mut ServerConfigSession,
+        request_id: u64,
+    ) -> bool {
+        if session.pending_request_id != Some(request_id) {
+            return false;
+        }
+
+        session.load_state = Self::fallback_restored_load_state(session);
+        Self::finalize_session_request(session);
+        true
     }
 
     // ==================== Getters ====================
 
     /// Get all configuration items
     pub fn configs(&self) -> &[ConfigItem] {
-        &self.configs
+        self.current_session()
+            .map_or(&[], |session| &session.configs)
     }
 
     /// Get the current loading state
-    pub fn load_state(&self) -> &ConfigLoadState {
-        &self.load_state
+    pub fn load_state(&self) -> ConfigLoadState {
+        self.current_session()
+            .map(|session| session.load_state.clone())
+            .unwrap_or_default()
     }
 
     /// Check if currently loading
     pub fn is_loading(&self) -> bool {
-        self.load_state.is_loading()
+        self.load_state().is_loading()
     }
 
     /// Get the selected config group ID
     pub fn selected_config_id(&self) -> Option<i32> {
-        self.selected_config_id
+        self.current_session()
+            .and_then(|session| session.selected_config_id)
     }
 
     /// Get the selected topic index
     pub fn selected_topic_index(&self) -> Option<i32> {
-        self.selected_topic_index
+        self.current_session()
+            .and_then(|session| session.selected_topic_index)
+    }
+
+    /// Get the topic index currently allowed to drive topic streaming.
+    pub fn synced_selected_topic_index(&self) -> Option<i32> {
+        self.current_session().and_then(|session| {
+            session
+                .topic_sync_enabled
+                .then_some(session.selected_topic_index)
+                .flatten()
+        })
     }
 
     /// Get all connected server IDs
@@ -74,36 +159,61 @@ impl ConfigState {
         &self.connected_server_ids
     }
 
+    /// Get the currently active server ID
+    pub fn active_server_id(&self) -> Option<&str> {
+        self.active_server_id.as_deref()
+    }
+
+    /// Whether the active session may auto-drive topic streaming.
+    pub fn topic_sync_enabled(&self) -> bool {
+        self.current_session()
+            .is_some_and(|session| session.topic_sync_enabled)
+    }
+
     /// Get the currently selected config item
     pub fn selected_config(&self) -> Option<&ConfigItem> {
-        self.selected_config_id
-            .and_then(|id| self.configs.iter().find(|c| c.group_id == id))
+        let session = self.current_session()?;
+        session
+            .selected_config_id
+            .and_then(|id| session.configs.iter().find(|config| config.group_id == id))
     }
 
     /// Get the currently selected topic detail
     pub fn selected_topic(&self) -> Option<&DetailItem> {
-        self.selected_config().and_then(|config| {
-            self.selected_topic_index
-                .and_then(|idx| config.details.iter().find(|d| d.index == idx))
+        let session = self.current_session()?;
+        let selected_config = session
+            .selected_config_id
+            .and_then(|id| session.configs.iter().find(|config| config.group_id == id))?;
+
+        session.selected_topic_index.and_then(|idx| {
+            selected_config
+                .details
+                .iter()
+                .find(|detail| detail.index == idx)
         })
     }
 
     /// Get the selected agent ID
     pub fn selected_agent_id(&self) -> Option<&str> {
-        self.selected_agent_id.as_deref()
+        self.current_session()
+            .and_then(|session| session.selected_agent_id.as_deref())
     }
 
     /// Get all TopicAgentItems from the selected config
     pub fn topic_agents(&self) -> Vec<&TopicAgentItem> {
-        self.topic_agents_merged.iter().collect()
+        self.current_session()
+            .map(|session| session.topic_agents_merged.iter().collect())
+            .unwrap_or_default()
     }
 
     /// Get the currently selected TopicAgentItem
     pub fn selected_agent(&self) -> Option<&TopicAgentItem> {
-        self.selected_agent_id.as_ref().and_then(|aid| {
-            self.topic_agents_merged
+        let session = self.current_session()?;
+        session.selected_agent_id.as_ref().and_then(|agent_id| {
+            session
+                .topic_agents_merged
                 .iter()
-                .find(|ta| &ta.agent_id == aid)
+                .find(|topic_agent| &topic_agent.agent_id == agent_id)
         })
     }
 
@@ -125,8 +235,9 @@ impl ConfigState {
             .map(|idx| idx as i32)
     }
 
-    fn default_agent_selection(&self) -> Option<(String, Option<i32>)> {
-        self.topic_agents_merged
+    fn default_agent_selection(session: &ServerConfigSession) -> Option<(String, Option<i32>)> {
+        session
+            .topic_agents_merged
             .iter()
             .find(|agent| agent.topics.iter().any(Self::is_preferred_agent_topic))
             .map(|agent| {
@@ -136,7 +247,8 @@ impl ConfigState {
                 )
             })
             .or_else(|| {
-                self.topic_agents_merged
+                session
+                    .topic_agents_merged
                     .iter()
                     .find(|agent| agent.topics.iter().any(Self::is_prop_agent_topic))
                     .map(|agent| {
@@ -147,7 +259,8 @@ impl ConfigState {
                     })
             })
             .or_else(|| {
-                self.topic_agents_merged
+                session
+                    .topic_agents_merged
                     .iter()
                     .find(|agent| !agent.topics.is_empty())
                     .map(|agent| {
@@ -158,15 +271,24 @@ impl ConfigState {
                     })
             })
             .or_else(|| {
-                self.topic_agents_merged
+                session
+                    .topic_agents_merged
                     .first()
                     .map(|agent| (agent.agent_id.clone(), None))
             })
     }
 
-    fn selected_topic_path(&self) -> Option<&str> {
-        let idx = self.selected_topic_index? as usize;
-        self.selected_agent()
+    fn session_selected_topic_path(session: &ServerConfigSession) -> Option<&str> {
+        let idx = session.selected_topic_index? as usize;
+        session
+            .selected_agent_id
+            .as_ref()
+            .and_then(|agent_id| {
+                session
+                    .topic_agents_merged
+                    .iter()
+                    .find(|agent| &agent.agent_id == agent_id)
+            })
             .and_then(|agent| agent.topics.get(idx))
             .map(|topic| topic.path.as_str())
     }
@@ -179,8 +301,13 @@ impl ConfigState {
             .map(|idx| idx as i32)
     }
 
-    fn restore_previous_selection(
-        &mut self,
+    fn selected_topic_path(&self) -> Option<&str> {
+        self.current_session()
+            .and_then(Self::session_selected_topic_path)
+    }
+
+    fn restore_previous_selection_for_session(
+        session: &mut ServerConfigSession,
         previous_agent_id: Option<&str>,
         previous_topic_path: Option<&str>,
     ) -> bool {
@@ -188,7 +315,7 @@ impl ConfigState {
             return false;
         };
 
-        let Some(agent) = self
+        let Some(agent) = session
             .topic_agents_merged
             .iter()
             .find(|agent| agent.agent_id == previous_agent_id)
@@ -200,15 +327,15 @@ impl ConfigState {
             return false;
         }
 
-        self.selected_agent_id = Some(agent.agent_id.clone());
-        self.selected_topic_index = previous_topic_path
+        session.selected_agent_id = Some(agent.agent_id.clone());
+        session.selected_topic_index = previous_topic_path
             .and_then(|topic_path| Self::topic_index_by_path(agent, topic_path))
             .or_else(|| Self::default_topic_index_for_agent(agent));
 
         true
     }
 
-    fn rebuild_topic_agents_merged(&mut self) {
+    fn rebuild_topic_agents_merged_for_session(session: &mut ServerConfigSession) {
         #[derive(Clone, Debug)]
         struct MergedTopicMeta {
             index: i32,
@@ -218,7 +345,7 @@ impl ConfigState {
 
         let mut merged: BTreeMap<String, BTreeMap<String, MergedTopicMeta>> = BTreeMap::new();
 
-        for config in &self.configs {
+        for config in &session.configs {
             for agent in &config.topic_agents {
                 let topics_by_path = merged.entry(agent.agent_id.clone()).or_default();
 
@@ -249,7 +376,7 @@ impl ConfigState {
             }
         }
 
-        self.topic_agents_merged = merged
+        session.topic_agents_merged = merged
             .into_iter()
             .map(|(agent_id, topics_by_path)| {
                 let mut topics: Vec<TopicDetail> = topics_by_path
@@ -275,32 +402,44 @@ impl ConfigState {
 
     // ==================== Setters ====================
 
-    fn apply_configs(&mut self, configs: Vec<ConfigItem>) {
-        let previous_agent_id = self.selected_agent_id.clone();
-        let previous_topic_path = self.selected_topic_path().map(ToOwned::to_owned);
+    fn apply_configs_for_session(session: &mut ServerConfigSession, configs: Vec<ConfigItem>) {
+        let previous_agent_id = session.selected_agent_id.clone();
+        let previous_topic_path = Self::session_selected_topic_path(session).map(ToOwned::to_owned);
 
-        self.configs = configs;
-        self.rebuild_topic_agents_merged();
-        self.selected_config_id = None;
+        session.configs = configs;
+        Self::rebuild_topic_agents_merged_for_session(session);
+        session.selected_config_id = None;
 
-        if self.restore_previous_selection(
+        if Self::restore_previous_selection_for_session(
+            session,
             previous_agent_id.as_deref(),
             previous_topic_path.as_deref(),
         ) {
-            self.load_state = ConfigLoadState::Loaded;
+            Self::finalize_session_request(session);
+            session.load_state = ConfigLoadState::Loaded;
             return;
         }
 
         // Initialize selection to first agent/topic when available
-        if let Some((agent_id, topic_index)) = self.default_agent_selection() {
-            self.selected_agent_id = Some(agent_id);
-            self.selected_topic_index = topic_index;
+        if let Some((agent_id, topic_index)) = Self::default_agent_selection(session) {
+            session.selected_agent_id = Some(agent_id);
+            session.selected_topic_index = topic_index;
         } else {
-            self.selected_agent_id = None;
-            self.selected_topic_index = None;
+            session.selected_agent_id = None;
+            session.selected_topic_index = None;
         }
 
-        self.load_state = ConfigLoadState::Loaded;
+        Self::finalize_session_request(session);
+        session.load_state = ConfigLoadState::Loaded;
+        session.topic_sync_enabled = true;
+    }
+
+    fn rebuild_topic_agents_merged(&mut self) {
+        Self::rebuild_topic_agents_merged_for_session(self.current_session_mut());
+    }
+
+    fn apply_configs(&mut self, configs: Vec<ConfigItem>) {
+        Self::apply_configs_for_session(self.current_session_mut(), configs);
     }
 
     /// Set configuration items
@@ -309,47 +448,143 @@ impl ConfigState {
         cx.notify();
     }
 
+    /// Set configuration items for a specific server session.
+    pub fn set_configs_for_server(
+        &mut self,
+        server_id: &str,
+        configs: Vec<ConfigItem>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_server_id = Some(server_id.to_string());
+        Self::apply_configs_for_session(self.session_for_server_mut(server_id), configs);
+        cx.notify();
+    }
+
     /// Set loading state
     pub fn set_loading(&mut self, cx: &mut Context<Self>) {
-        self.load_state = ConfigLoadState::Loading;
+        self.current_session_mut().load_state = ConfigLoadState::Loading;
+        cx.notify();
+    }
+
+    /// Set loading state for a specific server session.
+    pub fn set_loading_for_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        self.active_server_id = Some(server_id.to_string());
+        Self::mark_session_loading(self.session_for_server_mut(server_id), None);
+        cx.notify();
+    }
+
+    /// Set loading state for a specific server session and bind it to a reconnect request id.
+    pub fn set_loading_for_server_request(
+        &mut self,
+        server_id: &str,
+        request_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_server_id = Some(server_id.to_string());
+        Self::mark_session_loading(self.session_for_server_mut(server_id), Some(request_id));
         cx.notify();
     }
 
     /// Set error state
     pub fn set_error(&mut self, message: impl Into<Arc<str>>, cx: &mut Context<Self>) {
-        self.load_state = ConfigLoadState::Error(message.into());
+        self.current_session_mut().load_state = ConfigLoadState::Error(message.into());
+        cx.notify();
+    }
+
+    /// Set error state for a specific server session.
+    pub fn set_error_for_server(
+        &mut self,
+        server_id: &str,
+        message: impl Into<Arc<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_server_id = Some(server_id.to_string());
+        let session = self.session_for_server_mut(server_id);
+        Self::finalize_session_request(session);
+        session.load_state = ConfigLoadState::Error(message.into());
+        cx.notify();
+    }
+
+    /// Set error state for a specific server session and finalize a tracked reconnect request.
+    pub fn set_error_for_server_request(
+        &mut self,
+        server_id: &str,
+        request_id: u64,
+        message: impl Into<Arc<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_server_id = Some(server_id.to_string());
+        let session = self.session_for_server_mut(server_id);
+        if session.pending_request_id == Some(request_id) {
+            Self::finalize_session_request(session);
+        }
+        session.load_state = ConfigLoadState::Error(message.into());
+        cx.notify();
+    }
+
+    /// Restore a server session if a tracked reconnect became stale before completion.
+    pub fn restore_stale_loading_for_server_request(
+        &mut self,
+        server_id: &str,
+        request_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if !Self::restore_stale_loading_for_session(
+            self.session_for_server_mut(server_id),
+            request_id,
+        ) {
+            return;
+        }
         cx.notify();
     }
 
     /// Select a configuration by group ID
     pub fn select_config(&mut self, group_id: Option<i32>, cx: &mut Context<Self>) {
-        self.selected_config_id = group_id;
+        let session = self.current_session_mut();
+        session.selected_config_id = group_id;
         // Reset topic selection when changing config
         if group_id.is_some() {
-            self.selected_topic_index = Some(0);
+            session.selected_topic_index = Some(0);
         } else {
-            self.selected_topic_index = None;
+            session.selected_topic_index = None;
         }
         cx.notify();
     }
 
     /// Select a topic by index
     pub fn select_topic(&mut self, index: Option<i32>, cx: &mut Context<Self>) {
-        self.selected_topic_index = index;
+        let session = self.current_session_mut();
+        session.topic_sync_enabled = index.is_some();
+        session.selected_topic_index = index;
         cx.notify();
     }
 
-    fn apply_agent_selection(&mut self, agent_id: Option<String>) -> bool {
-        if self.selected_agent_id == agent_id {
+    fn apply_agent_selection_for_session(
+        session: &mut ServerConfigSession,
+        agent_id: Option<String>,
+    ) -> bool {
+        if session.selected_agent_id == agent_id {
             return false;
         }
 
-        self.selected_agent_id = agent_id;
-        self.selected_topic_index = self
-            .selected_agent()
+        session.selected_agent_id = agent_id;
+        session.topic_sync_enabled = session.selected_agent_id.is_some();
+        session.selected_topic_index = session
+            .selected_agent_id
+            .as_ref()
+            .and_then(|selected_agent_id| {
+                session
+                    .topic_agents_merged
+                    .iter()
+                    .find(|agent| &agent.agent_id == selected_agent_id)
+            })
             .and_then(Self::default_topic_index_for_agent);
 
         true
+    }
+
+    fn apply_agent_selection(&mut self, agent_id: Option<String>) -> bool {
+        Self::apply_agent_selection_for_session(self.current_session_mut(), agent_id)
     }
 
     /// Select a TopicAgentId
@@ -362,11 +597,11 @@ impl ConfigState {
             tracing::info!(
                 agent_id = %agent.agent_id,
                 topics = agent.topics.len(),
-                selected_topic_index = self.selected_topic_index,
+                selected_topic_index = self.selected_topic_index(),
                 "Selected TopicAgentId"
             );
         } else {
-            tracing::info!(agent_id = ?self.selected_agent_id.as_deref(), "Selected TopicAgentId (not found)");
+            tracing::info!(agent_id = ?self.selected_agent_id(), "Selected TopicAgentId (not found)");
         }
         cx.notify();
     }
@@ -374,34 +609,93 @@ impl ConfigState {
     /// Add a connected server (no duplicates)
     pub fn add_connected_server(&mut self, server_id: String, cx: &mut Context<Self>) {
         if !self.connected_server_ids.iter().any(|id| id == &server_id) {
-            self.connected_server_ids.push(server_id);
+            self.connected_server_ids.push(server_id.clone());
         }
+        self.active_server_id = Some(server_id.clone());
+        self.session_for_server_mut(&server_id);
+        tracing::info!(
+            server_id,
+            cached_sessions = self.sessions.len(),
+            "Connected config session ready"
+        );
         cx.notify();
+    }
+
+    fn activate_server_session(&mut self, server_id: impl Into<String>) -> bool {
+        let server_id = server_id.into();
+        let was_active = self.active_server_id.as_deref() == Some(server_id.as_str());
+
+        self.active_server_id = Some(server_id.clone());
+        let has_cached_session = self.sessions.contains_key(server_id.as_str());
+        let session = self.session_for_server_mut(&server_id);
+        if !was_active {
+            session.topic_sync_enabled = false;
+        }
+        tracing::info!(
+            server_id,
+            has_cached_session,
+            topic_sync_enabled = session.topic_sync_enabled,
+            "Activated cached config session"
+        );
+
+        !was_active
+    }
+
+    /// Switch to an already cached server session without reloading configs.
+    pub fn activate_server(&mut self, server_id: impl Into<String>, cx: &mut Context<Self>) {
+        if self.activate_server_session(server_id) {
+            cx.notify();
+        }
+    }
+
+    /// Check whether a specific server has a cached config session.
+    pub fn has_server_session(&self, server_id: &str) -> bool {
+        self.sessions.contains_key(server_id)
+    }
+
+    /// Get loading state for a specific server session.
+    pub fn load_state_for_server(&self, server_id: &str) -> Option<ConfigLoadState> {
+        self.sessions
+            .get(server_id)
+            .map(|session| session.load_state.clone())
+    }
+
+    /// Whether the active session has any configs cached.
+    pub fn has_configs(&self) -> bool {
+        !self.configs().is_empty()
+    }
+
+    /// Whether a specific server session has any configs cached.
+    pub fn has_configs_for_server(&self, server_id: &str) -> bool {
+        self.sessions
+            .get(server_id)
+            .is_some_and(|session| !session.configs.is_empty())
     }
 
     /// Remove a connected server
     pub fn remove_connected_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
         self.connected_server_ids.retain(|id| id != server_id);
+        self.sessions.remove(server_id);
+        if self.active_server_id.as_deref() == Some(server_id) {
+            self.active_server_id = None;
+        }
         cx.notify();
     }
 
     /// Clear all state and reset to initial
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.configs.clear();
-        self.topic_agents_merged.clear();
-        self.load_state = ConfigLoadState::Idle;
-        self.selected_config_id = None;
-        self.selected_topic_index = None;
+        self.sessions.clear();
         self.connected_server_ids.clear();
-        self.selected_agent_id = None;
+        self.active_server_id = None;
         cx.notify();
     }
 
     /// Go back to config list (deselect config)
     pub fn back_to_list(&mut self, cx: &mut Context<Self>) {
-        self.selected_config_id = None;
-        self.selected_topic_index = None;
-        self.selected_agent_id = None;
+        let session = self.current_session_mut();
+        session.selected_config_id = None;
+        session.selected_topic_index = None;
+        session.selected_agent_id = None;
         cx.notify();
     }
 }
@@ -469,10 +763,10 @@ mod tests {
             ),
         ];
 
-        state.configs = configs;
+        state.current_session_mut().configs = configs;
         state.rebuild_topic_agents_merged();
 
-        let agents = state.topic_agents_merged.clone();
+        let agents: Vec<_> = state.topic_agents().into_iter().cloned().collect();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].agent_id, "A");
 
@@ -495,10 +789,10 @@ mod tests {
             ),
         ];
 
-        state.configs = configs;
+        state.current_session_mut().configs = configs;
         state.rebuild_topic_agents_merged();
 
-        let agents = state.topic_agents_merged.clone();
+        let agents: Vec<_> = state.topic_agents().into_iter().cloned().collect();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].topics.len(), 1);
         assert_eq!(agents[0].topics[0].topic_type, "event");
@@ -682,8 +976,9 @@ mod tests {
                 1,
             )],
         )]);
-        state.selected_agent_id = Some("A".to_string());
-        state.selected_topic_index = Some(1);
+        let session = state.current_session_mut();
+        session.selected_agent_id = Some("A".to_string());
+        session.selected_topic_index = Some(1);
 
         state.apply_configs(vec![make_config(
             2,
@@ -714,8 +1009,9 @@ mod tests {
                 1,
             )],
         )]);
-        state.selected_agent_id = Some("A".to_string());
-        state.selected_topic_index = Some(0);
+        let session = state.current_session_mut();
+        session.selected_agent_id = Some("A".to_string());
+        session.selected_topic_index = Some(0);
 
         state.apply_configs(vec![make_config(
             2,
@@ -738,8 +1034,9 @@ mod tests {
                 make_agent("B", vec![(0, "/b/prop", true, "prop")], 1),
             ],
         )]);
-        state.selected_agent_id = Some("A".to_string());
-        state.selected_topic_index = Some(0);
+        let session = state.current_session_mut();
+        session.selected_agent_id = Some("A".to_string());
+        session.selected_topic_index = Some(0);
 
         state.apply_configs(vec![make_config(
             2,
@@ -766,8 +1063,9 @@ mod tests {
                 1,
             )],
         )]);
-        state.selected_agent_id = Some("A".to_string());
-        state.selected_topic_index = Some(1);
+        let session = state.current_session_mut();
+        session.selected_agent_id = Some("A".to_string());
+        session.selected_topic_index = Some(1);
 
         let changed = state.apply_agent_selection(Some("A".to_string()));
 
@@ -775,5 +1073,108 @@ mod tests {
         assert_eq!(state.selected_agent_id(), Some("A"));
         assert_eq!(state.selected_topic_index(), Some(1));
         assert_eq!(state.selected_topic_path(), Some("/a/event"));
+    }
+
+    #[test]
+    fn server_sessions_keep_cached_configs_isolated() {
+        let mut state = ConfigState::new();
+
+        state.active_server_id = Some("server-a".to_string());
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent("A", vec![(0, "/a/prop", true, "prop")], 1)],
+        )]);
+
+        state.active_server_id = Some("server-b".to_string());
+        state.apply_configs(vec![make_config(
+            2,
+            vec![make_agent("B", vec![(0, "/b/event", true, "event")], 2)],
+        )]);
+
+        assert_eq!(state.selected_agent_id(), Some("B"));
+        assert_eq!(state.selected_topic_path(), Some("/b/event"));
+
+        state.active_server_id = Some("server-a".to_string());
+        assert_eq!(state.selected_agent_id(), Some("A"));
+        assert_eq!(state.selected_topic_path(), Some("/a/prop"));
+
+        state.active_server_id = Some("server-b".to_string());
+        assert_eq!(state.selected_agent_id(), Some("B"));
+        assert_eq!(state.selected_topic_path(), Some("/b/event"));
+    }
+
+    #[test]
+    fn activate_server_disables_auto_topic_sync_until_manual_selection() {
+        let mut state = ConfigState::new();
+
+        state.active_server_id = Some("server-a".to_string());
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent("A", vec![(0, "/a/prop", true, "prop")], 1)],
+        )]);
+        state.active_server_id = Some("server-b".to_string());
+        state.apply_configs(vec![make_config(
+            2,
+            vec![make_agent("B", vec![(0, "/b/event", true, "event")], 2)],
+        )]);
+
+        state.activate_server_session("server-a");
+
+        assert_eq!(state.selected_agent_id(), Some("A"));
+        assert_eq!(state.selected_topic_index(), Some(0));
+        assert_eq!(state.synced_selected_topic_index(), None);
+        assert_eq!(state.selected_topic_path(), Some("/a/prop"));
+        assert!(!state.topic_sync_enabled());
+    }
+
+    #[test]
+    fn restore_stale_loading_recovers_previous_loaded_state() {
+        let mut state = ConfigState::new();
+        state.active_server_id = Some("server-a".to_string());
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent("A", vec![(0, "/a/prop", true, "prop")], 1)],
+        )]);
+
+        let session = state.session_for_server_mut("server-a");
+        ConfigState::mark_session_loading(session, Some(7));
+        assert!(matches!(session.load_state, ConfigLoadState::Loading));
+
+        assert!(ConfigState::restore_stale_loading_for_session(
+            state.session_for_server_mut("server-a"),
+            7,
+        ));
+
+        let session = state.session_for_server_mut("server-a");
+        assert!(matches!(session.load_state, ConfigLoadState::Loaded));
+        assert_eq!(session.pending_request_id, None);
+        assert!(session.resume_load_state.is_none());
+    }
+
+    #[test]
+    fn restore_stale_loading_does_not_change_active_server_session() {
+        let mut state = ConfigState::new();
+        state.active_server_id = Some("server-a".to_string());
+        state.apply_configs(vec![make_config(
+            1,
+            vec![make_agent("A", vec![(0, "/a/prop", true, "prop")], 1)],
+        )]);
+        state.active_server_id = Some("server-b".to_string());
+        state.apply_configs(vec![make_config(
+            2,
+            vec![make_agent("B", vec![(0, "/b/event", true, "event")], 2)],
+        )]);
+
+        ConfigState::mark_session_loading(state.session_for_server_mut("server-a"), Some(11));
+        state.active_server_id = Some("server-b".to_string());
+
+        assert!(ConfigState::restore_stale_loading_for_session(
+            state.session_for_server_mut("server-a"),
+            11,
+        ));
+
+        assert_eq!(state.active_server_id(), Some("server-b"));
+        assert_eq!(state.selected_agent_id(), Some("B"));
+        assert_eq!(state.selected_topic_path(), Some("/b/event"));
     }
 }

@@ -163,6 +163,7 @@ pub enum EventTableLoadState {
     Error(Arc<str>),
 }
 
+#[derive(Clone)]
 pub struct EventTableState {
     topic_path: Option<String>,
     rows: VecDeque<EventRow>,

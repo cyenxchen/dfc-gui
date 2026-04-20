@@ -174,10 +174,11 @@ impl DfcSidebar {
 
         let mut items: Vec<AnyElement> = Vec::new();
         for (index, server_id, server_name, is_active) in servers_data {
-            let store_for_click = cx.global::<DfcGlobalStore>().clone();
             let server_id_for_click = server_id.clone();
-            let config_state = self.config_state.clone();
-            let app_state = self.app_state.clone();
+            let config_state_for_click = self.config_state.clone();
+            let app_state_for_click = self.app_state.clone();
+            let config_state_for_close = self.config_state.clone();
+            let app_state_for_close = self.app_state.clone();
             let server_id_for_close = server_id.clone();
 
             items.push(self.render_server_tab(
@@ -186,15 +187,28 @@ impl DfcSidebar {
                 server_id,
                 server_name,
                 is_active,
-                move |_, window, cx| {
-                    store_for_click.set_pending_server(server_id_for_click.clone());
-                    window.dispatch_action(Box::new(ServerAction::Reconnect), cx);
+                move |_, _, cx| {
+                    tracing::info!(
+                        server_id = %server_id_for_click,
+                        "Switching connected server tab without proactive reconnect"
+                    );
+                    app_state_for_click.update(cx, |state, cx| {
+                        state.select_server(Some(server_id_for_click.clone()), cx);
+                    });
+                    config_state_for_click.update(cx, |state, cx| {
+                        state.activate_server(server_id_for_click.clone(), cx);
+                    });
+                    cx.update_global::<DfcGlobalStore, ()>(|store, cx| {
+                        store.update(cx, |state, cx| {
+                            state.go_to(Route::Home, cx);
+                        });
+                    });
                 },
                 move |_, _, cx| {
-                    config_state.update(cx, |state, cx| {
+                    config_state_for_close.update(cx, |state, cx| {
                         state.remove_connected_server(&server_id_for_close, cx);
                     });
-                    app_state.update(cx, |state, cx| {
+                    app_state_for_close.update(cx, |state, cx| {
                         if state.selected_server_id() == Some(server_id_for_close.as_str()) {
                             state.select_server(None, cx);
                         }
