@@ -46,6 +46,8 @@ impl AssetSource for Assets {
 
 /// Custom icon names for DFC-GUI
 pub enum CustomIconName {
+    /// GitHub icon
+    GitHub,
     /// Device icon
     Device,
     /// Online status indicator
@@ -84,6 +86,7 @@ impl CustomIconName {
     /// Get the SVG path for this icon
     pub fn path(self) -> SharedString {
         match self {
+            CustomIconName::GitHub => "icons/dfc-github.svg",
             CustomIconName::Device => "icons/device.svg",
             CustomIconName::Online => "icons/online.svg",
             CustomIconName::Offline => "icons/offline.svg",

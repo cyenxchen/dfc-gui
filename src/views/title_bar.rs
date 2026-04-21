@@ -2,6 +2,7 @@
 //!
 //! Custom title bar with settings menu and branding.
 
+use crate::assets::CustomIconName;
 use crate::helpers::MenuAction;
 use crate::states::{
     DfcGlobalStore, FontSize, FontSizeAction, LocaleAction, SettingsAction, ThemeAction,
@@ -15,6 +16,8 @@ use gpui_component::{
     label::Label,
     menu::{DropdownMenu, PopupMenu},
 };
+
+const GITHUB_REPOSITORY_URL: &str = "https://github.com/cyenxchen/dfc-gui";
 
 /// Title bar component
 pub struct DfcTitleBar;
@@ -103,6 +106,21 @@ impl Render for DfcTitleBar {
                     .flex_1()
                     .items_center()
                     .pl_4()
+                    .gap_2()
+                    .child(
+                        Button::new("github-repo-left")
+                            .tooltip("GitHub")
+                            .icon(Icon::from(CustomIconName::GitHub))
+                            .small()
+                            .ghost()
+                            .on_click(|_, _, cx| {
+                                tracing::info!(
+                                    url = GITHUB_REPOSITORY_URL,
+                                    "Opening GitHub repository from title bar"
+                                );
+                                cx.open_url(GITHUB_REPOSITORY_URL);
+                            }),
+                    )
                     .child(Label::new("DFC-GUI").text_sm()),
             )
             // Right side - settings and info
@@ -118,6 +136,20 @@ impl Render for DfcTitleBar {
                                 Self::render_settings_menu(menu, window, cx)
                             })
                             .anchor(Corner::TopRight),
+                    )
+                    .child(
+                        Button::new("github-repo-right")
+                            .tooltip("GitHub")
+                            .icon(Icon::from(CustomIconName::GitHub))
+                            .small()
+                            .ghost()
+                            .on_click(|_, _, cx| {
+                                tracing::info!(
+                                    url = GITHUB_REPOSITORY_URL,
+                                    "Opening GitHub repository from title bar"
+                                );
+                                cx.open_url(GITHUB_REPOSITORY_URL);
+                            }),
                     )
                     .child(
                         Button::new("info")
