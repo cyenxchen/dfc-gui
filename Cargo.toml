@@ -87,7 +87,7 @@ panic = "abort"
 [package.metadata.bundle]
 name = "DFC-GUI"
 identifier = "com.goldwind.dfc-gui"
-icon = ["icons/dfc-gui.icns"]
+icon = ["icons/dfc-gui.icns", "assets/icon.ico"]
 copyright = "Copyright 2026 Goldwind DFC Team. All rights reserved."
 category = "public.app-category.developer-tools"
 osx_minimum_system_version = "12.0"
