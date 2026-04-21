@@ -195,6 +195,7 @@ impl Render for ColumnResizeGhost {
 }
 
 type TopicSelectionKey = (Option<String>, Option<String>, Option<String>);
+type AgentTabsSignature = (Option<String>, Option<String>, Vec<String>);
 
 fn topic_display_name(topic_path: &str) -> String {
     if topic_path.contains("thing_service-BZ-RESPONSE")
@@ -473,6 +474,8 @@ pub struct ConfigView {
     agent_query_mode: AgentQueryMode,
     agent_list_focus_handle: FocusHandle,
     topic_content_focus_handle: FocusHandle,
+    /// Shared horizontal scroll handle for the selected agent topic tabs.
+    agent_tabs_horizontal_scroll_handle: ScrollHandle,
     /// Prop topic table state (for `prop_data` topics)
     prop_table_state: Entity<PropTableState>,
     /// Per-column filter inputs for the prop topic table
@@ -524,6 +527,8 @@ pub struct ConfigView {
     topic_feedback_frame: usize,
     _topic_feedback_task: Option<Task<()>>,
     last_selection_key: TopicSelectionKey,
+    last_agent_tabs_signature: AgentTabsSignature,
+    agent_tabs_scrollbar_visible: bool,
     switch_feedback_until: Option<Instant>,
     /// Subscriptions
     _subscriptions: Vec<Subscription>,
@@ -827,6 +832,7 @@ impl ConfigView {
                         .map(|s| s.to_string());
                     if let Some(selected) = selected {
                         if !this.agent_id_matches_query(&selected, &query) {
+                            this.reset_agent_tabs_horizontal_scroll();
                             this.config_state.update(cx, |state, cx| {
                                 state.select_agent(None, cx);
                             });
@@ -851,6 +857,7 @@ impl ConfigView {
                         .map(|s| s.to_string());
                     if let Some(selected) = selected {
                         if !this.agent_id_matches_query(&selected, &query) {
+                            this.reset_agent_tabs_horizontal_scroll();
                             this.config_state.update(cx, |state, cx| {
                                 state.select_agent(None, cx);
                             });
@@ -861,6 +868,9 @@ impl ConfigView {
                 cx.notify();
             }
         }));
+        subscriptions.push(cx.observe_window_bounds(window, |this, _window, cx| {
+            this.update_agent_tabs_scrollbar_visibility(cx);
+        }));
 
         Self {
             app_state,
@@ -870,6 +880,7 @@ impl ConfigView {
             agent_query_mode: AgentQueryMode::default(),
             agent_list_focus_handle,
             topic_content_focus_handle,
+            agent_tabs_horizontal_scroll_handle: ScrollHandle::default(),
             prop_table_state,
             prop_filter_inputs,
             prop_table_scroll_handle: ScrollHandle::default(),
@@ -904,6 +915,8 @@ impl ConfigView {
             topic_feedback_frame: 0,
             _topic_feedback_task: None,
             last_selection_key: (None, None, None),
+            last_agent_tabs_signature: (None, None, Vec::new()),
+            agent_tabs_scrollbar_visible: false,
             switch_feedback_until: None,
             _subscriptions: subscriptions,
         }
@@ -1132,11 +1145,53 @@ impl ConfigView {
             .map(|s| s.to_string());
         if let Some(selected) = selected {
             if !self.agent_id_matches_query(&selected, &query) {
+                self.reset_agent_tabs_horizontal_scroll();
                 self.config_state.update(cx, |state, cx| {
                     state.select_agent(None, cx);
                 });
             }
         }
+    }
+
+    fn reset_agent_tabs_horizontal_scroll(&self) -> bool {
+        let mut offset = self.agent_tabs_horizontal_scroll_handle.offset();
+        if offset.x == px(0.0) {
+            return false;
+        }
+
+        offset.x = px(0.0);
+        self.agent_tabs_horizontal_scroll_handle.set_offset(offset);
+        tracing::debug!("reset agent topic tabs horizontal scroll offset");
+        true
+    }
+
+    fn update_agent_tabs_scrollbar_visibility(&mut self, cx: &mut Context<Self>) -> bool {
+        let is_visible = self.agent_tabs_horizontal_scroll_handle.max_offset().width > px(0.0);
+        if self.agent_tabs_scrollbar_visible == is_visible {
+            return false;
+        }
+
+        self.agent_tabs_scrollbar_visible = is_visible;
+        tracing::debug!(
+            visible = is_visible,
+            max_offset_x = ?self.agent_tabs_horizontal_scroll_handle.max_offset().width,
+            "updated agent topic tabs scrollbar visibility"
+        );
+        cx.notify();
+        true
+    }
+
+    fn schedule_agent_tabs_scrollbar_visibility_refresh(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity();
+        window.defer(cx, move |_window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.update_agent_tabs_scrollbar_visibility(cx);
+            });
+        });
     }
 
     pub fn handle_filter_shortcut(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1471,6 +1526,28 @@ impl ConfigView {
         };
 
         (server_id, agent_id, topic_path)
+    }
+
+    fn current_agent_tabs_signature(&self, cx: &App) -> AgentTabsSignature {
+        let server_id = self
+            .app_state
+            .read(cx)
+            .selected_server_id()
+            .map(str::to_string);
+        let state = self.config_state.read(cx);
+        let agent_id = state.selected_agent_id().map(str::to_string);
+        let topic_paths = state
+            .selected_agent()
+            .map(|agent| {
+                agent
+                    .topics
+                    .iter()
+                    .map(|topic| topic.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        (server_id, agent_id, topic_paths)
     }
 
     fn topic_feedback_kind_for_panel(
@@ -1894,8 +1971,22 @@ impl ConfigView {
 
     fn sync_topic_stream_with_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selection_key = self.current_selection_key(cx);
+        let agent_tabs_signature = self.current_agent_tabs_signature(cx);
         let server_id = selection_key.0.clone();
         let selected_topic_path = selection_key.2.clone();
+
+        if self.last_agent_tabs_signature != agent_tabs_signature {
+            let reset = self.reset_agent_tabs_horizontal_scroll();
+            self.agent_tabs_scrollbar_visible = false;
+            tracing::debug!(
+                agent_id = ?agent_tabs_signature.1,
+                topic_count = agent_tabs_signature.2.len(),
+                did_reset = reset,
+                "agent topic tabs changed"
+            );
+            self.last_agent_tabs_signature = agent_tabs_signature;
+            self.schedule_agent_tabs_scrollbar_visibility_refresh(window, cx);
+        }
 
         if self.last_selection_key != selection_key {
             self.last_selection_key = selection_key.clone();
@@ -2990,6 +3081,7 @@ impl ConfigView {
                     return;
                 }
 
+                this.reset_agent_tabs_horizontal_scroll();
                 this.config_state.update(cx, |state, cx| {
                     state.select_agent(Some(agent_id_for_click.clone()), cx);
                 });
@@ -3157,6 +3249,7 @@ impl ConfigView {
         let border = cx.theme().border;
         let secondary_bg = cx.theme().secondary;
         let no_topic_selected = t!("config.no_topic_selected", locale = &locale).to_string();
+        let show_agent_tabs_scrollbar = self.agent_tabs_scrollbar_visible;
 
         let selected_topic_index =
             selected_topic_index.filter(|idx| (*idx as usize) < topic_paths.len());
@@ -3204,15 +3297,28 @@ impl ConfigView {
                     .border_b_1()
                     .border_color(border)
                     .child(
-                        h_flex()
-                            .id("agent-tabs-scroll")
+                        v_flex()
                             .flex_1()
                             .min_w(px(0.0))
-                            .gap_2()
-                            .flex_nowrap()
-                            .justify_center()
-                            .overflow_x_scroll()
-                            .children(tabs),
+                            .h_full()
+                            .child(
+                                h_flex()
+                                    .id("agent-tabs-scroll")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .gap_2()
+                                    .flex_nowrap()
+                                    .items_center()
+                                    .overflow_x_scroll()
+                                    .track_scroll(&self.agent_tabs_horizontal_scroll_handle)
+                                    .children(tabs),
+                            )
+                            .when(show_agent_tabs_scrollbar, |this| {
+                                this.child(self.render_horizontal_scrollbar_row(
+                                    &self.agent_tabs_horizontal_scroll_handle,
+                                    cx,
+                                ))
+                            }),
                     ),
             )
             // Content area
@@ -5294,11 +5400,12 @@ impl ConfigView {
             cx.theme().muted_foreground
         };
         let tooltip_label = topic_path.to_string();
+        let topic_path_for_log = tooltip_label.clone();
 
         div()
             .id(("agent-topic-tab", index as usize))
             .px_4()
-            .py_2()
+            .py_1()
             .bg(tab_bg)
             .cursor_pointer()
             .flex_none()
@@ -5308,6 +5415,11 @@ impl ConfigView {
             .child(Label::new(label).text_sm().text_color(text_color))
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
+                tracing::debug!(
+                    topic_index = index,
+                    topic = %topic_path_for_log,
+                    "selecting topic tab from agent topic bar"
+                );
                 this.config_state.update(cx, |state, cx| {
                     state.select_topic(Some(index), cx);
                 });
