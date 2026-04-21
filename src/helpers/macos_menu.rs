@@ -1,10 +1,49 @@
 #[cfg(target_os = "macos")]
 use cocoa::{
-    appkit::{NSApp, NSApplication, NSMenu},
+    appkit::{NSApp, NSApplication, NSImage, NSMenu},
     base::{id, nil},
+    foundation::{NSData, NSUInteger},
 };
 #[cfg(target_os = "macos")]
 use objc::{msg_send, sel, sel_impl};
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
+#[cfg(target_os = "macos")]
+use tracing::{error, info};
+
+#[cfg(target_os = "macos")]
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
+
+/// Install the application icon so dev builds also show a Dock icon.
+#[cfg(target_os = "macos")]
+pub fn install_application_icon() {
+    unsafe {
+        let app = NSApp();
+        if app == nil {
+            error!("NSApp unavailable, skipping application icon install");
+            return;
+        }
+
+        let icon_data = NSData::dataWithBytes_length_(
+            nil,
+            APP_ICON_PNG.as_ptr() as *const c_void,
+            APP_ICON_PNG.len() as NSUInteger,
+        );
+        if icon_data == nil {
+            error!("Failed to build NSData for embedded application icon");
+            return;
+        }
+
+        let image = NSImage::initWithData_(NSImage::alloc(nil), icon_data);
+        if image == nil {
+            error!("Failed to decode embedded application icon PNG");
+            return;
+        }
+
+        app.setApplicationIconImage_(image);
+        info!("Installed macOS application icon");
+    }
+}
 
 /// Rewire GPUI-created Window menu items to native AppKit selectors so
 /// macOS standard shortcuts like Cmd+M and Cmd+Ctrl+F work reliably.
@@ -44,6 +83,9 @@ pub fn install_native_window_menu_shortcuts() {
         }
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_application_icon() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn install_native_window_menu_shortcuts() {}

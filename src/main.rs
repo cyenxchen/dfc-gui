@@ -6,8 +6,8 @@
 
 use crate::helpers::{
     DeviceAction, MenuAction, ServerAction, WindowAction, get_or_create_log_dir,
-    handle_window_action, install_native_window_menu_shortcuts, is_app_store_build, is_development,
-    new_key_bindings, supports_auto_update,
+    handle_window_action, install_application_icon, install_native_window_menu_shortcuts,
+    is_app_store_build, is_development, new_key_bindings, supports_auto_update,
 };
 use crate::services::ServiceHub;
 use crate::states::{
@@ -347,6 +347,7 @@ fn main() {
     app.run(move |cx| {
         // Initialize GPUI components
         gpui_component::init(cx);
+        install_application_icon();
 
         cx.activate(true);
 
