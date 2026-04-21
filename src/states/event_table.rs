@@ -308,6 +308,15 @@ impl EventTableState {
         };
     }
 
+    pub fn mark_loading_for_topic(&mut self, topic_path: Option<String>) {
+        self.topic_path = topic_path;
+        self.load_state = if self.topic_path.is_some() {
+            EventTableLoadState::Loading
+        } else {
+            EventTableLoadState::Idle
+        };
+    }
+
     pub fn set_error(&mut self, message: impl Into<Arc<str>>) {
         self.load_state = EventTableLoadState::Error(message.into());
     }
@@ -460,6 +469,20 @@ mod tests {
         let rows = state.page_rows_owned();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].happened_time, "2026-04-14 00:00:01.000");
+    }
+
+    #[test]
+    fn mark_loading_for_topic_preserves_existing_rows_and_filters() {
+        let mut state = EventTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+        state.push_rows_front(vec![event_row(1, "2026-04-14 00:00:01.000")]);
+        state.set_filter(EventSortColumn::Device, "dev".to_string());
+
+        state.mark_loading_for_topic(Some("persistent://topic".to_string()));
+
+        assert!(matches!(state.load_state(), EventTableLoadState::Loading));
+        assert_eq!(state.rows_len(), 1);
+        assert_eq!(state.filters().device, "dev");
     }
 }
 

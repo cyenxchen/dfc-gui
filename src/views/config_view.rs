@@ -10,7 +10,7 @@ use super::service_panel::{
     pulsar_service_url_candidates, run_service_topic_stream,
 };
 use crate::assets::CustomIconName;
-use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo};
+use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo, TopicAgentItem};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
     ConfigState, DfcAppState, DfcGlobalStore, EventRow, EventSortColumn, EventTableLoadState,
@@ -42,7 +42,7 @@ use gpui_component::{
 use rust_i18n::t;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -94,21 +94,61 @@ enum TopicFeedbackKind {
     Loading,
 }
 
+struct PropTopicRuntime {
+    state: PropTableState,
+    stream_stop: Option<watch::Sender<bool>>,
+    ingest_task: Option<Task<()>>,
+}
+
+struct EventTopicRuntime {
+    state: EventTableState,
+    stream_stop: Option<watch::Sender<bool>>,
+    ingest_task: Option<Task<()>>,
+}
+
+struct ServiceTopicRuntime {
+    state: ServiceTableState,
+    stream_stop: Option<watch::Sender<bool>>,
+    publish_tx: Option<Sender<ServicePublishRequest>>,
+    ingest_task: Option<Task<()>>,
+}
+
+impl Default for PropTopicRuntime {
+    fn default() -> Self {
+        Self {
+            state: PropTableState::new(),
+            stream_stop: None,
+            ingest_task: None,
+        }
+    }
+}
+
+impl Default for EventTopicRuntime {
+    fn default() -> Self {
+        Self {
+            state: EventTableState::new(),
+            stream_stop: None,
+            ingest_task: None,
+        }
+    }
+}
+
+impl Default for ServiceTopicRuntime {
+    fn default() -> Self {
+        Self {
+            state: ServiceTableState::new(),
+            stream_stop: None,
+            publish_tx: None,
+            ingest_task: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ServerTopicRuntime {
-    active_prop_topic: Option<String>,
-    prop_state: PropTableState,
-    prop_stream_stop: Option<watch::Sender<bool>>,
-    prop_ingest_task: Option<Task<()>>,
-    active_event_topic: Option<String>,
-    event_state: EventTableState,
-    event_stream_stop: Option<watch::Sender<bool>>,
-    event_ingest_task: Option<Task<()>>,
-    active_service_topic: Option<String>,
-    service_state: ServiceTableState,
-    service_stream_stop: Option<watch::Sender<bool>>,
-    service_publish_tx: Option<Sender<ServicePublishRequest>>,
-    service_ingest_task: Option<Task<()>>,
+    prop_topics: BTreeMap<String, PropTopicRuntime>,
+    event_topics: BTreeMap<String, EventTopicRuntime>,
+    service_topics: BTreeMap<String, ServiceTopicRuntime>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +236,29 @@ impl Render for ColumnResizeGhost {
 
 type TopicSelectionKey = (Option<String>, Option<String>, Option<String>);
 type AgentTabsSignature = (Option<String>, Option<String>, Vec<String>);
+
+fn topic_paths_by_kind<'a>(
+    topic_agents: impl IntoIterator<Item = &'a TopicAgentItem>,
+) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let mut prop_topics = BTreeSet::new();
+    let mut event_topics = BTreeSet::new();
+    let mut service_topics = BTreeSet::new();
+
+    for agent in topic_agents {
+        for topic in &agent.topics {
+            let path = topic.path.clone();
+            if ConfigView::is_prop_topic_path(&path) {
+                prop_topics.insert(path);
+            } else if ConfigView::is_event_topic_path(&path) {
+                event_topics.insert(path);
+            } else if ConfigView::is_service_topic_path(&path) {
+                service_topics.insert(path);
+            }
+        }
+    }
+
+    (prop_topics, event_topics, service_topics)
+}
 
 fn topic_display_name(topic_path: &str) -> String {
     if topic_path.contains("thing_service-BZ-RESPONSE")
@@ -803,9 +866,9 @@ impl ConfigView {
                     .cloned()
                     .collect();
                 for server_id in stale_server_ids {
-                    this.stop_prop_stream_for_server(&server_id);
-                    this.stop_event_stream_for_server(&server_id);
-                    this.stop_service_stream_for_server(&server_id);
+                    this.stop_prop_streams_for_server(&server_id);
+                    this.stop_event_streams_for_server(&server_id);
+                    this.stop_service_streams_for_server(&server_id);
                     this.server_topic_runtimes.remove(&server_id);
                 }
 
@@ -815,12 +878,15 @@ impl ConfigView {
                         load_state,
                         ConfigLoadState::Loading | ConfigLoadState::Error(_)
                     ) {
-                        this.stop_prop_stream_for_server(&server_id);
-                        this.stop_event_stream_for_server(&server_id);
-                        this.stop_service_stream_for_server(&server_id);
+                        this.stop_prop_streams_for_server(&server_id);
+                        this.stop_event_streams_for_server(&server_id);
+                        this.stop_service_streams_for_server(&server_id);
+                        this.service_publish_tx = None;
                         cx.notify();
                         return;
                     }
+
+                    this.prune_removed_topic_runtimes_for_server(&server_id, cx);
                 }
 
                 let query = this.agent_search_state.read(cx).value().trim().to_string();
@@ -1230,44 +1296,199 @@ impl ConfigView {
             .or_default()
     }
 
-    fn stop_prop_stream_for_server(&mut self, server_id: &str) {
-        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
-            return;
-        };
-        if let Some(stop) = runtime.prop_stream_stop.take() {
-            let _ = stop.send(true);
-        }
-        if let Some(task) = runtime.prop_ingest_task.take() {
-            drop(task);
-        }
-        runtime.active_prop_topic = None;
+    fn prop_topic_runtime_mut(
+        &mut self,
+        server_id: &str,
+        topic_path: &str,
+    ) -> &mut PropTopicRuntime {
+        let runtime = self.current_runtime_mut(server_id);
+        runtime
+            .prop_topics
+            .entry(topic_path.to_string())
+            .or_insert_with(|| {
+                tracing::debug!(server_id, topic = %topic_path, "creating prop topic runtime");
+                let mut topic_runtime = PropTopicRuntime::default();
+                topic_runtime
+                    .state
+                    .reset_for_topic(Some(topic_path.to_string()));
+                topic_runtime
+            })
     }
 
-    fn stop_event_stream_for_server(&mut self, server_id: &str) {
-        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
-            return;
-        };
-        if let Some(stop) = runtime.event_stream_stop.take() {
-            let _ = stop.send(true);
-        }
-        if let Some(task) = runtime.event_ingest_task.take() {
-            drop(task);
-        }
-        runtime.active_event_topic = None;
+    fn event_topic_runtime_mut(
+        &mut self,
+        server_id: &str,
+        topic_path: &str,
+    ) -> &mut EventTopicRuntime {
+        let runtime = self.current_runtime_mut(server_id);
+        runtime
+            .event_topics
+            .entry(topic_path.to_string())
+            .or_insert_with(|| {
+                tracing::debug!(server_id, topic = %topic_path, "creating event topic runtime");
+                let mut topic_runtime = EventTopicRuntime::default();
+                topic_runtime
+                    .state
+                    .reset_for_topic(Some(topic_path.to_string()));
+                topic_runtime
+            })
     }
 
-    fn stop_service_stream_for_server(&mut self, server_id: &str) {
+    fn service_topic_runtime_mut(
+        &mut self,
+        server_id: &str,
+        topic_path: &str,
+    ) -> &mut ServiceTopicRuntime {
+        let runtime = self.current_runtime_mut(server_id);
+        runtime
+            .service_topics
+            .entry(topic_path.to_string())
+            .or_insert_with(|| {
+                tracing::debug!(server_id, topic = %topic_path, "creating service topic runtime");
+                let mut topic_runtime = ServiceTopicRuntime::default();
+                topic_runtime
+                    .state
+                    .reset_for_topic(Some(topic_path.to_string()));
+                topic_runtime
+            })
+    }
+
+    fn stop_prop_streams_for_server(&mut self, server_id: &str) {
         let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
             return;
         };
-        if let Some(stop) = runtime.service_stream_stop.take() {
+        for (topic_path, topic_runtime) in &mut runtime.prop_topics {
+            if let Some(stop) = topic_runtime.stream_stop.take() {
+                tracing::info!(server_id, topic = %topic_path, "stopping prop topic stream");
+                let _ = stop.send(true);
+            }
+            if let Some(task) = topic_runtime.ingest_task.take() {
+                drop(task);
+            }
+        }
+    }
+
+    fn stop_and_remove_prop_topic_runtime(&mut self, server_id: &str, topic_path: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        let Some(mut topic_runtime) = runtime.prop_topics.remove(topic_path) else {
+            return;
+        };
+
+        tracing::info!(server_id, topic = %topic_path, "pruning removed prop topic runtime");
+        if let Some(stop) = topic_runtime.stream_stop.take() {
             let _ = stop.send(true);
         }
-        if let Some(task) = runtime.service_ingest_task.take() {
+        if let Some(task) = topic_runtime.ingest_task.take() {
             drop(task);
         }
-        runtime.active_service_topic = None;
-        runtime.service_publish_tx = None;
+    }
+
+    fn stop_event_streams_for_server(&mut self, server_id: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        for (topic_path, topic_runtime) in &mut runtime.event_topics {
+            if let Some(stop) = topic_runtime.stream_stop.take() {
+                tracing::info!(server_id, topic = %topic_path, "stopping event topic stream");
+                let _ = stop.send(true);
+            }
+            if let Some(task) = topic_runtime.ingest_task.take() {
+                drop(task);
+            }
+        }
+    }
+
+    fn stop_and_remove_event_topic_runtime(&mut self, server_id: &str, topic_path: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        let Some(mut topic_runtime) = runtime.event_topics.remove(topic_path) else {
+            return;
+        };
+
+        tracing::info!(server_id, topic = %topic_path, "pruning removed event topic runtime");
+        if let Some(stop) = topic_runtime.stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = topic_runtime.ingest_task.take() {
+            drop(task);
+        }
+    }
+
+    fn stop_service_streams_for_server(&mut self, server_id: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        for (topic_path, topic_runtime) in &mut runtime.service_topics {
+            if let Some(stop) = topic_runtime.stream_stop.take() {
+                tracing::info!(server_id, topic = %topic_path, "stopping service topic stream");
+                let _ = stop.send(true);
+            }
+            if let Some(task) = topic_runtime.ingest_task.take() {
+                drop(task);
+            }
+            topic_runtime.publish_tx = None;
+        }
+    }
+
+    fn stop_and_remove_service_topic_runtime(&mut self, server_id: &str, topic_path: &str) {
+        let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) else {
+            return;
+        };
+        let Some(mut topic_runtime) = runtime.service_topics.remove(topic_path) else {
+            return;
+        };
+
+        tracing::info!(server_id, topic = %topic_path, "pruning removed service topic runtime");
+        if let Some(stop) = topic_runtime.stream_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = topic_runtime.ingest_task.take() {
+            drop(task);
+        }
+        topic_runtime.publish_tx = None;
+    }
+
+    fn prune_removed_topic_runtimes_for_server(&mut self, server_id: &str, cx: &App) {
+        let (valid_prop_topics, valid_event_topics, valid_service_topics) = {
+            let config_state = self.config_state.read(cx);
+            topic_paths_by_kind(config_state.topic_agents())
+        };
+
+        let Some(runtime) = self.server_topic_runtimes.get(server_id) else {
+            return;
+        };
+
+        let stale_prop_topics: Vec<String> = runtime
+            .prop_topics
+            .keys()
+            .filter(|topic_path| !valid_prop_topics.contains(*topic_path))
+            .cloned()
+            .collect();
+        let stale_event_topics: Vec<String> = runtime
+            .event_topics
+            .keys()
+            .filter(|topic_path| !valid_event_topics.contains(*topic_path))
+            .cloned()
+            .collect();
+        let stale_service_topics: Vec<String> = runtime
+            .service_topics
+            .keys()
+            .filter(|topic_path| !valid_service_topics.contains(*topic_path))
+            .cloned()
+            .collect();
+
+        for topic_path in stale_prop_topics {
+            self.stop_and_remove_prop_topic_runtime(server_id, &topic_path);
+        }
+        for topic_path in stale_event_topics {
+            self.stop_and_remove_event_topic_runtime(server_id, &topic_path);
+        }
+        for topic_path in stale_service_topics {
+            self.stop_and_remove_service_topic_runtime(server_id, &topic_path);
+        }
     }
 
     fn persist_visible_prop_state_for_current_server(&mut self, cx: &mut Context<Self>) {
@@ -1282,9 +1503,8 @@ impl ConfigView {
         }
 
         let snapshot = self.prop_table_state.read(cx).clone();
-        let runtime = self.current_runtime_mut(&server_id);
-        runtime.prop_state = snapshot;
-        runtime.active_prop_topic = Some(topic_path);
+        let topic_runtime = self.prop_topic_runtime_mut(&server_id, &topic_path);
+        topic_runtime.state = snapshot;
     }
 
     fn persist_visible_event_state_for_current_server(&mut self, cx: &mut Context<Self>) {
@@ -1299,9 +1519,8 @@ impl ConfigView {
         }
 
         let snapshot = self.event_table_state.read(cx).clone();
-        let runtime = self.current_runtime_mut(&server_id);
-        runtime.event_state = snapshot;
-        runtime.active_event_topic = Some(topic_path);
+        let topic_runtime = self.event_topic_runtime_mut(&server_id, &topic_path);
+        topic_runtime.state = snapshot;
     }
 
     fn persist_visible_service_state_for_current_server(&mut self, cx: &mut Context<Self>) {
@@ -1316,9 +1535,8 @@ impl ConfigView {
         }
 
         let snapshot = self.service_table_state.read(cx).clone();
-        let runtime = self.current_runtime_mut(&server_id);
-        runtime.service_state = snapshot;
-        runtime.active_service_topic = Some(topic_path);
+        let topic_runtime = self.service_topic_runtime_mut(&server_id, &topic_path);
+        topic_runtime.state = snapshot;
     }
 
     fn sync_prop_filter_inputs_from_visible_state(
@@ -1422,14 +1640,20 @@ impl ConfigView {
     fn load_visible_prop_state_for_server(
         &mut self,
         server_id: &str,
+        topic_path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let snapshot = self
             .server_topic_runtimes
             .get(server_id)
-            .map(|runtime| runtime.prop_state.clone())
-            .unwrap_or_default();
+            .and_then(|runtime| runtime.prop_topics.get(topic_path))
+            .map(|runtime| runtime.state.clone())
+            .unwrap_or_else(|| {
+                let mut snapshot = PropTableState::new();
+                snapshot.reset_for_topic(Some(topic_path.to_string()));
+                snapshot
+            });
         self.replace_visible_prop_state(snapshot, cx);
         self.sync_prop_filter_inputs_from_visible_state(window, cx);
     }
@@ -1437,28 +1661,40 @@ impl ConfigView {
     fn load_visible_event_state_for_server(
         &mut self,
         server_id: &str,
+        topic_path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let snapshot = self
             .server_topic_runtimes
             .get(server_id)
-            .map(|runtime| runtime.event_state.clone())
-            .unwrap_or_default();
+            .and_then(|runtime| runtime.event_topics.get(topic_path))
+            .map(|runtime| runtime.state.clone())
+            .unwrap_or_else(|| {
+                let mut snapshot = EventTableState::new();
+                snapshot.reset_for_topic(Some(topic_path.to_string()));
+                snapshot
+            });
         self.replace_visible_event_state(snapshot, cx);
         self.sync_event_filter_inputs_from_visible_state(window, cx);
     }
 
-    fn load_visible_service_state_for_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
-        let snapshot = self
+    fn load_visible_service_state_for_server(
+        &mut self,
+        server_id: &str,
+        topic_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (snapshot, publish_tx) = self
             .server_topic_runtimes
             .get(server_id)
-            .map(|runtime| runtime.service_state.clone())
-            .unwrap_or_default();
-        let publish_tx = self
-            .server_topic_runtimes
-            .get(server_id)
-            .and_then(|runtime| runtime.service_publish_tx.clone());
+            .and_then(|runtime| runtime.service_topics.get(topic_path))
+            .map(|runtime| (runtime.state.clone(), runtime.publish_tx.clone()))
+            .unwrap_or_else(|| {
+                let mut snapshot = ServiceTableState::new();
+                snapshot.reset_for_topic(Some(topic_path.to_string()));
+                (snapshot, None)
+            });
         self.replace_visible_service_state(snapshot, cx);
         self.service_publish_tx = publish_tx;
     }
@@ -1869,21 +2105,18 @@ impl ConfigView {
         let same_topic_running = self
             .server_topic_runtimes
             .get(server_id)
-            .is_some_and(|runtime| {
-                runtime.active_prop_topic.as_deref() == Some(topic_path.as_str())
-                    && runtime.prop_stream_stop.is_some()
-            });
+            .and_then(|runtime| runtime.prop_topics.get(&topic_path))
+            .is_some_and(|runtime| runtime.stream_stop.is_some());
         if same_topic_running {
+            tracing::debug!(server_id, topic = %topic_path, "reusing running prop topic stream");
             return;
         }
 
-        self.stop_prop_stream_for_server(server_id);
-
-        let runtime = self.current_runtime_mut(server_id);
-        if runtime.prop_state.topic_path() != Some(topic_path.as_str()) {
-            runtime.prop_state.reset_for_topic(Some(topic_path.clone()));
-        }
-        runtime.active_prop_topic = Some(topic_path.clone());
+        let topic_runtime = self.prop_topic_runtime_mut(server_id, &topic_path);
+        topic_runtime
+            .state
+            .mark_loading_for_topic(Some(topic_path.clone()));
+        tracing::info!(server_id, topic = %topic_path, "starting prop topic stream");
 
         self.start_prop_stream(
             server_id.to_string(),
@@ -1906,23 +2139,18 @@ impl ConfigView {
         let same_topic_running = self
             .server_topic_runtimes
             .get(server_id)
-            .is_some_and(|runtime| {
-                runtime.active_event_topic.as_deref() == Some(topic_path.as_str())
-                    && runtime.event_stream_stop.is_some()
-            });
+            .and_then(|runtime| runtime.event_topics.get(&topic_path))
+            .is_some_and(|runtime| runtime.stream_stop.is_some());
         if same_topic_running {
+            tracing::debug!(server_id, topic = %topic_path, "reusing running event topic stream");
             return;
         }
 
-        self.stop_event_stream_for_server(server_id);
-
-        let runtime = self.current_runtime_mut(server_id);
-        if runtime.event_state.topic_path() != Some(topic_path.as_str()) {
-            runtime
-                .event_state
-                .reset_for_topic(Some(topic_path.clone()));
-        }
-        runtime.active_event_topic = Some(topic_path.clone());
+        let topic_runtime = self.event_topic_runtime_mut(server_id, &topic_path);
+        topic_runtime
+            .state
+            .mark_loading_for_topic(Some(topic_path.clone()));
+        tracing::info!(server_id, topic = %topic_path, "starting event topic stream");
 
         self.start_event_stream(server_id.to_string(), service_url, topic_path, token, cx);
     }
@@ -1940,23 +2168,19 @@ impl ConfigView {
         let same_topic_running = self
             .server_topic_runtimes
             .get(server_id)
-            .is_some_and(|runtime| {
-                runtime.active_service_topic.as_deref() == Some(topic_path.as_str())
-                    && runtime.service_stream_stop.is_some()
-            });
+            .and_then(|runtime| runtime.service_topics.get(&topic_path))
+            .is_some_and(|runtime| runtime.stream_stop.is_some());
         if same_topic_running {
+            tracing::debug!(
+                server_id,
+                topic = %topic_path,
+                "reusing running service topic stream"
+            );
             return;
         }
 
-        self.stop_service_stream_for_server(server_id);
-
-        let runtime = self.current_runtime_mut(server_id);
-        if runtime.service_state.topic_path() != Some(topic_path.as_str()) {
-            runtime
-                .service_state
-                .reset_for_topic(Some(topic_path.clone()));
-        }
-        runtime.active_service_topic = Some(topic_path.clone());
+        let _ = self.service_topic_runtime_mut(server_id, &topic_path);
+        tracing::info!(server_id, topic = %topic_path, "starting service topic stream");
 
         self.start_service_stream(
             server_id.to_string(),
@@ -2014,20 +2238,21 @@ impl ConfigView {
             .clone()
             .filter(|path| Self::is_prop_topic_path(path))
         {
-            self.stop_event_stream_for_server(&server_id);
-            self.stop_service_stream_for_server(&server_id);
-
             let (service_url, cfgid) = {
                 let config_state = self.config_state.read(cx);
                 match find_topic_origin(config_state.configs(), &topic_path) {
                     Some(v) => v,
                     None => {
-                        let runtime = self.current_runtime_mut(&server_id);
-                        runtime.prop_state.reset_for_topic(Some(topic_path.clone()));
-                        runtime
-                            .prop_state
+                        let topic_runtime = self.prop_topic_runtime_mut(&server_id, &topic_path);
+                        topic_runtime
+                            .state
                             .set_error("无法定位该 Topic 对应的 service_url/cfgid");
-                        self.load_visible_prop_state_for_server(&server_id, window, cx);
+                        self.load_visible_prop_state_for_server(
+                            &server_id,
+                            &topic_path,
+                            window,
+                            cx,
+                        );
                         self.service_publish_tx = None;
                         return;
                     }
@@ -2038,11 +2263,11 @@ impl ConfigView {
                 &server_id,
                 service_url,
                 cfgid,
-                topic_path,
+                topic_path.clone(),
                 token,
                 cx,
             );
-            self.load_visible_prop_state_for_server(&server_id, window, cx);
+            self.load_visible_prop_state_for_server(&server_id, &topic_path, window, cx);
             self.service_publish_tx = None;
             return;
         }
@@ -2051,30 +2276,35 @@ impl ConfigView {
             .clone()
             .filter(|path| Self::is_event_topic_path(path))
         {
-            self.stop_prop_stream_for_server(&server_id);
-            self.stop_service_stream_for_server(&server_id);
-
             let service_url = {
                 let config_state = self.config_state.read(cx);
                 match find_topic_service_url(config_state.configs(), &topic_path) {
                     Some(service_url) => service_url,
                     None => {
-                        let runtime = self.current_runtime_mut(&server_id);
-                        runtime
-                            .event_state
-                            .reset_for_topic(Some(topic_path.clone()));
-                        runtime
-                            .event_state
+                        let topic_runtime = self.event_topic_runtime_mut(&server_id, &topic_path);
+                        topic_runtime
+                            .state
                             .set_error("无法定位该 Topic 对应的 service_url");
-                        self.load_visible_event_state_for_server(&server_id, window, cx);
+                        self.load_visible_event_state_for_server(
+                            &server_id,
+                            &topic_path,
+                            window,
+                            cx,
+                        );
                         self.service_publish_tx = None;
                         return;
                     }
                 }
             };
 
-            self.ensure_event_stream_for_server(&server_id, service_url, topic_path, token, cx);
-            self.load_visible_event_state_for_server(&server_id, window, cx);
+            self.ensure_event_stream_for_server(
+                &server_id,
+                service_url,
+                topic_path.clone(),
+                token,
+                cx,
+            );
+            self.load_visible_event_state_for_server(&server_id, &topic_path, window, cx);
             self.service_publish_tx = None;
             return;
         }
@@ -2083,19 +2313,11 @@ impl ConfigView {
             .clone()
             .filter(|path| Self::is_service_topic_path(path))
         {
-            self.stop_prop_stream_for_server(&server_id);
-            self.stop_event_stream_for_server(&server_id);
-
             let Some((request_topic, response_topic)) = Self::split_service_topic_path(&topic_path)
             else {
-                let runtime = self.current_runtime_mut(&server_id);
-                runtime
-                    .service_state
-                    .reset_for_topic(Some(topic_path.clone()));
-                runtime
-                    .service_state
-                    .set_error("无法解析 service topic 路径");
-                self.load_visible_service_state_for_server(&server_id, cx);
+                let topic_runtime = self.service_topic_runtime_mut(&server_id, &topic_path);
+                topic_runtime.state.set_error("无法解析 service topic 路径");
+                self.load_visible_service_state_for_server(&server_id, &topic_path, cx);
                 return;
             };
 
@@ -2104,14 +2326,11 @@ impl ConfigView {
                 match find_topic_service_url(config_state.configs(), &topic_path) {
                     Some(url) => url,
                     None => {
-                        let runtime = self.current_runtime_mut(&server_id);
-                        runtime
-                            .service_state
-                            .reset_for_topic(Some(topic_path.clone()));
-                        runtime
-                            .service_state
+                        let topic_runtime = self.service_topic_runtime_mut(&server_id, &topic_path);
+                        topic_runtime
+                            .state
                             .set_error("无法定位该 Topic 对应的 service_url");
-                        self.load_visible_service_state_for_server(&server_id, cx);
+                        self.load_visible_service_state_for_server(&server_id, &topic_path, cx);
                         return;
                     }
                 }
@@ -2120,13 +2339,13 @@ impl ConfigView {
             self.ensure_service_stream_for_server(
                 &server_id,
                 service_url,
-                topic_path,
+                topic_path.clone(),
                 request_topic,
                 response_topic,
                 token,
                 cx,
             );
-            self.load_visible_service_state_for_server(&server_id, cx);
+            self.load_visible_service_state_for_server(&server_id, &topic_path, cx);
             return;
         }
 
@@ -2145,12 +2364,14 @@ impl ConfigView {
         let (tx, rx): (Sender<PropStreamEvent>, Receiver<PropStreamEvent>) =
             crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = watch::channel(false);
-        self.current_runtime_mut(&server_id).prop_stream_stop = Some(stop_tx);
+        self.prop_topic_runtime_mut(&server_id, &topic_path)
+            .stream_stop = Some(stop_tx);
 
         let redis = cx.global::<DfcGlobalStore>().services().redis().clone();
         let uid = self.prop_row_uid.clone();
         let stream_topic_path = topic_path.clone();
         let runtime_server_id = server_id.clone();
+        let runtime_topic_path = topic_path.clone();
 
         spawn_named_in_tokio("prop-topic-stream", async move {
             run_prop_topic_stream(
@@ -2174,11 +2395,17 @@ impl ConfigView {
 
                 let mut rows: Vec<PropRow> = Vec::new();
                 let mut error: Option<String> = None;
+                let mut stream_disconnected = false;
 
-                while let Ok(ev) = rx.try_recv() {
-                    match ev {
-                        PropStreamEvent::Rows(mut batch) => rows.append(&mut batch),
-                        PropStreamEvent::Error(msg) => error = Some(msg),
+                loop {
+                    match rx.try_recv() {
+                        Ok(PropStreamEvent::Rows(mut batch)) => rows.append(&mut batch),
+                        Ok(PropStreamEvent::Error(msg)) => error = Some(msg),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            stream_disconnected = true;
+                            break;
+                        }
                     }
                 }
 
@@ -2189,14 +2416,14 @@ impl ConfigView {
                             && this.current_selected_topic_path_raw(cx).as_deref()
                                 == Some(topic_path.as_str());
                         let mut snapshot = None;
-                        if let Some(runtime) =
-                            this.server_topic_runtimes.get_mut(&runtime_server_id)
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.prop_topics.get_mut(topic_path.as_str()))
                         {
-                            if runtime.active_prop_topic.as_deref() == Some(topic_path.as_str()) {
-                                runtime.prop_state.set_error(msg);
-                                if is_visible {
-                                    snapshot = Some(runtime.prop_state.clone());
-                                }
+                            topic_runtime.state.set_error(msg);
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
                             }
                         }
 
@@ -2207,39 +2434,75 @@ impl ConfigView {
                             this.replace_visible_prop_state(snapshot, cx);
                         }
                     });
-                    continue;
                 }
 
-                if rows.is_empty() {
-                    continue;
-                }
-
-                let _ = handle.update(cx, |this, cx| {
-                    let is_visible = this.current_server_id(cx).as_deref()
-                        == Some(runtime_server_id.as_str())
-                        && this.current_selected_topic_path_raw(cx).as_deref()
-                            == Some(topic_path.as_str());
-                    let mut snapshot = None;
-                    if let Some(runtime) = this.server_topic_runtimes.get_mut(&runtime_server_id) {
-                        if runtime.active_prop_topic.as_deref() == Some(topic_path.as_str()) {
-                            runtime.prop_state.push_rows_front(rows);
+                if !rows.is_empty() {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.prop_topics.get_mut(topic_path.as_str()))
+                        {
+                            topic_runtime.state.push_rows_front(rows);
                             if is_visible {
-                                snapshot = Some(runtime.prop_state.clone());
+                                snapshot = Some(topic_runtime.state.clone());
                             }
                         }
-                    }
 
-                    if is_visible {
-                        let Some(snapshot) = snapshot else {
-                            return;
-                        };
-                        this.replace_visible_prop_state(snapshot, cx);
-                    }
-                });
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_prop_state(snapshot, cx);
+                        }
+                    });
+                }
+
+                if stream_disconnected {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        let mut unexpected_exit = false;
+
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.prop_topics.get_mut(topic_path.as_str()))
+                        {
+                            unexpected_exit = topic_runtime.stream_stop.take().is_some();
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
+                            }
+                        }
+
+                        if is_visible {
+                            if let Some(snapshot) = snapshot {
+                                this.replace_visible_prop_state(snapshot, cx);
+                            }
+                        }
+
+                        tracing::warn!(
+                            server_id = %runtime_server_id,
+                            topic = %topic_path,
+                            unexpected_exit,
+                            "prop topic background stream disconnected"
+                        );
+                    });
+                    break;
+                }
             }
         });
 
-        self.current_runtime_mut(&server_id).prop_ingest_task = Some(task);
+        self.prop_topic_runtime_mut(&server_id, &runtime_topic_path)
+            .ingest_task = Some(task);
     }
 
     fn start_event_stream(
@@ -2253,11 +2516,13 @@ impl ConfigView {
         let (tx, rx): (Sender<EventStreamEvent>, Receiver<EventStreamEvent>) =
             crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = watch::channel(false);
-        self.current_runtime_mut(&server_id).event_stream_stop = Some(stop_tx);
+        self.event_topic_runtime_mut(&server_id, &topic_path)
+            .stream_stop = Some(stop_tx);
 
         let uid = self.event_row_uid.clone();
         let stream_topic_path = topic_path.clone();
         let runtime_server_id = server_id.clone();
+        let runtime_topic_path = topic_path.clone();
 
         spawn_named_in_tokio("event-topic-stream", async move {
             run_event_topic_stream(service_url, stream_topic_path, token, stop_rx, tx, uid).await;
@@ -2271,11 +2536,17 @@ impl ConfigView {
 
                 let mut rows: Vec<EventRow> = Vec::new();
                 let mut error: Option<String> = None;
+                let mut stream_disconnected = false;
 
-                while let Ok(ev) = rx.try_recv() {
-                    match ev {
-                        EventStreamEvent::Rows(mut batch) => rows.append(&mut batch),
-                        EventStreamEvent::Error(msg) => error = Some(msg),
+                loop {
+                    match rx.try_recv() {
+                        Ok(EventStreamEvent::Rows(mut batch)) => rows.append(&mut batch),
+                        Ok(EventStreamEvent::Error(msg)) => error = Some(msg),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            stream_disconnected = true;
+                            break;
+                        }
                     }
                 }
 
@@ -2286,14 +2557,14 @@ impl ConfigView {
                             && this.current_selected_topic_path_raw(cx).as_deref()
                                 == Some(topic_path.as_str());
                         let mut snapshot = None;
-                        if let Some(runtime) =
-                            this.server_topic_runtimes.get_mut(&runtime_server_id)
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.event_topics.get_mut(topic_path.as_str()))
                         {
-                            if runtime.active_event_topic.as_deref() == Some(topic_path.as_str()) {
-                                runtime.event_state.set_error(msg);
-                                if is_visible {
-                                    snapshot = Some(runtime.event_state.clone());
-                                }
+                            topic_runtime.state.set_error(msg);
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
                             }
                         }
 
@@ -2304,39 +2575,75 @@ impl ConfigView {
                             this.replace_visible_event_state(snapshot, cx);
                         }
                     });
-                    continue;
                 }
 
-                if rows.is_empty() {
-                    continue;
-                }
-
-                let _ = handle.update(cx, |this, cx| {
-                    let is_visible = this.current_server_id(cx).as_deref()
-                        == Some(runtime_server_id.as_str())
-                        && this.current_selected_topic_path_raw(cx).as_deref()
-                            == Some(topic_path.as_str());
-                    let mut snapshot = None;
-                    if let Some(runtime) = this.server_topic_runtimes.get_mut(&runtime_server_id) {
-                        if runtime.active_event_topic.as_deref() == Some(topic_path.as_str()) {
-                            runtime.event_state.push_rows_front(rows);
+                if !rows.is_empty() {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.event_topics.get_mut(topic_path.as_str()))
+                        {
+                            topic_runtime.state.push_rows_front(rows);
                             if is_visible {
-                                snapshot = Some(runtime.event_state.clone());
+                                snapshot = Some(topic_runtime.state.clone());
                             }
                         }
-                    }
 
-                    if is_visible {
-                        let Some(snapshot) = snapshot else {
-                            return;
-                        };
-                        this.replace_visible_event_state(snapshot, cx);
-                    }
-                });
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_event_state(snapshot, cx);
+                        }
+                    });
+                }
+
+                if stream_disconnected {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        let mut unexpected_exit = false;
+
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.event_topics.get_mut(topic_path.as_str()))
+                        {
+                            unexpected_exit = topic_runtime.stream_stop.take().is_some();
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
+                            }
+                        }
+
+                        if is_visible {
+                            if let Some(snapshot) = snapshot {
+                                this.replace_visible_event_state(snapshot, cx);
+                            }
+                        }
+
+                        tracing::warn!(
+                            server_id = %runtime_server_id,
+                            topic = %topic_path,
+                            unexpected_exit,
+                            "event topic background stream disconnected"
+                        );
+                    });
+                    break;
+                }
             }
         });
 
-        self.current_runtime_mut(&server_id).event_ingest_task = Some(task);
+        self.event_topic_runtime_mut(&server_id, &runtime_topic_path)
+            .ingest_task = Some(task);
     }
 
     fn start_service_stream(
@@ -2357,14 +2664,15 @@ impl ConfigView {
         ) = crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = watch::channel(false);
         {
-            let runtime = self.current_runtime_mut(&server_id);
-            runtime.service_stream_stop = Some(stop_tx);
-            runtime.service_publish_tx = Some(publish_tx.clone());
+            let topic_runtime = self.service_topic_runtime_mut(&server_id, &topic_path);
+            topic_runtime.stream_stop = Some(stop_tx);
+            topic_runtime.publish_tx = Some(publish_tx.clone());
         }
         self.service_publish_tx = Some(publish_tx);
 
         let uid = self.service_row_uid.clone();
         let runtime_server_id = server_id.clone();
+        let runtime_topic_path = topic_path.clone();
 
         spawn_named_in_tokio("service-topic-stream", async move {
             run_service_topic_stream(
@@ -2388,11 +2696,17 @@ impl ConfigView {
 
                 let mut responses = Vec::new();
                 let mut error: Option<String> = None;
+                let mut stream_disconnected = false;
 
-                while let Ok(ev) = event_rx.try_recv() {
-                    match ev {
-                        ServiceStreamEvent::Response(row) => responses.push(row),
-                        ServiceStreamEvent::Error(msg) => error = Some(msg),
+                loop {
+                    match event_rx.try_recv() {
+                        Ok(ServiceStreamEvent::Response(row)) => responses.push(row),
+                        Ok(ServiceStreamEvent::Error(msg)) => error = Some(msg),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            stream_disconnected = true;
+                            break;
+                        }
                     }
                 }
 
@@ -2403,15 +2717,14 @@ impl ConfigView {
                             && this.current_selected_topic_path_raw(cx).as_deref()
                                 == Some(topic_path.as_str());
                         let mut snapshot = None;
-                        if let Some(runtime) =
-                            this.server_topic_runtimes.get_mut(&runtime_server_id)
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.service_topics.get_mut(topic_path.as_str()))
                         {
-                            if runtime.active_service_topic.as_deref() == Some(topic_path.as_str())
-                            {
-                                runtime.service_state.set_error(msg);
-                                if is_visible {
-                                    snapshot = Some(runtime.service_state.clone());
-                                }
+                            topic_runtime.state.set_error(msg);
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
                             }
                         }
 
@@ -2422,41 +2735,79 @@ impl ConfigView {
                             this.replace_visible_service_state(snapshot, cx);
                         }
                     });
-                    continue;
                 }
 
-                if responses.is_empty() {
-                    continue;
-                }
-
-                let _ = handle.update(cx, |this, cx| {
-                    let is_visible = this.current_server_id(cx).as_deref()
-                        == Some(runtime_server_id.as_str())
-                        && this.current_selected_topic_path_raw(cx).as_deref()
-                            == Some(topic_path.as_str());
-                    let mut snapshot = None;
-                    if let Some(runtime) = this.server_topic_runtimes.get_mut(&runtime_server_id) {
-                        if runtime.active_service_topic.as_deref() == Some(topic_path.as_str()) {
+                if !responses.is_empty() {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.service_topics.get_mut(topic_path.as_str()))
+                        {
                             for row in responses {
-                                runtime.service_state.push_response_front(row);
+                                topic_runtime.state.push_response_front(row);
                             }
                             if is_visible {
-                                snapshot = Some(runtime.service_state.clone());
+                                snapshot = Some(topic_runtime.state.clone());
                             }
                         }
-                    }
 
-                    if is_visible {
-                        let Some(snapshot) = snapshot else {
-                            return;
-                        };
-                        this.replace_visible_service_state(snapshot, cx);
-                    }
-                });
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_service_state(snapshot, cx);
+                        }
+                    });
+                }
+
+                if stream_disconnected {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        let mut unexpected_exit = false;
+
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.service_topics.get_mut(topic_path.as_str()))
+                        {
+                            unexpected_exit = topic_runtime.stream_stop.take().is_some();
+                            topic_runtime.publish_tx = None;
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
+                            }
+                        }
+
+                        if is_visible {
+                            this.service_publish_tx = None;
+                            if let Some(snapshot) = snapshot {
+                                this.replace_visible_service_state(snapshot, cx);
+                            }
+                        }
+
+                        tracing::warn!(
+                            server_id = %runtime_server_id,
+                            topic = %topic_path,
+                            unexpected_exit,
+                            "service topic background stream disconnected"
+                        );
+                    });
+                    break;
+                }
             }
         });
 
-        self.current_runtime_mut(&server_id).service_ingest_task = Some(task);
+        self.service_topic_runtime_mut(&server_id, &runtime_topic_path)
+            .ingest_task = Some(task);
     }
 
     fn on_submit_service_request(&mut self, cx: &mut Context<Self>) {
@@ -6343,7 +6694,7 @@ mod tests {
     use super::{
         TABLE_COLUMN_MIN_WIDTH, TableColumnWidths, find_topic_service_url,
         normalize_pulsar_service_url, parse_event_rows_from_payload, parse_prop_rows_from_payload,
-        topic_display_name,
+        topic_display_name, topic_paths_by_kind,
     };
     use crate::connection::{ConfigItem, TopicAgentItem, TopicDetail};
     use crate::proto::iothub::{
@@ -6449,6 +6800,41 @@ mod tests {
             find_topic_service_url(&configs, topic_path),
             Some("10.10.4.101:6650,10.10.4.102:6650".to_string())
         );
+    }
+
+    #[test]
+    fn topic_paths_by_kind_splits_supported_topics() {
+        let agents = vec![TopicAgentItem {
+            agent_id: "agent-1".to_string(),
+            topics: vec![
+                TopicDetail {
+                    index: 0,
+                    path: "persistent://goldwind/iothub/prop_data-BZ-GRID-realdev-Guarantee-1"
+                        .to_string(),
+                    visibility: true,
+                    topic_type: "prop".to_string(),
+                },
+                TopicDetail {
+                    index: 1,
+                    path: "persistent://goldwind/iothub/thing_event-BZ-1".to_string(),
+                    visibility: true,
+                    topic_type: "event".to_string(),
+                },
+                TopicDetail {
+                    index: 2,
+                    path: "persistent://goldwind/iothub/thing_service-BZ-RESPONSE-1,persistent://goldwind/iothub/thing_service-BZ-REQUEST-1".to_string(),
+                    visibility: true,
+                    topic_type: "service".to_string(),
+                },
+            ],
+            group_id: 1,
+        }];
+
+        let (prop_topics, event_topics, service_topics) = topic_paths_by_kind(agents.iter());
+
+        assert_eq!(prop_topics.len(), 1);
+        assert_eq!(event_topics.len(), 1);
+        assert_eq!(service_topics.len(), 1);
     }
 
     #[test]

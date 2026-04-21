@@ -327,6 +327,15 @@ impl PropTableState {
         };
     }
 
+    pub fn mark_loading_for_topic(&mut self, topic_path: Option<String>) {
+        self.topic_path = topic_path;
+        self.load_state = if self.topic_path.is_some() {
+            PropTableLoadState::Loading
+        } else {
+            PropTableLoadState::Idle
+        };
+    }
+
     pub fn set_error(&mut self, message: impl Into<Arc<str>>) {
         self.load_state = PropTableLoadState::Error(message.into());
     }
@@ -512,6 +521,20 @@ mod tests {
             state.page_rows_owned()[0].message_time,
             "2026-04-14 11:33:06.000"
         );
+    }
+
+    #[test]
+    fn mark_loading_for_topic_preserves_existing_rows_and_filters() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+        state.push_rows_front(vec![prop_row(1, "2026-04-14 11:33:03.000")]);
+        state.set_filter(PropSortColumn::Value, "false".to_string());
+
+        state.mark_loading_for_topic(Some("persistent://topic".to_string()));
+
+        assert!(matches!(state.load_state(), PropTableLoadState::Loading));
+        assert_eq!(state.rows_len(), 1);
+        assert_eq!(state.filters().value, "false");
     }
 
     #[test]
