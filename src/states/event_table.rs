@@ -317,6 +317,19 @@ impl EventTableState {
         };
     }
 
+    /// Clear cached rows before a reconnect-driven reload while preserving the
+    /// current topic binding and user-visible filters/sort settings.
+    pub fn prepare_for_reload(&mut self) {
+        self.rows.clear();
+        self.page_index = 0;
+        self.visible_indices.clear();
+        self.load_state = if self.topic_path.is_some() {
+            EventTableLoadState::Loading
+        } else {
+            EventTableLoadState::Idle
+        };
+    }
+
     pub fn set_error(&mut self, message: impl Into<Arc<str>>) {
         self.load_state = EventTableLoadState::Error(message.into());
     }
@@ -482,6 +495,21 @@ mod tests {
 
         assert!(matches!(state.load_state(), EventTableLoadState::Loading));
         assert_eq!(state.rows_len(), 1);
+        assert_eq!(state.filters().device, "dev");
+    }
+
+    #[test]
+    fn prepare_for_reload_clears_rows_but_keeps_filters() {
+        let mut state = EventTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+        state.push_rows_front(vec![event_row(1, "2026-04-14 00:00:01.000")]);
+        state.set_filter(EventSortColumn::Device, "dev".to_string());
+
+        state.prepare_for_reload();
+
+        assert!(matches!(state.load_state(), EventTableLoadState::Loading));
+        assert_eq!(state.topic_path(), Some("persistent://topic"));
+        assert_eq!(state.rows_len(), 0);
         assert_eq!(state.filters().device, "dev");
     }
 }

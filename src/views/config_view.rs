@@ -878,10 +878,7 @@ impl ConfigView {
                         load_state,
                         ConfigLoadState::Loading | ConfigLoadState::Error(_)
                     ) {
-                        this.stop_prop_streams_for_server(&server_id);
-                        this.stop_event_streams_for_server(&server_id);
-                        this.stop_service_streams_for_server(&server_id);
-                        this.service_publish_tx = None;
+                        this.prepare_server_topic_runtimes_for_reconnect(&server_id, window, cx);
                         cx.notify();
                         return;
                     }
@@ -1449,6 +1446,70 @@ impl ConfigView {
             drop(task);
         }
         topic_runtime.publish_tx = None;
+    }
+
+    fn prepare_server_topic_runtimes_for_reconnect(
+        &mut self,
+        server_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected_topic_path = (self.current_server_id(cx).as_deref() == Some(server_id))
+            .then(|| self.current_selected_topic_path_raw(cx))
+            .flatten();
+
+        self.stop_prop_streams_for_server(server_id);
+        self.stop_event_streams_for_server(server_id);
+        self.stop_service_streams_for_server(server_id);
+
+        let (prop_topics, event_topics, service_topics) =
+            if let Some(runtime) = self.server_topic_runtimes.get_mut(server_id) {
+                let prop_topics = runtime.prop_topics.len();
+                let event_topics = runtime.event_topics.len();
+                let service_topics = runtime.service_topics.len();
+
+                for topic_runtime in runtime.prop_topics.values_mut() {
+                    topic_runtime.state.prepare_for_reload();
+                }
+                for topic_runtime in runtime.event_topics.values_mut() {
+                    topic_runtime.state.prepare_for_reload();
+                }
+                for topic_runtime in runtime.service_topics.values_mut() {
+                    topic_runtime.state.prepare_for_reload();
+                    topic_runtime.publish_tx = None;
+                }
+
+                (prop_topics, event_topics, service_topics)
+            } else {
+                (0, 0, 0)
+            };
+
+        tracing::info!(
+            server_id,
+            prop_topics,
+            event_topics,
+            service_topics,
+            selected_topic = ?selected_topic_path,
+            "cleared cached topic data for reconnect"
+        );
+
+        if self.current_server_id(cx).as_deref() != Some(server_id) {
+            return;
+        }
+
+        self.service_publish_tx = None;
+
+        let Some(topic_path) = selected_topic_path else {
+            return;
+        };
+
+        if Self::is_prop_topic_path(&topic_path) {
+            self.load_visible_prop_state_for_server(server_id, &topic_path, window, cx);
+        } else if Self::is_event_topic_path(&topic_path) {
+            self.load_visible_event_state_for_server(server_id, &topic_path, window, cx);
+        } else if Self::is_service_topic_path(&topic_path) {
+            self.load_visible_service_state_for_server(server_id, &topic_path, cx);
+        }
     }
 
     fn prune_removed_topic_runtimes_for_server(&mut self, server_id: &str, cx: &App) {

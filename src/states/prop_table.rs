@@ -336,6 +336,20 @@ impl PropTableState {
         };
     }
 
+    /// Clear cached rows before a reconnect-driven reload while preserving the
+    /// current topic binding and user-visible filters/sort settings.
+    pub fn prepare_for_reload(&mut self) {
+        self.rows.clear();
+        self.row_keys.clear();
+        self.page_index = 0;
+        self.visible_indices.clear();
+        self.load_state = if self.topic_path.is_some() {
+            PropTableLoadState::Loading
+        } else {
+            PropTableLoadState::Idle
+        };
+    }
+
     pub fn set_error(&mut self, message: impl Into<Arc<str>>) {
         self.load_state = PropTableLoadState::Error(message.into());
     }
@@ -535,6 +549,25 @@ mod tests {
         assert!(matches!(state.load_state(), PropTableLoadState::Loading));
         assert_eq!(state.rows_len(), 1);
         assert_eq!(state.filters().value, "false");
+    }
+
+    #[test]
+    fn prepare_for_reload_clears_rows_and_dedup_keys_but_keeps_filters() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+        let row = prop_row(1, "2026-04-14 11:33:03.000");
+        state.push_rows_front(vec![row.clone()]);
+        state.set_filter(PropSortColumn::Value, "false".to_string());
+
+        state.prepare_for_reload();
+
+        assert!(matches!(state.load_state(), PropTableLoadState::Loading));
+        assert_eq!(state.topic_path(), Some("persistent://topic"));
+        assert_eq!(state.rows_len(), 0);
+        assert_eq!(state.filters().value, "false");
+
+        state.push_rows_front(vec![row]);
+        assert_eq!(state.rows_len(), 1);
     }
 
     #[test]

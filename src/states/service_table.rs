@@ -201,6 +201,17 @@ impl ServiceTableState {
         self.resp_page_index = 0;
     }
 
+    /// Clear cached records before a reconnect-driven reload while preserving
+    /// the active topic binding and pagination preferences.
+    pub fn prepare_for_reload(&mut self) {
+        self.clear_records();
+        self.load_state = if self.topic_path.is_some() {
+            ServiceTableLoadState::Loading
+        } else {
+            ServiceTableLoadState::Idle
+        };
+    }
+
     pub fn req_page_range(&self) -> (usize, usize) {
         page_range(self.requests.len(), self.req_page_size, self.req_page_index)
     }
@@ -337,6 +348,21 @@ mod tests {
         assert_eq!(state.responses.len(), 0);
         assert_eq!(state.topic_path(), Some("svc"));
         assert!(matches!(state.load_state, ServiceTableLoadState::Ready));
+    }
+
+    #[test]
+    fn prepare_for_reload_clears_records_and_sets_loading() {
+        let mut state = ServiceTableState::new();
+        state.reset_for_topic(Some("svc".to_string()));
+        state.push_request_front(sample_request("uuid-1"));
+        state.push_response_front(sample_response("uuid-1"));
+
+        state.prepare_for_reload();
+
+        assert_eq!(state.requests_len(), 0);
+        assert_eq!(state.responses_len(), 0);
+        assert_eq!(state.topic_path(), Some("svc"));
+        assert!(matches!(state.load_state(), ServiceTableLoadState::Loading));
     }
 
     #[test]
