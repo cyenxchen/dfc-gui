@@ -42,6 +42,7 @@ tracing-appender = "0.2"
 ahash = "0.8"
 crossbeam-channel = "0.5"
 directories = "6.0"
+hashlink = "0.11"
 home = "0.5"
 reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
 semver = "1.0"
