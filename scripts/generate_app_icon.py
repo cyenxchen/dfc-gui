@@ -2,7 +2,6 @@
 
 import logging
 import math
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -67,123 +66,181 @@ def rounded_rect_mask(size: int, inset: int, radius: int) -> Image.Image:
     return mask
 
 
+def composite_masked(
+    canvas: Image.Image, layer: Image.Image, mask: Image.Image, dest: tuple[int, int] = (0, 0)
+) -> None:
+    clipped = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    clipped.paste(layer, mask=mask)
+    canvas.alpha_composite(clipped, dest=dest)
+
+
 def draw_icon() -> Image.Image:
     logging.info("Rendering %sx%s icon source", ICON_SIZE, ICON_SIZE)
     canvas = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
 
-    shadow_mask = rounded_rect_mask(ICON_SIZE, inset=116, radius=212)
-    shadow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    shadow.paste((8, 12, 20, 185), mask=shadow_mask)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(38))
-    canvas.alpha_composite(shadow, dest=(0, 36))
+    outer_mask = rounded_rect_mask(ICON_SIZE, inset=78, radius=226)
+    outer_shadow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    outer_shadow.paste((30, 30, 34, 165), mask=outer_mask)
+    outer_shadow = outer_shadow.filter(ImageFilter.GaussianBlur(46))
+    canvas.alpha_composite(outer_shadow, dest=(0, 34))
 
-    base_mask = rounded_rect_mask(ICON_SIZE, inset=88, radius=196)
-    base = build_vertical_gradient(ICON_SIZE, (58, 70, 92), (20, 27, 39))
+    outer = build_vertical_gradient(ICON_SIZE, (249, 249, 250), (215, 212, 206))
+    outer = Image.alpha_composite(
+        outer,
+        build_radial_highlight(ICON_SIZE, (250, 210), 520, (255, 255, 255)),
+    )
+    outer = Image.alpha_composite(
+        outer,
+        build_radial_highlight(ICON_SIZE, (860, 850), 560, (183, 181, 176)),
+    )
+    shell_gloss = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    shell_gloss_draw = ImageDraw.Draw(shell_gloss)
+    shell_gloss_draw.pieslice(
+        (-40, -220, 1120, 760),
+        start=12,
+        end=155,
+        fill=(255, 255, 255, 54),
+    )
+    shell_gloss = shell_gloss.filter(ImageFilter.GaussianBlur(36))
+    outer = Image.alpha_composite(outer, shell_gloss)
 
-    cool_glow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    cool_glow = Image.alpha_composite(
-        cool_glow,
-        build_radial_highlight(ICON_SIZE, (300, 230), 420, (96, 138, 198)),
+    outer_border = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    outer_border_draw = ImageDraw.Draw(outer_border)
+    outer_border_draw.rounded_rectangle(
+        (78, 78, 946, 946),
+        radius=226,
+        outline=(255, 255, 255, 175),
+        width=12,
     )
-    cool_glow = Image.alpha_composite(
-        cool_glow,
-        build_radial_highlight(ICON_SIZE, (760, 760), 320, (70, 112, 182)),
-    )
-    base = Image.alpha_composite(base, cool_glow)
-
-    top_sheen = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    sheen_draw = ImageDraw.Draw(top_sheen)
-    sheen_draw.pieslice(
-        (-40, -280, 1100, 780),
-        start=18,
-        end=150,
-        fill=(255, 255, 255, 34),
-    )
-    sheen_draw.rounded_rectangle(
-        (150, 130, 874, 330),
-        radius=130,
-        fill=(255, 255, 255, 20),
-    )
-    top_sheen = top_sheen.filter(ImageFilter.GaussianBlur(44))
-    base = Image.alpha_composite(base, top_sheen)
-
-    lower_accent = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    accent_draw = ImageDraw.Draw(lower_accent)
-    accent_draw.pieslice(
-        (420, 340, 1180, 1140),
-        start=190,
-        end=336,
-        fill=(98, 148, 225, 50),
-    )
-    lower_accent = lower_accent.filter(ImageFilter.GaussianBlur(40))
-    base = Image.alpha_composite(base, lower_accent)
-
-    border = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    border_draw = ImageDraw.Draw(border)
-    border_draw.rounded_rectangle(
-        (88, 88, 936, 936),
-        radius=196,
-        outline=(214, 225, 241, 115),
+    outer_border_draw.rounded_rectangle(
+        (92, 92, 932, 932),
+        radius=212,
+        outline=(165, 162, 157, 78),
         width=10,
     )
-    border_draw.rounded_rectangle(
-        (102, 102, 922, 922),
-        radius=182,
-        outline=(8, 12, 18, 122),
-        width=6,
+    outer = Image.alpha_composite(outer, outer_border)
+    composite_masked(canvas, outer, outer_mask)
+
+    inner_mask = rounded_rect_mask(ICON_SIZE, inset=205, radius=138)
+    inner_shadow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    inner_shadow.paste((14, 18, 28, 150), mask=inner_mask)
+    inner_shadow = inner_shadow.filter(ImageFilter.GaussianBlur(34))
+    canvas.alpha_composite(inner_shadow, dest=(0, 26))
+
+    inner = build_vertical_gradient(ICON_SIZE, (74, 92, 123), (24, 35, 57))
+    inner = Image.alpha_composite(
+        inner,
+        build_radial_highlight(ICON_SIZE, (335, 315), 245, (119, 151, 210)),
     )
-    base = Image.alpha_composite(base, border)
+    inner = Image.alpha_composite(
+        inner,
+        build_radial_highlight(ICON_SIZE, (768, 726), 290, (87, 127, 198)),
+    )
+    inner = Image.alpha_composite(
+        inner,
+        build_radial_highlight(ICON_SIZE, (760, 405), 270, (188, 202, 224)),
+    )
 
-    base_mask_rgba = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    base_mask_rgba.paste(base, mask=base_mask)
-    canvas.alpha_composite(base_mask_rgba)
+    panel_gloss = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    panel_gloss_draw = ImageDraw.Draw(panel_gloss)
+    panel_gloss_draw.pieslice(
+        (40, -40, 1120, 830),
+        start=20,
+        end=136,
+        fill=(255, 255, 255, 34),
+    )
+    panel_gloss_draw.ellipse((420, 126, 970, 540), fill=(255, 255, 255, 18))
+    panel_gloss = panel_gloss.filter(ImageFilter.GaussianBlur(52))
+    inner = Image.alpha_composite(inner, panel_gloss)
 
-    font = ImageFont.truetype(str(FONT_PATH), 172)
+    panel_vignette = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    panel_vignette_draw = ImageDraw.Draw(panel_vignette)
+    panel_vignette_draw.ellipse((120, 560, 760, 1200), fill=(10, 16, 26, 72))
+    panel_vignette = panel_vignette.filter(ImageFilter.GaussianBlur(78))
+    inner = Image.alpha_composite(inner, panel_vignette)
+
+    inner_border = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    inner_border_draw = ImageDraw.Draw(inner_border)
+    inner_border_draw.rounded_rectangle(
+        (205, 205, 819, 819),
+        radius=138,
+        outline=(116, 134, 165, 165),
+        width=12,
+    )
+    inner_border_draw.rounded_rectangle(
+        (216, 216, 808, 808),
+        radius=128,
+        outline=(28, 39, 60, 188),
+        width=8,
+    )
+    inner_border_draw.rounded_rectangle(
+        (224, 224, 800, 800),
+        radius=120,
+        outline=(190, 205, 230, 48),
+        width=4,
+    )
+    inner = Image.alpha_composite(inner, inner_border)
+    composite_masked(canvas, inner, inner_mask)
+
+    font = ImageFont.truetype(str(FONT_PATH), 126)
     text = "DFC-GUI"
     draw = ImageDraw.Draw(canvas)
 
-    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=6)
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=8)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
     x = (ICON_SIZE - text_width) / 2
-    y = (ICON_SIZE - text_height) / 2 - 8
+    y = (ICON_SIZE - text_height) / 2 - 2
 
     draw.text(
-        (x, y + 10),
+        (x, y + 11),
         text,
         font=font,
-        fill=(0, 0, 0, 110),
-        stroke_width=8,
-        stroke_fill=(0, 0, 0, 60),
+        fill=(47, 53, 66, 148),
+        stroke_width=10,
+        stroke_fill=(32, 37, 48, 92),
     )
     draw.text(
         (x, y),
         text,
         font=font,
-        fill=(242, 246, 252, 255),
-        stroke_width=6,
-        stroke_fill=(18, 24, 34, 120),
+        fill=(248, 249, 250, 255),
+        stroke_width=8,
+        stroke_fill=(141, 143, 147, 224),
     )
 
     text_glow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(text_glow)
     glow_draw.text(
-        (x, y - 2),
+        (x, y - 4),
         text,
         font=font,
-        fill=(255, 255, 255, 82),
+        fill=(255, 255, 255, 92),
         stroke_width=0,
     )
-    text_glow = text_glow.filter(ImageFilter.GaussianBlur(18))
+    text_glow = text_glow.filter(ImageFilter.GaussianBlur(16))
     canvas.alpha_composite(text_glow)
+
+    text_highlight = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    text_highlight_draw = ImageDraw.Draw(text_highlight)
+    text_highlight_draw.text(
+        (x, y - 6),
+        text,
+        font=font,
+        fill=(255, 255, 255, 54),
+        stroke_width=0,
+    )
+    text_highlight = text_highlight.filter(ImageFilter.GaussianBlur(10))
+    canvas.alpha_composite(text_highlight)
+
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (x, y),
         text,
         font=font,
-        fill=(242, 246, 252, 255),
-        stroke_width=6,
-        stroke_fill=(18, 24, 34, 120),
+        fill=(248, 249, 250, 255),
+        stroke_width=8,
+        stroke_fill=(141, 143, 147, 224),
     )
 
     return canvas
