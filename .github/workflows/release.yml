@@ -69,12 +69,20 @@ jobs:
         run: |
           set -euo pipefail
           safe_tag="${GITHUB_REF_NAME//\//-}"
+          app_name="DFC-GUI"
+          bundle_icon="dfc-gui.icns"
           app="dist/DFC-GUI.app"
           contents="dist/dmg"
           temp_dmg="dist/DFC-GUI-temp.dmg"
           asset="dfc-gui-${safe_tag}-macos-arm64.dmg"
+          if [ ! -f "icons/${bundle_icon}" ]; then
+            echo "::error title=Missing macOS app icon::icons/${bundle_icon} was not found"
+            exit 1
+          fi
+          echo "Packaging macOS app bundle ${app_name}.app with icon icons/${bundle_icon}"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$contents"
           cp "target/aarch64-apple-darwin/release/dfc-gui" "$app/Contents/MacOS/dfc-gui"
+          cp "icons/${bundle_icon}" "$app/Contents/Resources/${bundle_icon}"
           chmod +x "$app/Contents/MacOS/dfc-gui"
           cat > "$app/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -87,10 +95,14 @@ jobs:
             <string>dfc-gui</string>
             <key>CFBundleIdentifier</key>
             <string>com.goldwind.dfc-gui</string>
+            <key>CFBundleDisplayName</key>
+            <string>${app_name}</string>
+            <key>CFBundleIconFile</key>
+            <string>${bundle_icon}</string>
             <key>CFBundleInfoDictionaryVersion</key>
             <string>6.0</string>
             <key>CFBundleName</key>
-            <string>DFC-GUI</string>
+            <string>${app_name}</string>
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
@@ -99,11 +111,19 @@ jobs:
             <string>${safe_tag#v}</string>
             <key>LSMinimumSystemVersion</key>
             <string>12.0</string>
+            <key>NSHumanReadableCopyright</key>
+            <string>Copyright 2026 Goldwind DFC Team. All rights reserved.</string>
             <key>NSHighResolutionCapable</key>
             <true/>
           </dict>
           </plist>
           PLIST
+          embedded_icon="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")"
+          if [ "$embedded_icon" != "$bundle_icon" ]; then
+            echo "::error title=Invalid macOS app icon metadata::Expected ${bundle_icon}, got ${embedded_icon}"
+            exit 1
+          fi
+          echo "Verified macOS Info.plist points CFBundleIconFile to ${embedded_icon}"
           cp -R "$app" "$contents/DFC-GUI.app"
           ln -s /Applications "$contents/Applications"
 
@@ -198,12 +218,25 @@ jobs:
           $safeTag = $env:GITHUB_REF_NAME -replace '/', '-'
           $asset = "dfc-gui-$safeTag-windows-x86.zip"
           $dir = "dist"
+          $iconPath = "assets/icon.ico"
+          if (-not (Test-Path $iconPath)) {
+            throw "Missing Windows icon resource: $iconPath"
+          }
+          Write-Host "Packaging Windows release archive with embedded executable icon and external ICO resource"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
           Copy-Item "target/i686-pc-windows-msvc/release/dfc-gui.exe" "$dir/dfc-gui.exe" -Force
+          Copy-Item $iconPath "$dir/DFC-GUI.ico" -Force
+          Add-Type -AssemblyName System.Drawing
+          $exePath = (Resolve-Path "$dir/dfc-gui.exe").Path
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+          if ($null -eq $icon) {
+            throw "Failed to extract embedded icon from $exePath"
+          }
+          Write-Host "Verified embedded Windows executable icon for $exePath"
           if (Test-Path $asset) {
             Remove-Item $asset -Force
           }
-          Compress-Archive -Path "$dir/dfc-gui.exe" -DestinationPath $asset
+          Compress-Archive -Path "$dir/dfc-gui.exe", "$dir/DFC-GUI.ico" -DestinationPath $asset
           Add-Content -Path $env:GITHUB_OUTPUT -Value "asset=$asset"
 
       - name: Upload Windows artifact
