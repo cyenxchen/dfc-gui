@@ -17,6 +17,11 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
 /// Install the application icon so dev builds also show a Dock icon.
 #[cfg(target_os = "macos")]
 pub fn install_application_icon() {
+    if crate::helpers::get_app_bundle_path().is_some() {
+        info!("Running from app bundle, keeping bundled macOS application icon");
+        return;
+    }
+
     unsafe {
         let app = NSApp();
         if app == nil {
@@ -41,7 +46,7 @@ pub fn install_application_icon() {
         }
 
         app.setApplicationIconImage_(image);
-        info!("Installed macOS application icon");
+        info!("Installed runtime macOS application icon for non-bundled launch");
     }
 }
 
