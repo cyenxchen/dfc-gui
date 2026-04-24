@@ -75,114 +75,75 @@ def composite_masked(
 
 
 def draw_icon() -> Image.Image:
-    logging.info("Rendering %sx%s icon source", ICON_SIZE, ICON_SIZE)
+    logging.info("Rendering %sx%s icon source without the outer white shell", ICON_SIZE, ICON_SIZE)
     canvas = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
 
-    outer_mask = rounded_rect_mask(ICON_SIZE, inset=78, radius=226)
-    outer_shadow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    outer_shadow.paste((30, 30, 34, 165), mask=outer_mask)
-    outer_shadow = outer_shadow.filter(ImageFilter.GaussianBlur(46))
-    canvas.alpha_composite(outer_shadow, dest=(0, 34))
+    panel_inset = 112
+    panel_radius = 206
+    panel_bounds = (panel_inset, panel_inset, ICON_SIZE - panel_inset, ICON_SIZE - panel_inset)
+    panel_mask = rounded_rect_mask(ICON_SIZE, inset=panel_inset, radius=panel_radius)
 
-    outer = build_vertical_gradient(ICON_SIZE, (249, 249, 250), (215, 212, 206))
-    outer = Image.alpha_composite(
-        outer,
-        build_radial_highlight(ICON_SIZE, (250, 210), 520, (255, 255, 255)),
-    )
-    outer = Image.alpha_composite(
-        outer,
-        build_radial_highlight(ICON_SIZE, (860, 850), 560, (183, 181, 176)),
-    )
-    shell_gloss = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    shell_gloss_draw = ImageDraw.Draw(shell_gloss)
-    shell_gloss_draw.pieslice(
-        (-40, -220, 1120, 760),
-        start=12,
-        end=155,
-        fill=(255, 255, 255, 54),
-    )
-    shell_gloss = shell_gloss.filter(ImageFilter.GaussianBlur(36))
-    outer = Image.alpha_composite(outer, shell_gloss)
+    panel_shadow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    panel_shadow.paste((7, 10, 18, 168), mask=panel_mask)
+    panel_shadow = panel_shadow.filter(ImageFilter.GaussianBlur(42))
+    canvas.alpha_composite(panel_shadow, dest=(0, 30))
 
-    outer_border = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    outer_border_draw = ImageDraw.Draw(outer_border)
-    outer_border_draw.rounded_rectangle(
-        (78, 78, 946, 946),
-        radius=226,
-        outline=(255, 255, 255, 175),
-        width=12,
+    panel = build_vertical_gradient(ICON_SIZE, (79, 98, 130), (21, 31, 51))
+    panel = Image.alpha_composite(
+        panel,
+        build_radial_highlight(ICON_SIZE, (330, 308), 320, (126, 160, 220)),
     )
-    outer_border_draw.rounded_rectangle(
-        (92, 92, 932, 932),
-        radius=212,
-        outline=(165, 162, 157, 78),
-        width=10,
+    panel = Image.alpha_composite(
+        panel,
+        build_radial_highlight(ICON_SIZE, (778, 720), 360, (83, 123, 193)),
     )
-    outer = Image.alpha_composite(outer, outer_border)
-    composite_masked(canvas, outer, outer_mask)
-
-    inner_mask = rounded_rect_mask(ICON_SIZE, inset=205, radius=138)
-    inner_shadow = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    inner_shadow.paste((14, 18, 28, 150), mask=inner_mask)
-    inner_shadow = inner_shadow.filter(ImageFilter.GaussianBlur(34))
-    canvas.alpha_composite(inner_shadow, dest=(0, 26))
-
-    inner = build_vertical_gradient(ICON_SIZE, (74, 92, 123), (24, 35, 57))
-    inner = Image.alpha_composite(
-        inner,
-        build_radial_highlight(ICON_SIZE, (335, 315), 245, (119, 151, 210)),
-    )
-    inner = Image.alpha_composite(
-        inner,
-        build_radial_highlight(ICON_SIZE, (768, 726), 290, (87, 127, 198)),
-    )
-    inner = Image.alpha_composite(
-        inner,
-        build_radial_highlight(ICON_SIZE, (760, 405), 270, (188, 202, 224)),
+    panel = Image.alpha_composite(
+        panel,
+        build_radial_highlight(ICON_SIZE, (760, 394), 330, (188, 202, 224)),
     )
 
     panel_gloss = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     panel_gloss_draw = ImageDraw.Draw(panel_gloss)
     panel_gloss_draw.pieslice(
-        (40, -40, 1120, 830),
+        (20, -70, 1150, 850),
         start=20,
         end=136,
-        fill=(255, 255, 255, 34),
+        fill=(255, 255, 255, 38),
     )
-    panel_gloss_draw.ellipse((420, 126, 970, 540), fill=(255, 255, 255, 18))
+    panel_gloss_draw.ellipse((420, 110, 980, 548), fill=(255, 255, 255, 20))
     panel_gloss = panel_gloss.filter(ImageFilter.GaussianBlur(52))
-    inner = Image.alpha_composite(inner, panel_gloss)
+    panel = Image.alpha_composite(panel, panel_gloss)
 
     panel_vignette = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     panel_vignette_draw = ImageDraw.Draw(panel_vignette)
-    panel_vignette_draw.ellipse((120, 560, 760, 1200), fill=(10, 16, 26, 72))
+    panel_vignette_draw.ellipse((70, 570, 770, 1220), fill=(10, 16, 26, 82))
     panel_vignette = panel_vignette.filter(ImageFilter.GaussianBlur(78))
-    inner = Image.alpha_composite(inner, panel_vignette)
+    panel = Image.alpha_composite(panel, panel_vignette)
 
-    inner_border = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    inner_border_draw = ImageDraw.Draw(inner_border)
-    inner_border_draw.rounded_rectangle(
-        (205, 205, 819, 819),
-        radius=138,
+    panel_border = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    panel_border_draw = ImageDraw.Draw(panel_border)
+    panel_border_draw.rounded_rectangle(
+        panel_bounds,
+        radius=panel_radius,
         outline=(116, 134, 165, 165),
-        width=12,
+        width=14,
     )
-    inner_border_draw.rounded_rectangle(
-        (216, 216, 808, 808),
-        radius=128,
+    panel_border_draw.rounded_rectangle(
+        (panel_inset + 13, panel_inset + 13, ICON_SIZE - panel_inset - 13, ICON_SIZE - panel_inset - 13),
+        radius=panel_radius - 13,
         outline=(28, 39, 60, 188),
         width=8,
     )
-    inner_border_draw.rounded_rectangle(
-        (224, 224, 800, 800),
-        radius=120,
-        outline=(190, 205, 230, 48),
+    panel_border_draw.rounded_rectangle(
+        (panel_inset + 23, panel_inset + 23, ICON_SIZE - panel_inset - 23, ICON_SIZE - panel_inset - 23),
+        radius=panel_radius - 23,
+        outline=(190, 205, 230, 56),
         width=4,
     )
-    inner = Image.alpha_composite(inner, inner_border)
-    composite_masked(canvas, inner, inner_mask)
+    panel = Image.alpha_composite(panel, panel_border)
+    composite_masked(canvas, panel, panel_mask)
 
-    font = ImageFont.truetype(str(FONT_PATH), 126)
+    font = ImageFont.truetype(str(FONT_PATH), 148)
     text = "DFC-GUI"
     draw = ImageDraw.Draw(canvas)
 
