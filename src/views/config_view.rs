@@ -13,9 +13,10 @@ use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo, TopicAgentItem};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
-    ConfigState, DfcAppState, DfcGlobalStore, EventRow, EventSortColumn, EventTableLoadState,
-    EventTableState, KeysState, PropRow, PropSortColumn, PropTableLoadState, PropTableState,
-    ServiceRequestRow, ServiceTableLoadState, ServiceTableState, SortDirection,
+    AgentQueryMode, AgentSearchSession, ConfigState, DfcAppState, DfcGlobalStore, EventRow,
+    EventSortColumn, EventTableLoadState, EventTableState, KeysState, PropRow, PropSortColumn,
+    PropTableLoadState, PropTableState, ServiceRequestRow, ServiceTableLoadState,
+    ServiceTableState, SortDirection,
 };
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender};
@@ -298,13 +299,6 @@ fn topic_display_name(topic_path: &str) -> String {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
-enum AgentQueryMode {
-    All,
-    Prefix,
-    Exact,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug, Deserialize, JsonSchema, Action)]
 enum PropPageSize {
     S10,
     S20,
@@ -329,12 +323,6 @@ impl PropPageSize {
             100 => Self::S100,
             _ => Self::S20,
         }
-    }
-}
-
-impl Default for AgentQueryMode {
-    fn default() -> Self {
-        Self::All
     }
 }
 
@@ -581,6 +569,8 @@ pub struct ConfigView {
     suppress_event_state_persist: bool,
     /// Skip pushing visible state back into the runtime cache for the next service-state observe.
     suppress_service_state_persist: bool,
+    /// Skip persisting the next programmatic TopicAgentId search input restore.
+    suppress_agent_search_state_persist: bool,
     service_row_uid: Arc<AtomicU64>,
     /// Monotonic row id generator
     prop_row_uid: Arc<AtomicU64>,
@@ -859,6 +849,7 @@ impl ConfigView {
             cx.observe_in(&config_state, window, |this, _model, window, cx| {
                 let connected_server_ids =
                     this.config_state.read(cx).connected_server_ids().to_vec();
+                this.sync_agent_search_state_for_current_server(window, cx);
                 let stale_server_ids: Vec<String> = this
                     .server_topic_runtimes
                     .keys()
@@ -910,7 +901,13 @@ impl ConfigView {
         // Subscribe to agent search input changes for filtering and selection clearing
         subscriptions.push(cx.subscribe(&agent_search_state, |this, state, event, cx| {
             if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                if this.suppress_agent_search_state_persist {
+                    this.suppress_agent_search_state_persist = false;
+                    return;
+                }
+
                 let query = state.read(cx).value().trim().to_string();
+                this.persist_agent_search_state_for_active_server(cx);
 
                 if !query.is_empty() {
                     let selected = this
@@ -972,6 +969,7 @@ impl ConfigView {
             suppress_prop_state_persist: false,
             suppress_event_state_persist: false,
             suppress_service_state_persist: false,
+            suppress_agent_search_state_persist: false,
             service_row_uid,
             prop_row_uid,
             event_row_uid,
@@ -1016,6 +1014,69 @@ impl ConfigView {
             AgentQueryMode::All => agent_id.contains(query),
             AgentQueryMode::Prefix => agent_id.starts_with(query),
             AgentQueryMode::Exact => agent_id == query,
+        }
+    }
+
+    fn current_agent_search_session(&self, cx: &App) -> AgentSearchSession {
+        AgentSearchSession {
+            query: self.agent_search_state.read(cx).value().to_string(),
+            query_mode: self.agent_query_mode,
+        }
+    }
+
+    fn persist_agent_search_state_for_active_server(&mut self, cx: &mut Context<Self>) {
+        let session = self.current_agent_search_session(cx);
+        self.config_state.update(cx, |state, cx| {
+            let server_id = state.active_server_id().map(str::to_string);
+            let changed = state.set_agent_search_session(session.clone(), cx);
+            if changed {
+                if let Some(server_id) = server_id {
+                    tracing::debug!(
+                        server_id = %server_id,
+                        query = %session.query,
+                        query_mode = ?session.query_mode,
+                        "saved TopicAgentId search state for connected server"
+                    );
+                }
+            }
+        });
+    }
+
+    fn sync_agent_search_state_for_current_server(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (server_id, session) = {
+            let state = self.config_state.read(cx);
+            (
+                state.active_server_id().map(str::to_string),
+                state.agent_search_session(),
+            )
+        };
+        let current_query = self.agent_search_state.read(cx).value().to_string();
+        let query_changed = current_query != session.query;
+        let mode_changed = self.agent_query_mode != session.query_mode;
+
+        if mode_changed {
+            self.agent_query_mode = session.query_mode;
+        }
+
+        if query_changed {
+            let query = session.query.clone();
+            self.suppress_agent_search_state_persist = true;
+            self.agent_search_state.update(cx, |state, cx| {
+                state.set_value(query, window, cx);
+            });
+        }
+
+        if query_changed || mode_changed {
+            tracing::info!(
+                server_id = ?server_id.as_deref(),
+                query = %session.query,
+                query_mode = ?session.query_mode,
+                "restored TopicAgentId search state for connected server"
+            );
         }
     }
 
@@ -7038,6 +7099,7 @@ impl Render for ConfigView {
             .overflow_hidden()
             .on_action(cx.listener(|this, mode: &AgentQueryMode, _window, cx| {
                 this.agent_query_mode = *mode;
+                this.persist_agent_search_state_for_active_server(cx);
                 this.clear_selected_agent_if_filtered_out(cx);
                 cx.notify();
             }))

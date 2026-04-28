@@ -3,11 +3,32 @@
 //! Manages the state of Redis configuration items and their loading status.
 
 use crate::connection::{ConfigItem, ConfigLoadState, DetailItem, TopicAgentItem, TopicDetail};
-use gpui::Context;
+use gpui::{Action, Context};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::Arc;
 
 const DEFAULT_SESSION_ID: &str = "__default__";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, JsonSchema, Action)]
+pub enum AgentQueryMode {
+    All,
+    Prefix,
+    Exact,
+}
+
+impl Default for AgentQueryMode {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentSearchSession {
+    pub query: String,
+    pub query_mode: AgentQueryMode,
+}
 
 #[derive(Default)]
 struct ServerConfigSession {
@@ -23,6 +44,8 @@ struct ServerConfigSession {
     selected_topic_index: Option<i32>,
     /// Currently selected TopicAgentId
     selected_agent_id: Option<String>,
+    /// TopicAgentId search UI state scoped to this server session.
+    agent_search: AgentSearchSession,
     /// Whether the current topic selection should auto-drive topic consumption.
     topic_sync_enabled: bool,
     /// In-flight reconnect request id for this server session, if any.
@@ -112,6 +135,16 @@ impl ConfigState {
         true
     }
 
+    fn apply_agent_search_session(&mut self, session: AgentSearchSession) -> bool {
+        let current = self.current_session_mut();
+        if current.agent_search == session {
+            return false;
+        }
+
+        current.agent_search = session;
+        true
+    }
+
     // ==================== Getters ====================
 
     /// Get all configuration items
@@ -197,6 +230,13 @@ impl ConfigState {
     pub fn selected_agent_id(&self) -> Option<&str> {
         self.current_session()
             .and_then(|session| session.selected_agent_id.as_deref())
+    }
+
+    /// Get the active server's TopicAgentId search UI state.
+    pub fn agent_search_session(&self) -> AgentSearchSession {
+        self.current_session()
+            .map(|session| session.agent_search.clone())
+            .unwrap_or_default()
     }
 
     /// Get all TopicAgentItems from the selected config
@@ -604,6 +644,19 @@ impl ConfigState {
             tracing::info!(agent_id = ?self.selected_agent_id(), "Selected TopicAgentId (not found)");
         }
         cx.notify();
+    }
+
+    /// Save the active server's TopicAgentId search UI state.
+    pub fn set_agent_search_session(
+        &mut self,
+        session: AgentSearchSession,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = self.apply_agent_search_session(session);
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     /// Add a connected server (no duplicates)
@@ -1101,6 +1154,62 @@ mod tests {
         state.active_server_id = Some("server-b".to_string());
         assert_eq!(state.selected_agent_id(), Some("B"));
         assert_eq!(state.selected_topic_path(), Some("/b/event"));
+    }
+
+    #[test]
+    fn server_sessions_keep_agent_search_isolated() {
+        let mut state = ConfigState::new();
+
+        state.active_server_id = Some("server-a".to_string());
+        assert!(state.apply_agent_search_session(AgentSearchSession {
+            query: "626221".to_string(),
+            query_mode: AgentQueryMode::Prefix,
+        }));
+
+        state.active_server_id = Some("server-b".to_string());
+        assert!(state.apply_agent_search_session(AgentSearchSession {
+            query: "650412".to_string(),
+            query_mode: AgentQueryMode::Exact,
+        }));
+
+        assert_eq!(state.agent_search_session().query, "650412");
+        assert_eq!(
+            state.agent_search_session().query_mode,
+            AgentQueryMode::Exact
+        );
+
+        state.active_server_id = Some("server-a".to_string());
+        assert_eq!(state.agent_search_session().query, "626221");
+        assert_eq!(
+            state.agent_search_session().query_mode,
+            AgentQueryMode::Prefix
+        );
+
+        state.active_server_id = Some("server-c".to_string());
+        assert_eq!(state.agent_search_session(), AgentSearchSession::default());
+    }
+
+    #[test]
+    fn removing_server_session_drops_agent_search_state() {
+        let mut state = ConfigState::new();
+
+        state.connected_server_ids = vec!["server-a".to_string(), "server-b".to_string()];
+        state.active_server_id = Some("server-a".to_string());
+        state.apply_agent_search_session(AgentSearchSession {
+            query: "626221".to_string(),
+            query_mode: AgentQueryMode::All,
+        });
+        state.active_server_id = Some("server-b".to_string());
+        state.apply_agent_search_session(AgentSearchSession {
+            query: "650412".to_string(),
+            query_mode: AgentQueryMode::All,
+        });
+
+        state.connected_server_ids.retain(|id| id != "server-a");
+        state.sessions.remove("server-a");
+        state.active_server_id = Some("server-a".to_string());
+
+        assert_eq!(state.agent_search_session(), AgentSearchSession::default());
     }
 
     #[test]
