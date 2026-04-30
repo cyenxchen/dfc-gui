@@ -161,7 +161,7 @@ pub struct ServicePublishRequest {
 /// Build the Pulsar payload for one service request.
 ///
 /// Layout: `[0x20, 0x02, 0x00] || EventRecordList { event_array: [EventRecord {
-///   src: device, context: { "svrReq": AnyValue { bytesV: SvrReqRecord encoded } }
+///   src: device, context: { "svrReq": AnyValue { anyV.value: SvrReqRecord encoded } }
 /// }] }`
 pub fn build_service_request_payload(device: &str, req: &SvrReqRecord) -> Vec<u8> {
     let req_bytes = req.encode_to_vec();
@@ -170,7 +170,10 @@ pub fn build_service_request_payload(device: &str, req: &SvrReqRecord) -> Vec<u8
     context.insert(
         SVR_REQ_KEY.to_string(),
         AnyValue {
-            v: Some(crate::proto::iothub::any_value::V::BytesV(req_bytes)),
+            v: Some(crate::proto::iothub::any_value::V::AnyV(prost_types::Any {
+                type_url: String::new(),
+                value: req_bytes,
+            })),
         },
     );
 
@@ -191,8 +194,20 @@ pub fn build_service_request_payload(device: &str, req: &SvrReqRecord) -> Vec<u8
     payload
 }
 
+fn embedded_iothub_message_bytes(value: &AnyValue) -> Option<&[u8]> {
+    match value.v.as_ref() {
+        Some(crate::proto::iothub::any_value::V::AnyV(any)) => Some(any.value.as_slice()),
+        Some(crate::proto::iothub::any_value::V::BytesV(bytes)) => Some(bytes.as_slice()),
+        _ => None,
+    }
+}
+
 pub fn parse_service_response_rows(payload: &[u8], uid: &AtomicU64) -> Vec<ServiceResponseRow> {
     let Some((summary, list)) = decode_framed_iothub_message::<EventRecordList>(payload) else {
+        tracing::warn!(
+            payload_len = payload.len(),
+            "failed to decode service response EventRecordList"
+        );
         return Vec::new();
     };
 
@@ -200,19 +215,25 @@ pub fn parse_service_response_rows(payload: &[u8], uid: &AtomicU64) -> Vec<Servi
     let mut rows = Vec::new();
 
     for event in list.event_array {
-        let svr_resp_bytes = event
+        let Some(bytes) = event
             .context
             .get(SVR_RESP_KEY)
-            .and_then(|v| match v.v.as_ref() {
-                Some(crate::proto::iothub::any_value::V::BytesV(b)) => Some(b.clone()),
-                _ => None,
-            });
-
-        let Some(bytes) = svr_resp_bytes else {
+            .and_then(embedded_iothub_message_bytes)
+        else {
+            tracing::debug!(
+                event_uuid = %event.evt_uuid,
+                src = %event.src,
+                "service response event has no svrResp Any payload"
+            );
             continue;
         };
 
-        let Ok(svr_resp) = SvrRespRecord::decode(bytes.as_slice()) else {
+        let Ok(svr_resp) = SvrRespRecord::decode(bytes) else {
+            tracing::warn!(
+                event_uuid = %event.evt_uuid,
+                bytes_len = bytes.len(),
+                "failed to decode SvrRespRecord from service response"
+            );
             continue;
         };
 
@@ -236,7 +257,7 @@ pub fn parse_service_response_rows(payload: &[u8], uid: &AtomicU64) -> Vec<Servi
 }
 
 pub fn format_response_code_hex(code: u32) -> String {
-    format!("0x{:08X}", code)
+    format!("{code:08X}")
 }
 
 /// Build a `ClockTime` from the current local time (seconds precision).
@@ -244,12 +265,12 @@ pub fn now_clock_time() -> crate::proto::iothub::ClockTime {
     let now = chrono::Local::now();
     crate::proto::iothub::ClockTime {
         t: now.timestamp().clamp(0, u32::MAX as i64) as u32,
-        zone_info: now.offset().local_minus_utc(),
+        zone_info: 0,
     }
 }
 
 /// Convert a `serde_json::Value` to an `AnyValue` following the DFC mapping:
-/// bool -> boolV, integer -> sint64V, float -> doubleV, otherwise -> jsonV(string).
+/// bool -> boolV, integer -> sint64V, float -> doubleV, string/compound -> jsonV.
 pub fn json_value_to_any_value(value: &serde_json::Value) -> AnyValue {
     use crate::proto::iothub::any_value::V;
 
@@ -264,8 +285,8 @@ pub fn json_value_to_any_value(value: &serde_json::Value) -> AnyValue {
                 V::StringV(n.to_string())
             }
         }
-        serde_json::Value::String(s) => V::StringV(s.clone()),
-        serde_json::Value::Null => V::NullV(0),
+        serde_json::Value::String(s) => V::JsonV(s.clone()),
+        serde_json::Value::Null => V::JsonV("null".to_string()),
         other => V::JsonV(other.to_string()),
     };
 
@@ -357,6 +378,19 @@ pub async fn run_service_topic_stream(
                     "发送请求失败 ({}): {e}",
                     req.device
                 )));
+                tracing::error!(
+                    device = %req.device,
+                    req_uuid = %req.record.req_serial_uuid,
+                    imr = %req.record.imr,
+                    "failed to send service request"
+                );
+            } else {
+                tracing::debug!(
+                    device = %req.device,
+                    req_uuid = %req.record.req_serial_uuid,
+                    imr = %req.record.imr,
+                    "queued service request to Pulsar"
+                );
             }
         }
 
@@ -439,7 +473,7 @@ mod tests {
             .and_then(|v| v.v.as_ref())
             .expect("svrReq present")
         {
-            crate::proto::iothub::any_value::V::BytesV(b) => b.clone(),
+            crate::proto::iothub::any_value::V::AnyV(any) => any.value.clone(),
             other => panic!("unexpected variant: {other:?}"),
         };
 
@@ -489,9 +523,10 @@ mod tests {
         context.insert(
             "svrResp".to_string(),
             AnyValue {
-                v: Some(crate::proto::iothub::any_value::V::BytesV(
-                    resp.encode_to_vec(),
-                )),
+                v: Some(crate::proto::iothub::any_value::V::AnyV(prost_types::Any {
+                    type_url: String::new(),
+                    value: resp.encode_to_vec(),
+                })),
             },
         );
 
@@ -515,15 +550,59 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].request_uuid, "uuid-1");
         assert_eq!(rows[0].response_uuid, "evt-99");
-        assert_eq!(rows[0].response_code_hex, "0x80010000");
+        assert_eq!(rows[0].response_code_hex, "80010000");
         assert_eq!(rows[0].responser, "device");
     }
 
     #[test]
+    fn parse_response_keeps_legacy_bytes_payload_compatibility() {
+        let resp = SvrRespRecord {
+            req_serial_uuid: "uuid-legacy".to_string(),
+            resp_code: 0x8000_0000,
+            resp_date_time: None,
+            requester: "V8Test".to_string(),
+            imr: "WindTurbine/SERVICE/WTUR/Start".to_string(),
+            args: HashMap::new(),
+            responser: String::new(),
+        };
+
+        let mut context = HashMap::new();
+        context.insert(
+            "svrResp".to_string(),
+            AnyValue {
+                v: Some(crate::proto::iothub::any_value::V::BytesV(
+                    resp.encode_to_vec(),
+                )),
+            },
+        );
+
+        let event = EventRecord {
+            evt_uuid: "evt-legacy".to_string(),
+            context,
+            ..Default::default()
+        };
+
+        let list = EventRecordList {
+            event_array: vec![event],
+        };
+        let mut payload = vec![0x20, 0x02, 0x00];
+        list.encode(&mut payload)
+            .expect("event record list should encode");
+
+        let uid = AtomicU64::new(1);
+        let rows = parse_service_response_rows(&payload, &uid);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_uuid, "uuid-legacy");
+        assert_eq!(rows[0].response_uuid, "evt-legacy");
+        assert_eq!(rows[0].responser, "V8Test");
+    }
+
+    #[test]
     fn format_response_code_hex_pads_eight_digits() {
-        assert_eq!(format_response_code_hex(0), "0x00000000");
-        assert_eq!(format_response_code_hex(0x80010000), "0x80010000");
-        assert_eq!(format_response_code_hex(0xFF), "0x000000FF");
+        assert_eq!(format_response_code_hex(0), "00000000");
+        assert_eq!(format_response_code_hex(0x80010000), "80010000");
+        assert_eq!(format_response_code_hex(0xFF), "000000FF");
     }
 
     #[test]
@@ -540,13 +619,20 @@ mod tests {
         assert!(matches!(float_av.v, Some(V::DoubleV(_))));
 
         let str_av = json_value_to_any_value(&serde_json::json!("hi"));
-        if let Some(V::StringV(s)) = str_av.v {
+        if let Some(V::JsonV(s)) = str_av.v {
             assert_eq!(s, "hi");
         } else {
-            panic!("expected stringV");
+            panic!("expected jsonV");
         }
 
         let obj_av = json_value_to_any_value(&serde_json::json!({"a": 1}));
         assert!(matches!(obj_av.v, Some(V::JsonV(_))));
+
+        let null_av = json_value_to_any_value(&serde_json::Value::Null);
+        if let Some(V::JsonV(s)) = null_av.v {
+            assert_eq!(s, "null");
+        } else {
+            panic!("expected jsonV");
+        }
     }
 }
