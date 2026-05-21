@@ -81,6 +81,12 @@ severity_info = "Info"
 severity_warning = "Warning"
 severity_error = "Error"
 severity_critical = "Critical"
+event_store_unavailable = "Event table local store is unavailable"
+event_store_init_failed = "Failed to initialize event table local store"
+event_store_insert_failed = "Failed to write to event table local store"
+event_store_clear_failed = "Failed to clear event table local store"
+event_store_count_failed = "Failed to count event table rows"
+event_store_filter_count_failed = "Failed to count filtered event table rows"
 
 [commands]
 send = "Send"

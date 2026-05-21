@@ -176,7 +176,6 @@ pub struct PropTableState {
     load_state: PropTableLoadState,
     page_size: usize,
     page_index: usize,
-    max_rows: usize,
     sort: Option<PropSort>,
     filters: PropFilters,
     /// Keys into `rows` after filtering and sorting, in display order.
@@ -191,7 +190,6 @@ impl PropTableState {
             load_state: PropTableLoadState::Idle,
             page_size: 20,
             page_index: 0,
-            max_rows: 20 * 10_000,
             sort: None,
             filters: PropFilters::default(),
             visible_keys: Vec::new(),
@@ -380,10 +378,6 @@ impl PropTableState {
                 replaced_rows += 1;
             }
             let _ = self.rows.to_front(&key);
-        }
-
-        while self.rows.len() > self.max_rows {
-            let _ = self.rows.pop_back();
         }
 
         if replaced_rows > 0 {
@@ -587,27 +581,6 @@ mod tests {
 
         state.push_rows_front(vec![row]);
         assert_eq!(state.rows_len(), 1);
-    }
-
-    #[test]
-    fn trimming_old_rows_keeps_latest_point_row() {
-        let mut state = PropTableState::new();
-        state.reset_for_topic(Some("persistent://topic".to_string()));
-        state.max_rows = 1;
-
-        let first = prop_row(1, "2026-04-14 11:33:03.000");
-        let mut second = prop_row(2, "2026-04-14 11:33:06.000");
-        second.value = "true".to_string();
-
-        state.push_rows_front(vec![first.clone()]);
-        state.push_rows_front(vec![second]);
-        state.push_rows_front(vec![first]);
-
-        assert_eq!(state.rows_len(), 1);
-        assert_eq!(
-            state.page_rows_owned()[0].message_time,
-            "2026-04-14 11:33:03.000"
-        );
     }
 
     #[test]

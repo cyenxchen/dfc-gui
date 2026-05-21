@@ -4205,13 +4205,19 @@ impl ConfigView {
 
         match &load_state {
             EventTableLoadState::Error(msg) => {
+                let locale = self.locale(cx);
+                let error_title = t!("config.error", locale = &locale).to_string();
+                let error_detail = msg.localized_message(&locale);
                 return div()
                     .flex_1()
                     .h_0()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .p_4()
-                    .child(Label::new(format!("加载失败: {msg}")).text_color(cx.theme().danger))
+                    .child(
+                        Label::new(format!("{error_title}: {error_detail}"))
+                            .text_color(cx.theme().danger),
+                    )
                     .into_any_element();
             }
             _ => {}

@@ -81,6 +81,12 @@ severity_info = "信息"
 severity_warning = "警告"
 severity_error = "错误"
 severity_critical = "严重"
+event_store_unavailable = "事件表本地存储不可用"
+event_store_init_failed = "初始化事件表本地存储失败"
+event_store_insert_failed = "写入事件表本地存储失败"
+event_store_clear_failed = "清空事件表本地存储失败"
+event_store_count_failed = "统计事件表总数失败"
+event_store_filter_count_failed = "统计事件表过滤结果失败"
 
 [commands]
 send = "发送"
