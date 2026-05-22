@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::helpers::cmp_u64ish;
+use crate::helpers::{cmp_u64ish, split_filter_values};
 use hashlink::LinkedHashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,32 +96,47 @@ impl PropFilters {
     }
 
     /// Pre-lowercase non-empty needles for the hot path. Returns one slot per column.
-    fn lowered_needles(&self) -> [Option<String>; 10] {
+    fn lowered_needles(&self) -> [Vec<String>; 10] {
         [
-            opt_lower(&self.global_uuid),
-            opt_lower(&self.device),
-            opt_lower(&self.imr),
-            opt_lower(&self.imid),
-            opt_lower(&self.value),
-            opt_lower(&self.quality),
-            opt_lower(&self.bcrid),
-            opt_lower(&self.time),
-            opt_lower(&self.message_time),
-            opt_lower(&self.summary),
+            lowered_filter_values(&self.global_uuid),
+            lowered_filter_values(&self.device),
+            lowered_filter_values(&self.imr),
+            lowered_filter_values(&self.imid),
+            lowered_filter_values(&self.value),
+            lowered_filter_values(&self.quality),
+            lowered_filter_values(&self.bcrid),
+            lowered_single_filter_value(&self.time),
+            lowered_single_filter_value(&self.message_time),
+            lowered_filter_values(&self.summary),
         ]
     }
 }
 
-fn opt_lower(s: &str) -> Option<String> {
-    if s.is_empty() {
-        None
+fn lowered_filter_values(value: &str) -> Vec<String> {
+    split_filter_values(value)
+        .into_iter()
+        .map(|part| part.to_lowercase())
+        .collect()
+}
+
+fn lowered_single_filter_value(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Vec::new()
     } else {
-        Some(s.to_lowercase())
+        vec![value.to_lowercase()]
     }
 }
 
-fn matches_lowered(haystack: &str, lowered_needle: &str) -> bool {
-    haystack.to_lowercase().contains(lowered_needle)
+fn prop_column_allows_multi_filter(column: PropSortColumn) -> bool {
+    !matches!(column, PropSortColumn::Time | PropSortColumn::MessageTime)
+}
+
+fn matches_any_lowered(haystack: &str, lowered_needles: &[String]) -> bool {
+    let haystack = haystack.to_lowercase();
+    lowered_needles
+        .iter()
+        .any(|needle| haystack.contains(needle))
 }
 
 /// A single row in the property data table (aligned with DFC PropHistory columns).
@@ -266,6 +281,18 @@ impl PropTableState {
     pub fn set_filter(&mut self, column: PropSortColumn, value: String) {
         if self.filters.get(column) == value {
             return;
+        }
+        let value_count = if prop_column_allows_multi_filter(column) {
+            split_filter_values(&value).len()
+        } else {
+            0
+        };
+        if value_count > 1 {
+            tracing::debug!(
+                ?column,
+                value_count,
+                "applying prop table multi-value column filter"
+            );
         }
         self.filters.set(column, value);
         self.page_index = 0;
@@ -617,64 +644,106 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].time, "2026-04-14 00:00:01.000");
     }
+
+    #[test]
+    fn time_filter_keeps_single_value_semantics() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        let mut first = prop_row(1, "2026-04-14 11:33:03.000");
+        first.time = "2026-04-14 00:00:01.000".to_string();
+        let mut second = prop_row(2, "2026-04-15 11:33:03.000");
+        second.time = "2026-04-15 00:00:01.000".to_string();
+        second.imid = 2;
+        second.imr = "Turbine/WTUR/State/Other".to_string();
+
+        state.push_rows_front(vec![first, second]);
+        state.set_filter(PropSortColumn::Time, "2026-04-14,2026-04-15".to_string());
+
+        assert!(state.page_rows_owned().is_empty());
+    }
+
+    #[test]
+    fn column_filter_matches_any_comma_separated_value() {
+        let mut state = PropTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        let mut first = prop_row(1, "2026-04-14 11:33:03.000");
+        first.device = "100".to_string();
+        let mut second = prop_row(2, "2026-04-14 11:33:06.000");
+        second.device = "200".to_string();
+        let mut third = prop_row(3, "2026-04-14 11:33:09.000");
+        third.device = "300".to_string();
+
+        state.push_rows_front(vec![first, second, third]);
+        state.set_filter(PropSortColumn::Device, "100, 300".to_string());
+
+        let rows = state.page_rows_owned();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.device.as_str())
+                .collect::<Vec<_>>(),
+            vec!["100", "300"]
+        );
+    }
 }
 
-fn row_matches_lowered(row: &PropRow, needles: &[Option<String>; 10]) -> bool {
-    if let Some(n) = &needles[0] {
-        if !matches_lowered(&row.global_uuid, n) {
+fn row_matches_lowered(row: &PropRow, needles: &[Vec<String>; 10]) -> bool {
+    if !needles[0].is_empty() {
+        if !matches_any_lowered(&row.global_uuid, &needles[0]) {
             return false;
         }
     }
-    if let Some(n) = &needles[1] {
-        if !matches_lowered(&row.device, n) {
+    if !needles[1].is_empty() {
+        if !matches_any_lowered(&row.device, &needles[1]) {
             return false;
         }
     }
-    if let Some(n) = &needles[2] {
-        if !matches_lowered(&row.imr, n) {
+    if !needles[2].is_empty() {
+        if !matches_any_lowered(&row.imr, &needles[2]) {
             return false;
         }
     }
-    if let Some(n) = &needles[3] {
-        if !matches_lowered(&row.imid.to_string(), n) {
+    if !needles[3].is_empty() {
+        if !matches_any_lowered(&row.imid.to_string(), &needles[3]) {
             return false;
         }
     }
-    if let Some(n) = &needles[4] {
-        if !matches_lowered(&row.value, n) {
+    if !needles[4].is_empty() {
+        if !matches_any_lowered(&row.value, &needles[4]) {
             return false;
         }
     }
-    if let Some(n) = &needles[5] {
-        if !matches_lowered(&row.quality.to_string(), n) {
+    if !needles[5].is_empty() {
+        if !matches_any_lowered(&row.quality.to_string(), &needles[5]) {
             return false;
         }
     }
-    if let Some(n) = &needles[6] {
-        if !matches_lowered(&row.bcrid, n) {
+    if !needles[6].is_empty() {
+        if !matches_any_lowered(&row.bcrid, &needles[6]) {
             return false;
         }
     }
-    if let Some(n) = &needles[7] {
-        if !matches_day_filter(&row.time, n) {
+    if !needles[7].is_empty() {
+        if !matches_any_day_filter(&row.time, &needles[7]) {
             return false;
         }
     }
-    if let Some(n) = &needles[8] {
-        if !matches_day_filter(&row.message_time, n) {
+    if !needles[8].is_empty() {
+        if !matches_any_day_filter(&row.message_time, &needles[8]) {
             return false;
         }
     }
-    if let Some(n) = &needles[9] {
-        if !matches_lowered(&row.summary, n) {
+    if !needles[9].is_empty() {
+        if !matches_any_lowered(&row.summary, &needles[9]) {
             return false;
         }
     }
     true
 }
 
-fn matches_day_filter(timestamp: &str, day: &str) -> bool {
-    timestamp.starts_with(day)
+fn matches_any_day_filter(timestamp: &str, days: &[String]) -> bool {
+    days.iter().any(|day| timestamp.starts_with(day))
 }
 
 impl Default for PropTableState {

@@ -11,6 +11,7 @@ use super::service_panel::{
 };
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo, TopicAgentItem};
+use crate::helpers::split_filter_values;
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
     AgentQueryMode, AgentSearchSession, ConfigState, DfcAppState, DfcGlobalStore, EventRow,
@@ -370,31 +371,12 @@ impl PropFilterInputs {
         }
     }
 
-    fn all(&self) -> [&Entity<InputState>; 10] {
-        [
-            &self.global_uuid,
-            &self.device,
-            &self.imr,
-            &self.imid,
-            &self.value,
-            &self.quality,
-            &self.bcrid,
-            &self.time,
-            &self.message_time,
-            &self.summary,
-        ]
-    }
-
     fn calendar(&self, col: PropSortColumn) -> Option<&Entity<CalendarState>> {
         match col {
             PropSortColumn::Time => Some(&self.time_calendar),
             PropSortColumn::MessageTime => Some(&self.message_time_calendar),
             _ => None,
         }
-    }
-
-    fn calendars(&self) -> [&Entity<CalendarState>; 2] {
-        [&self.time_calendar, &self.message_time_calendar]
     }
 }
 
@@ -436,24 +418,6 @@ impl EventFilterInputs {
         }
     }
 
-    fn all(&self) -> [&Entity<InputState>; 13] {
-        [
-            &self.uuid,
-            &self.device,
-            &self.imr,
-            &self.event_type,
-            &self.level,
-            &self.tags,
-            &self.codes,
-            &self.str_codes,
-            &self.happened_time,
-            &self.record_time,
-            &self.bcr_id,
-            &self.context,
-            &self.summary,
-        ]
-    }
-
     fn calendar(&self, col: EventSortColumn) -> Option<&Entity<CalendarState>> {
         match col {
             EventSortColumn::HappenedTime => Some(&self.happened_time_calendar),
@@ -461,17 +425,15 @@ impl EventFilterInputs {
             _ => None,
         }
     }
-
-    fn calendars(&self) -> [&Entity<CalendarState>; 2] {
-        [&self.happened_time_calendar, &self.record_time_calendar]
-    }
 }
 
 fn new_filter_input(window: &mut Window, cx: &mut Context<ConfigView>) -> Entity<InputState> {
     cx.new(|cx| {
+        let locale = cx.global::<DfcGlobalStore>().read(cx).locale().to_string();
+        let placeholder = t!("config.table_filter_placeholder", locale = &locale).to_string();
         InputState::new(window, cx)
             .clean_on_escape()
-            .placeholder("过滤...")
+            .placeholder(placeholder)
     })
 }
 
@@ -486,6 +448,51 @@ fn date_filter_value(date: Date) -> String {
     date.start()
         .map(|date| date.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+fn join_filter_input_values(inputs: Vec<Entity<InputState>>, cx: &App) -> String {
+    inputs
+        .into_iter()
+        .map(|input| input.read(cx).value().trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn prop_filter_column_allows_multiple(column: PropSortColumn) -> bool {
+    !matches!(column, PropSortColumn::Time | PropSortColumn::MessageTime)
+}
+
+fn event_filter_column_allows_multiple(column: EventSortColumn) -> bool {
+    !matches!(
+        column,
+        EventSortColumn::HappenedTime | EventSortColumn::RecordTime
+    )
+}
+
+fn split_prop_filter_values_for_column(column: PropSortColumn, value: &str) -> Vec<String> {
+    if prop_filter_column_allows_multiple(column) {
+        split_filter_values(value)
+    } else {
+        split_single_filter_value(value)
+    }
+}
+
+fn split_event_filter_values_for_column(column: EventSortColumn, value: &str) -> Vec<String> {
+    if event_filter_column_allows_multiple(column) {
+        split_filter_values(value)
+    } else {
+        split_single_filter_value(value)
+    }
+}
+
+fn split_single_filter_value(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        vec![value.to_string()]
+    }
 }
 
 fn new_table_cell_input(window: &mut Window, cx: &mut Context<ConfigView>) -> Entity<InputState> {
@@ -531,6 +538,8 @@ pub struct ConfigView {
     prop_table_state: Entity<PropTableState>,
     /// Per-column filter inputs for the prop topic table
     prop_filter_inputs: PropFilterInputs,
+    /// Extra per-column filter inputs added from the popover UI.
+    prop_extra_filter_inputs: Vec<Vec<Entity<InputState>>>,
     /// Scroll handle for the visible body scrollbar in the prop table
     prop_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the prop table header and body
@@ -541,6 +550,10 @@ pub struct ConfigView {
     event_table_state: Entity<EventTableState>,
     /// Per-column filter inputs for the event topic table
     event_filter_inputs: EventFilterInputs,
+    /// Extra per-column filter inputs added from the popover UI.
+    event_extra_filter_inputs: Vec<Vec<Entity<InputState>>>,
+    /// Suppresses filter writes while restoring input widgets from an existing table state.
+    suppress_filter_input_events: bool,
     /// Scroll handle for the visible body scrollbar in the event table
     event_table_scroll_handle: ScrollHandle,
     /// Shared horizontal scroll handle for the event table header and body
@@ -668,6 +681,7 @@ impl ConfigView {
             message_time_calendar: new_date_filter_calendar(window, cx),
             summary: new_filter_input(window, cx),
         };
+        let prop_extra_filter_inputs = vec![Vec::new(); PROP_COLUMN_COUNT];
 
         let event_filter_inputs = EventFilterInputs {
             uuid: new_filter_input(window, cx),
@@ -686,6 +700,7 @@ impl ConfigView {
             context: new_filter_input(window, cx),
             summary: new_filter_input(window, cx),
         };
+        let event_extra_filter_inputs = vec![Vec::new(); EVENT_COLUMN_COUNT];
 
         for (col, entity) in [
             (
@@ -706,12 +721,9 @@ impl ConfigView {
             (PropSortColumn::Summary, prop_filter_inputs.summary.clone()),
         ] {
             subscriptions.push(cx.subscribe(&entity, move |this, state, event, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let value = state.read(cx).value().to_string();
-                    this.prop_table_state.update(cx, |s, cx| {
-                        s.set_filter(col, value);
-                        cx.notify();
-                    });
+                if matches!(event, InputEvent::Change) && !this.suppress_filter_input_events {
+                    let _ = state;
+                    this.apply_prop_filter_from_inputs(col, cx);
                 }
             }));
         }
@@ -774,12 +786,9 @@ impl ConfigView {
             ),
         ] {
             subscriptions.push(cx.subscribe(&entity, move |this, state, event, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let value = state.read(cx).value().to_string();
-                    this.event_table_state.update(cx, |s, cx| {
-                        s.set_filter(col, value);
-                        cx.notify();
-                    });
+                if matches!(event, InputEvent::Change) && !this.suppress_filter_input_events {
+                    let _ = state;
+                    this.apply_event_filter_from_inputs(col, cx);
                 }
             }));
         }
@@ -943,11 +952,14 @@ impl ConfigView {
             agent_tabs_horizontal_scroll_handle: ScrollHandle::default(),
             prop_table_state,
             prop_filter_inputs,
+            prop_extra_filter_inputs,
             prop_table_scroll_handle: ScrollHandle::default(),
             prop_table_horizontal_scroll_handle: ScrollHandle::default(),
             prop_column_widths: TableColumnWidths::new(PROP_DEFAULT_COLUMN_WIDTHS),
             event_table_state,
             event_filter_inputs,
+            event_extra_filter_inputs,
+            suppress_filter_input_events: false,
             event_table_scroll_handle: ScrollHandle::default(),
             event_table_horizontal_scroll_handle: ScrollHandle::default(),
             event_column_widths: TableColumnWidths::new(EVENT_DEFAULT_COLUMN_WIDTHS),
@@ -986,6 +998,314 @@ impl ConfigView {
     /// Get the locale string
     fn locale(&self, cx: &App) -> String {
         cx.global::<DfcGlobalStore>().read(cx).locale().to_string()
+    }
+
+    fn prop_filter_input_entities(&self, column: PropSortColumn) -> Vec<Entity<InputState>> {
+        let mut inputs = vec![self.prop_filter_inputs.entity(column).clone()];
+        if let Some(extra_inputs) = self.prop_extra_filter_inputs.get(column as usize) {
+            inputs.extend(extra_inputs.iter().cloned());
+        }
+        inputs
+    }
+
+    fn event_filter_input_entities(&self, column: EventSortColumn) -> Vec<Entity<InputState>> {
+        let mut inputs = vec![self.event_filter_inputs.entity(column).clone()];
+        if let Some(extra_inputs) = self.event_extra_filter_inputs.get(column as usize) {
+            inputs.extend(extra_inputs.iter().cloned());
+        }
+        inputs
+    }
+
+    fn prop_filter_value_from_inputs(&self, column: PropSortColumn, cx: &App) -> String {
+        join_filter_input_values(self.prop_filter_input_entities(column), cx)
+    }
+
+    fn event_filter_value_from_inputs(&self, column: EventSortColumn, cx: &App) -> String {
+        join_filter_input_values(self.event_filter_input_entities(column), cx)
+    }
+
+    fn apply_prop_filter_from_inputs(&mut self, column: PropSortColumn, cx: &mut Context<Self>) {
+        let value = self.prop_filter_value_from_inputs(column, cx);
+        self.prop_table_state.update(cx, |state, cx| {
+            state.set_filter(column, value);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn apply_event_filter_from_inputs(&mut self, column: EventSortColumn, cx: &mut Context<Self>) {
+        let value = self.event_filter_value_from_inputs(column, cx);
+        self.event_table_state.update(cx, |state, cx| {
+            state.set_filter(column, value);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn add_prop_filter_input(
+        &mut self,
+        column: PropSortColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !prop_filter_column_allows_multiple(column) {
+            return;
+        }
+
+        let entity = new_filter_input(window, cx);
+        let subscription = cx.subscribe(&entity, move |this, state, event, cx| {
+            if matches!(event, InputEvent::Change) && !this.suppress_filter_input_events {
+                let _ = state;
+                this.apply_prop_filter_from_inputs(column, cx);
+            }
+        });
+        let input_count = {
+            let extra_inputs = &mut self.prop_extra_filter_inputs[column as usize];
+            extra_inputs.push(entity);
+            extra_inputs.len() + 1
+        };
+        self._subscriptions.push(subscription);
+        tracing::debug!(?column, input_count, "added prop table filter value input");
+        cx.notify();
+    }
+
+    fn add_event_filter_input(
+        &mut self,
+        column: EventSortColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event_filter_column_allows_multiple(column) {
+            return;
+        }
+
+        let entity = new_filter_input(window, cx);
+        let subscription = cx.subscribe(&entity, move |this, state, event, cx| {
+            if matches!(event, InputEvent::Change) && !this.suppress_filter_input_events {
+                let _ = state;
+                this.apply_event_filter_from_inputs(column, cx);
+            }
+        });
+        let input_count = {
+            let extra_inputs = &mut self.event_extra_filter_inputs[column as usize];
+            extra_inputs.push(entity);
+            extra_inputs.len() + 1
+        };
+        self._subscriptions.push(subscription);
+        tracing::debug!(?column, input_count, "added event table filter value input");
+        cx.notify();
+    }
+
+    fn ensure_prop_extra_filter_inputs(
+        &mut self,
+        column: PropSortColumn,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        while self.prop_extra_filter_inputs[column as usize].len() < count {
+            self.add_prop_filter_input(column, window, cx);
+        }
+        self.prop_extra_filter_inputs[column as usize].truncate(count);
+    }
+
+    fn ensure_event_extra_filter_inputs(
+        &mut self,
+        column: EventSortColumn,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        while self.event_extra_filter_inputs[column as usize].len() < count {
+            self.add_event_filter_input(column, window, cx);
+        }
+        self.event_extra_filter_inputs[column as usize].truncate(count);
+    }
+
+    fn set_prop_filter_inputs_from_value(
+        &mut self,
+        column: PropSortColumn,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let values = split_prop_filter_values_for_column(column, value);
+        self.set_prop_filter_input_values(column, values, false, window, cx);
+    }
+
+    fn set_prop_filter_input_values(
+        &mut self,
+        column: PropSortColumn,
+        mut values: Vec<String>,
+        apply_filter: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if values.is_empty() {
+            values.push(String::new());
+        }
+        let extra_count = values.len().saturating_sub(1);
+        self.ensure_prop_extra_filter_inputs(column, extra_count, window, cx);
+        let previous_suppress = self.suppress_filter_input_events;
+        if !apply_filter {
+            self.suppress_filter_input_events = true;
+        }
+        for (index, input) in self
+            .prop_filter_input_entities(column)
+            .into_iter()
+            .enumerate()
+        {
+            let value = values.get(index).cloned().unwrap_or_default();
+            input.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+            });
+        }
+        self.suppress_filter_input_events = previous_suppress;
+        if apply_filter {
+            self.apply_prop_filter_from_inputs(column, cx);
+        }
+    }
+
+    fn set_event_filter_inputs_from_value(
+        &mut self,
+        column: EventSortColumn,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let values = split_event_filter_values_for_column(column, value);
+        self.set_event_filter_input_values(column, values, false, window, cx);
+    }
+
+    fn set_event_filter_input_values(
+        &mut self,
+        column: EventSortColumn,
+        mut values: Vec<String>,
+        apply_filter: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if values.is_empty() {
+            values.push(String::new());
+        }
+        let extra_count = values.len().saturating_sub(1);
+        self.ensure_event_extra_filter_inputs(column, extra_count, window, cx);
+        let previous_suppress = self.suppress_filter_input_events;
+        if !apply_filter {
+            self.suppress_filter_input_events = true;
+        }
+        for (index, input) in self
+            .event_filter_input_entities(column)
+            .into_iter()
+            .enumerate()
+        {
+            let value = values.get(index).cloned().unwrap_or_default();
+            input.update(cx, |state, cx| {
+                state.set_value(value, window, cx);
+            });
+        }
+        self.suppress_filter_input_events = previous_suppress;
+        if apply_filter {
+            self.apply_event_filter_from_inputs(column, cx);
+        }
+    }
+
+    fn remove_prop_filter_input(
+        &mut self,
+        column: PropSortColumn,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut values = self
+            .prop_filter_input_entities(column)
+            .into_iter()
+            .map(|input| input.read(cx).value().to_string())
+            .collect::<Vec<_>>();
+        if index >= values.len() {
+            return;
+        }
+        if values.len() == 1 {
+            values[0].clear();
+        } else {
+            values.remove(index);
+        }
+        self.set_prop_filter_input_values(column, values, true, window, cx);
+        tracing::debug!(?column, index, "removed prop table filter value input");
+    }
+
+    fn remove_event_filter_input(
+        &mut self,
+        column: EventSortColumn,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut values = self
+            .event_filter_input_entities(column)
+            .into_iter()
+            .map(|input| input.read(cx).value().to_string())
+            .collect::<Vec<_>>();
+        if index >= values.len() {
+            return;
+        }
+        if values.len() == 1 {
+            values[0].clear();
+        } else {
+            values.remove(index);
+        }
+        self.set_event_filter_input_values(column, values, true, window, cx);
+        tracing::debug!(?column, index, "removed event table filter value input");
+    }
+
+    fn clear_prop_filter_input(
+        &mut self,
+        column: PropSortColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prop_extra_filter_inputs[column as usize].clear();
+        self.prop_filter_inputs
+            .entity(column)
+            .update(cx, |state, cx| {
+                state.set_value(String::new(), window, cx);
+            });
+        if let Some(calendar) = self.prop_filter_inputs.calendar(column) {
+            calendar.update(cx, |state, cx| {
+                state.set_date(Date::Single(None), window, cx);
+            });
+        }
+        self.prop_table_state.update(cx, |state, cx| {
+            state.set_filter(column, String::new());
+            cx.notify();
+        });
+        cx.notify();
+        tracing::debug!(?column, "cleared prop table column filter input");
+    }
+
+    fn clear_event_filter_input(
+        &mut self,
+        column: EventSortColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.event_extra_filter_inputs[column as usize].clear();
+        self.event_filter_inputs
+            .entity(column)
+            .update(cx, |state, cx| {
+                state.set_value(String::new(), window, cx);
+            });
+        if let Some(calendar) = self.event_filter_inputs.calendar(column) {
+            calendar.update(cx, |state, cx| {
+                state.set_date(Date::Single(None), window, cx);
+            });
+        }
+        self.event_table_state.update(cx, |state, cx| {
+            state.set_filter(column, String::new());
+            cx.notify();
+        });
+        cx.notify();
+        tracing::debug!(?column, "cleared event table column filter input");
     }
 
     fn activate_table_cell(
@@ -1662,100 +1982,51 @@ impl ConfigView {
     }
 
     fn sync_prop_filter_inputs_from_visible_state(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let filters = self.prop_table_state.read(cx).filters().clone();
-        for (column, entity) in [
-            (
-                PropSortColumn::GlobalUuid,
-                self.prop_filter_inputs.global_uuid.clone(),
-            ),
-            (
-                PropSortColumn::Device,
-                self.prop_filter_inputs.device.clone(),
-            ),
-            (PropSortColumn::Imr, self.prop_filter_inputs.imr.clone()),
-            (PropSortColumn::Imid, self.prop_filter_inputs.imid.clone()),
-            (PropSortColumn::Value, self.prop_filter_inputs.value.clone()),
-            (
-                PropSortColumn::Quality,
-                self.prop_filter_inputs.quality.clone(),
-            ),
-            (PropSortColumn::Bcrid, self.prop_filter_inputs.bcrid.clone()),
-            (PropSortColumn::Time, self.prop_filter_inputs.time.clone()),
-            (
-                PropSortColumn::MessageTime,
-                self.prop_filter_inputs.message_time.clone(),
-            ),
-            (
-                PropSortColumn::Summary,
-                self.prop_filter_inputs.summary.clone(),
-            ),
+        for column in [
+            PropSortColumn::GlobalUuid,
+            PropSortColumn::Device,
+            PropSortColumn::Imr,
+            PropSortColumn::Imid,
+            PropSortColumn::Value,
+            PropSortColumn::Quality,
+            PropSortColumn::Bcrid,
+            PropSortColumn::Time,
+            PropSortColumn::MessageTime,
+            PropSortColumn::Summary,
         ] {
             let value = filters.get(column).to_string();
-            entity.update(cx, |state, cx| {
-                state.set_value(value, window, cx);
-            });
+            self.set_prop_filter_inputs_from_value(column, &value, window, cx);
         }
     }
 
     fn sync_event_filter_inputs_from_visible_state(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let filters = self.event_table_state.read(cx).filters().clone();
-        for (column, entity) in [
-            (EventSortColumn::Uuid, self.event_filter_inputs.uuid.clone()),
-            (
-                EventSortColumn::Device,
-                self.event_filter_inputs.device.clone(),
-            ),
-            (EventSortColumn::Imr, self.event_filter_inputs.imr.clone()),
-            (
-                EventSortColumn::EventType,
-                self.event_filter_inputs.event_type.clone(),
-            ),
-            (
-                EventSortColumn::Level,
-                self.event_filter_inputs.level.clone(),
-            ),
-            (EventSortColumn::Tags, self.event_filter_inputs.tags.clone()),
-            (
-                EventSortColumn::Codes,
-                self.event_filter_inputs.codes.clone(),
-            ),
-            (
-                EventSortColumn::StrCodes,
-                self.event_filter_inputs.str_codes.clone(),
-            ),
-            (
-                EventSortColumn::HappenedTime,
-                self.event_filter_inputs.happened_time.clone(),
-            ),
-            (
-                EventSortColumn::RecordTime,
-                self.event_filter_inputs.record_time.clone(),
-            ),
-            (
-                EventSortColumn::BcrId,
-                self.event_filter_inputs.bcr_id.clone(),
-            ),
-            (
-                EventSortColumn::Context,
-                self.event_filter_inputs.context.clone(),
-            ),
-            (
-                EventSortColumn::Summary,
-                self.event_filter_inputs.summary.clone(),
-            ),
+        for column in [
+            EventSortColumn::Uuid,
+            EventSortColumn::Device,
+            EventSortColumn::Imr,
+            EventSortColumn::EventType,
+            EventSortColumn::Level,
+            EventSortColumn::Tags,
+            EventSortColumn::Codes,
+            EventSortColumn::StrCodes,
+            EventSortColumn::HappenedTime,
+            EventSortColumn::RecordTime,
+            EventSortColumn::BcrId,
+            EventSortColumn::Context,
+            EventSortColumn::Summary,
         ] {
             let value = filters.get(column).to_string();
-            entity.update(cx, |state, cx| {
-                state.set_value(value, window, cx);
-            });
+            self.set_event_filter_inputs_from_value(column, &value, window, cx);
         }
     }
 
@@ -5292,8 +5563,10 @@ impl ConfigView {
 
         let column_id = column as usize;
 
-        let input_entity = self.prop_filter_inputs.entity(column).clone();
+        let input_entities = self.prop_filter_input_entities(column);
         let calendar_entity = self.prop_filter_inputs.calendar(column).cloned();
+        let allow_multiple = prop_filter_column_allows_multiple(column);
+        let view_entity = cx.entity();
 
         let trigger_button = Button::new(("prop-filter-trig", column_id))
             .ghost()
@@ -5304,9 +5577,8 @@ impl ConfigView {
             .anchor(Corner::TopRight)
             .mouse_button(MouseButton::Left)
             .trigger(trigger_button)
-            .content(move |_state, _window, _cx| {
-                let input_for_clear = input_entity.clone();
-                let calendar_for_clear = calendar_entity.clone();
+            .content(move |_state, _window, cx| {
+                let popover_entity = cx.entity();
                 let control = if let Some(calendar) = calendar_entity.as_ref() {
                     Calendar::new(calendar)
                         .number_of_months(1)
@@ -5316,13 +5588,62 @@ impl ConfigView {
                         .p_0()
                         .into_any_element()
                 } else {
-                    Input::new(&input_entity)
-                        .cleanable(true)
-                        .small()
-                        .into_any_element()
+                    let mut input_list = v_flex().gap_2();
+                    let input_count = input_entities.len();
+                    for (input_ix, input_entity) in input_entities.iter().cloned().enumerate() {
+                        let mut row = h_flex().items_center().gap_2().child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(Input::new(&input_entity).cleanable(true).small().w_full()),
+                        );
+                        if allow_multiple {
+                            let view_for_remove = view_entity.clone();
+                            let popover_for_remove = popover_entity.clone();
+                            let dismiss_after_remove = input_count == 1;
+                            row = row.child(
+                                Button::new(("prop-filter-remove", column_id * 1000 + input_ix))
+                                    .ghost()
+                                    .compact()
+                                    .small()
+                                    .icon(IconName::Minus)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = view_for_remove.update(cx, |this, cx| {
+                                            this.remove_prop_filter_input(
+                                                column, input_ix, window, cx,
+                                            );
+                                        });
+                                        if dismiss_after_remove {
+                                            let _ = popover_for_remove.update(cx, |state, cx| {
+                                                state.dismiss(window, cx);
+                                            });
+                                        }
+                                    }),
+                            );
+                        }
+                        if allow_multiple && input_ix + 1 == input_count {
+                            let view_for_add = view_entity.clone();
+                            row = row.child(
+                                Button::new(("prop-filter-add", column_id))
+                                    .ghost()
+                                    .compact()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = view_for_add.update(cx, |this, cx| {
+                                            this.add_prop_filter_input(column, window, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        input_list = input_list.child(row);
+                    }
+                    input_list.into_any_element()
                 };
 
-                v_flex().gap_2().w(px(240.0)).p_2().child(control).child(
+                let view_for_clear = view_entity.clone();
+                let popover_for_clear = popover_entity.clone();
+                v_flex().gap_2().w(px(280.0)).p_2().child(control).child(
                     h_flex().justify_end().child(
                         Button::new(("prop-filter-clear", column_id))
                             .ghost()
@@ -5330,14 +5651,12 @@ impl ConfigView {
                             .small()
                             .label("清除")
                             .on_click(move |_, window, cx| {
-                                input_for_clear.update(cx, |state, cx| {
-                                    state.set_value("".to_string(), window, cx);
+                                let _ = view_for_clear.update(cx, |this, cx| {
+                                    this.clear_prop_filter_input(column, window, cx);
                                 });
-                                if let Some(calendar) = calendar_for_clear.as_ref() {
-                                    calendar.update(cx, |state, cx| {
-                                        state.set_date(Date::Single(None), window, cx);
-                                    });
-                                }
+                                let _ = popover_for_clear.update(cx, |state, cx| {
+                                    state.dismiss(window, cx);
+                                });
                             }),
                     ),
                 )
@@ -5427,8 +5746,10 @@ impl ConfigView {
 
         let column_id = column as usize;
 
-        let input_entity = self.event_filter_inputs.entity(column).clone();
+        let input_entities = self.event_filter_input_entities(column);
         let calendar_entity = self.event_filter_inputs.calendar(column).cloned();
+        let allow_multiple = event_filter_column_allows_multiple(column);
+        let view_entity = cx.entity();
 
         let trigger_button = Button::new(("event-filter-trig", column_id))
             .ghost()
@@ -5439,9 +5760,8 @@ impl ConfigView {
             .anchor(Corner::TopRight)
             .mouse_button(MouseButton::Left)
             .trigger(trigger_button)
-            .content(move |_state, _window, _cx| {
-                let input_for_clear = input_entity.clone();
-                let calendar_for_clear = calendar_entity.clone();
+            .content(move |_state, _window, cx| {
+                let popover_entity = cx.entity();
                 let control = if let Some(calendar) = calendar_entity.as_ref() {
                     Calendar::new(calendar)
                         .number_of_months(1)
@@ -5451,13 +5771,62 @@ impl ConfigView {
                         .p_0()
                         .into_any_element()
                 } else {
-                    Input::new(&input_entity)
-                        .cleanable(true)
-                        .small()
-                        .into_any_element()
+                    let mut input_list = v_flex().gap_2();
+                    let input_count = input_entities.len();
+                    for (input_ix, input_entity) in input_entities.iter().cloned().enumerate() {
+                        let mut row = h_flex().items_center().gap_2().child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(Input::new(&input_entity).cleanable(true).small().w_full()),
+                        );
+                        if allow_multiple {
+                            let view_for_remove = view_entity.clone();
+                            let popover_for_remove = popover_entity.clone();
+                            let dismiss_after_remove = input_count == 1;
+                            row = row.child(
+                                Button::new(("event-filter-remove", column_id * 1000 + input_ix))
+                                    .ghost()
+                                    .compact()
+                                    .small()
+                                    .icon(IconName::Minus)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = view_for_remove.update(cx, |this, cx| {
+                                            this.remove_event_filter_input(
+                                                column, input_ix, window, cx,
+                                            );
+                                        });
+                                        if dismiss_after_remove {
+                                            let _ = popover_for_remove.update(cx, |state, cx| {
+                                                state.dismiss(window, cx);
+                                            });
+                                        }
+                                    }),
+                            );
+                        }
+                        if allow_multiple && input_ix + 1 == input_count {
+                            let view_for_add = view_entity.clone();
+                            row = row.child(
+                                Button::new(("event-filter-add", column_id))
+                                    .ghost()
+                                    .compact()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = view_for_add.update(cx, |this, cx| {
+                                            this.add_event_filter_input(column, window, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        input_list = input_list.child(row);
+                    }
+                    input_list.into_any_element()
                 };
 
-                v_flex().gap_2().w(px(240.0)).p_2().child(control).child(
+                let view_for_clear = view_entity.clone();
+                let popover_for_clear = popover_entity.clone();
+                v_flex().gap_2().w(px(280.0)).p_2().child(control).child(
                     h_flex().justify_end().child(
                         Button::new(("event-filter-clear", column_id))
                             .ghost()
@@ -5465,14 +5834,12 @@ impl ConfigView {
                             .small()
                             .label("清除")
                             .on_click(move |_, window, cx| {
-                                input_for_clear.update(cx, |state, cx| {
-                                    state.set_value("".to_string(), window, cx);
+                                let _ = view_for_clear.update(cx, |this, cx| {
+                                    this.clear_event_filter_input(column, window, cx);
                                 });
-                                if let Some(calendar) = calendar_for_clear.as_ref() {
-                                    calendar.update(cx, |state, cx| {
-                                        state.set_date(Date::Single(None), window, cx);
-                                    });
-                                }
+                                let _ = popover_for_clear.update(cx, |state, cx| {
+                                    state.dismiss(window, cx);
+                                });
                             }),
                     ),
                 )

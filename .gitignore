@@ -4,6 +4,7 @@ Cargo.lock
 **/*.rs.bk
 
 # Build artifacts
+/dist/
 *.so
 *.dylib
 *.dll
@@ -44,6 +45,7 @@ tmp/
 
 # Claude/AI tools
 .claude/
+.codex/
 
 # Cursor
 .cursor/

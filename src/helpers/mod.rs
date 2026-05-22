@@ -4,6 +4,7 @@
 
 mod action;
 mod bounded;
+mod filter;
 mod fs;
 mod macos_menu;
 mod string;
@@ -11,6 +12,7 @@ mod updater;
 
 pub use action::*;
 pub use bounded::*;
+pub use filter::*;
 pub use fs::*;
 pub use macos_menu::*;
 pub use string::*;

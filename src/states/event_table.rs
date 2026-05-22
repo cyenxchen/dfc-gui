@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::prop_table::SortDirection;
-use crate::helpers::cmp_u64ish;
+use crate::helpers::{cmp_u64ish, split_filter_values};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params, params_from_iter};
 use rust_i18n::t;
@@ -272,6 +272,18 @@ impl EventTableState {
     pub fn set_filter(&mut self, column: EventSortColumn, value: String) {
         if self.filters.get(column) == value {
             return;
+        }
+        let value_count = if event_column_allows_multi_filter(column) {
+            split_filter_values(&value).len()
+        } else {
+            0
+        };
+        if value_count > 1 {
+            tracing::debug!(
+                ?column,
+                value_count,
+                "applying event table multi-value column filter"
+            );
         }
         self.filters.set(column, value);
         self.page_index = 0;
@@ -730,17 +742,31 @@ fn append_filter_clause(filters: &EventFilters, sql: &mut String) -> Vec<Value> 
     params
 }
 
+fn event_column_allows_multi_filter(column: EventSortColumn) -> bool {
+    !matches!(
+        column,
+        EventSortColumn::HappenedTime | EventSortColumn::RecordTime
+    )
+}
+
 fn push_contains_filter(
     column: &'static str,
     value: &str,
     clauses: &mut Vec<String>,
     params: &mut Vec<Value>,
 ) {
-    if value.is_empty() {
+    let values = split_filter_values(value);
+    if values.is_empty() {
         return;
     }
-    clauses.push(format!("instr(lower({column}), ?) > 0"));
-    params.push(Value::Text(value.to_lowercase()));
+    clauses.push(or_clause(values.len(), || {
+        format!("instr(lower({column}), ?) > 0")
+    }));
+    params.extend(
+        values
+            .into_iter()
+            .map(|value| Value::Text(value.to_lowercase())),
+    );
 }
 
 fn push_prefix_filter(
@@ -749,12 +775,21 @@ fn push_prefix_filter(
     clauses: &mut Vec<String>,
     params: &mut Vec<Value>,
 ) {
+    let value = value.trim();
     if value.is_empty() {
         return;
     }
     clauses.push(format!("substr({column}, 1, length(?)) = ?"));
     params.push(Value::Text(value.to_string()));
     params.push(Value::Text(value.to_string()));
+}
+
+fn or_clause(count: usize, mut clause: impl FnMut() -> String) -> String {
+    if count == 1 {
+        return clause();
+    }
+    let clauses = (0..count).map(|_| clause()).collect::<Vec<_>>();
+    format!("({})", clauses.join(" OR "))
 }
 
 fn sort_order_clause(sort: Option<EventSort>) -> &'static str {
@@ -937,6 +972,47 @@ mod tests {
         let rows = state.page_rows_owned();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].happened_time, "2026-04-14 00:00:01.000");
+    }
+
+    #[test]
+    fn time_filter_keeps_single_value_semantics() {
+        let mut state = EventTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        state.push_rows_front(vec![
+            event_row(1, "2026-04-14 00:00:01.000"),
+            event_row(2, "2026-04-15 00:00:01.000"),
+        ]);
+        state.set_filter(
+            EventSortColumn::HappenedTime,
+            "2026-04-14,2026-04-15".to_string(),
+        );
+
+        assert!(state.page_rows_owned().is_empty());
+    }
+
+    #[test]
+    fn column_filter_matches_any_comma_separated_value() {
+        let mut state = EventTableState::new();
+        state.reset_for_topic(Some("persistent://topic".to_string()));
+
+        let mut first = event_row(1, "2026-04-14 00:00:01.000");
+        first.device = "100".to_string();
+        let mut second = event_row(2, "2026-04-14 00:00:02.000");
+        second.device = "200".to_string();
+        let mut third = event_row(3, "2026-04-14 00:00:03.000");
+        third.device = "300".to_string();
+
+        state.push_rows_front(vec![first, second, third]);
+        state.set_filter(EventSortColumn::Device, "100, 300".to_string());
+
+        let rows = state.page_rows_owned();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.device.as_str())
+                .collect::<Vec<_>>(),
+            vec!["100", "300"]
+        );
     }
 
     #[test]
