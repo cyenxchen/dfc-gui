@@ -81,12 +81,14 @@ const SERVICE_RESPONSE_DEFAULT_COLUMN_WIDTHS: [f32; SERVICE_RESPONSE_COLUMN_COUN
 #[derive(Debug)]
 enum PropStreamEvent {
     Rows(Vec<PropRow>),
+    Ready,
     Error(String),
 }
 
 #[derive(Debug)]
 enum EventStreamEvent {
     Rows(Vec<EventRow>),
+    Ready,
     Error(String),
 }
 
@@ -98,14 +100,22 @@ enum TopicFeedbackKind {
 
 struct PropTopicRuntime {
     state: PropTableState,
+    device_filter_prefill: DeviceFilterPrefill,
     stream_stop: Option<watch::Sender<bool>>,
     ingest_task: Option<Task<()>>,
 }
 
 struct EventTopicRuntime {
     state: EventTableState,
+    device_filter_prefill: DeviceFilterPrefill,
     stream_stop: Option<watch::Sender<bool>>,
     ingest_task: Option<Task<()>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DeviceFilterPrefill {
+    initialized: bool,
+    value: Option<String>,
 }
 
 struct ServiceTopicRuntime {
@@ -119,6 +129,7 @@ impl Default for PropTopicRuntime {
     fn default() -> Self {
         Self {
             state: PropTableState::new(),
+            device_filter_prefill: DeviceFilterPrefill::default(),
             stream_stop: None,
             ingest_task: None,
         }
@@ -129,6 +140,7 @@ impl Default for EventTopicRuntime {
     fn default() -> Self {
         Self {
             state: EventTableState::new(),
+            device_filter_prefill: DeviceFilterPrefill::default(),
             stream_stop: None,
             ingest_task: None,
         }
@@ -1981,6 +1993,98 @@ impl ConfigView {
         topic_runtime.state = snapshot;
     }
 
+    fn apply_prop_device_filter_prefill(
+        server_id: &str,
+        topic_path: &str,
+        snapshot: &mut PropTableState,
+        prefill: &mut DeviceFilterPrefill,
+        device_filter: Option<String>,
+    ) -> bool {
+        if prefill.initialized && prefill.value == device_filter {
+            return false;
+        }
+
+        let previous_filter = prefill.value.clone();
+        prefill.initialized = true;
+        prefill.value = device_filter.clone();
+
+        match device_filter {
+            Some(device_filter) => {
+                if snapshot.filters().device == device_filter {
+                    return false;
+                }
+                tracing::debug!(
+                    server_id,
+                    topic = %topic_path,
+                    "prefilling prop table device filter from server device filter"
+                );
+                snapshot.set_filter(PropSortColumn::Device, device_filter);
+                true
+            }
+            None => {
+                let Some(previous_filter) = previous_filter else {
+                    return false;
+                };
+                if snapshot.filters().device != previous_filter {
+                    return false;
+                }
+                tracing::debug!(
+                    server_id,
+                    topic = %topic_path,
+                    "clearing stale prop table device filter after server device filter changed"
+                );
+                snapshot.set_filter(PropSortColumn::Device, String::new());
+                true
+            }
+        }
+    }
+
+    fn apply_event_device_filter_prefill(
+        server_id: &str,
+        topic_path: &str,
+        snapshot: &mut EventTableState,
+        prefill: &mut DeviceFilterPrefill,
+        device_filter: Option<String>,
+    ) -> bool {
+        if prefill.initialized && prefill.value == device_filter {
+            return false;
+        }
+
+        let previous_filter = prefill.value.clone();
+        prefill.initialized = true;
+        prefill.value = device_filter.clone();
+
+        match device_filter {
+            Some(device_filter) => {
+                if snapshot.filters().device == device_filter {
+                    return false;
+                }
+                tracing::debug!(
+                    server_id,
+                    topic = %topic_path,
+                    "prefilling event table device filter from server device filter"
+                );
+                snapshot.set_filter(EventSortColumn::Device, device_filter);
+                true
+            }
+            None => {
+                let Some(previous_filter) = previous_filter else {
+                    return false;
+                };
+                if snapshot.filters().device != previous_filter {
+                    return false;
+                }
+                tracing::debug!(
+                    server_id,
+                    topic = %topic_path,
+                    "clearing stale event table device filter after server device filter changed"
+                );
+                snapshot.set_filter(EventSortColumn::Device, String::new());
+                true
+            }
+        }
+    }
+
     fn sync_prop_filter_inputs_from_visible_state(
         &mut self,
         window: &mut Window,
@@ -2037,16 +2141,40 @@ impl ConfigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self
+        let device_filter = cx
+            .global::<DfcGlobalStore>()
+            .read(cx)
+            .server(server_id)
+            .and_then(|server| normalized_device_filter_value(server.device_filter.as_deref()));
+        let snapshot = if let Some(topic_runtime) = self
             .server_topic_runtimes
-            .get(server_id)
-            .and_then(|runtime| runtime.prop_topics.get(topic_path))
-            .map(|runtime| runtime.state.clone())
-            .unwrap_or_else(|| {
-                let mut snapshot = PropTableState::new();
-                snapshot.reset_for_topic(Some(topic_path.to_string()));
-                snapshot
-            });
+            .get_mut(server_id)
+            .and_then(|runtime| runtime.prop_topics.get_mut(topic_path))
+        {
+            let mut snapshot = topic_runtime.state.clone();
+            if Self::apply_prop_device_filter_prefill(
+                server_id,
+                topic_path,
+                &mut snapshot,
+                &mut topic_runtime.device_filter_prefill,
+                device_filter.clone(),
+            ) {
+                topic_runtime.state = snapshot.clone();
+            }
+            snapshot
+        } else {
+            let mut snapshot = PropTableState::new();
+            snapshot.reset_for_topic(Some(topic_path.to_string()));
+            if let Some(device_filter) = device_filter {
+                tracing::debug!(
+                    server_id,
+                    topic = %topic_path,
+                    "prefilling prop table device filter from server device filter"
+                );
+                snapshot.set_filter(PropSortColumn::Device, device_filter);
+            }
+            snapshot
+        };
         self.replace_visible_prop_state(snapshot, cx);
         self.sync_prop_filter_inputs_from_visible_state(window, cx);
     }
@@ -2058,16 +2186,40 @@ impl ConfigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapshot = self
+        let device_filter = cx
+            .global::<DfcGlobalStore>()
+            .read(cx)
+            .server(server_id)
+            .and_then(|server| normalized_device_filter_value(server.device_filter.as_deref()));
+        let snapshot = if let Some(topic_runtime) = self
             .server_topic_runtimes
-            .get(server_id)
-            .and_then(|runtime| runtime.event_topics.get(topic_path))
-            .map(|runtime| runtime.state.clone())
-            .unwrap_or_else(|| {
-                let mut snapshot = EventTableState::new();
-                snapshot.reset_for_topic(Some(topic_path.to_string()));
-                snapshot
-            });
+            .get_mut(server_id)
+            .and_then(|runtime| runtime.event_topics.get_mut(topic_path))
+        {
+            let mut snapshot = topic_runtime.state.clone();
+            if Self::apply_event_device_filter_prefill(
+                server_id,
+                topic_path,
+                &mut snapshot,
+                &mut topic_runtime.device_filter_prefill,
+                device_filter.clone(),
+            ) {
+                topic_runtime.state = snapshot.clone();
+            }
+            snapshot
+        } else {
+            let mut snapshot = EventTableState::new();
+            snapshot.reset_for_topic(Some(topic_path.to_string()));
+            if let Some(device_filter) = device_filter {
+                tracing::debug!(
+                    server_id,
+                    topic = %topic_path,
+                    "prefilling event table device filter from server device filter"
+                );
+                snapshot.set_filter(EventSortColumn::Device, device_filter);
+            }
+            snapshot
+        };
         self.replace_visible_event_state(snapshot, cx);
         self.sync_event_filter_inputs_from_visible_state(window, cx);
     }
@@ -2620,12 +2772,13 @@ impl ConfigView {
             return;
         };
 
-        let token = cx
-            .global::<DfcGlobalStore>()
-            .read(cx)
-            .selected_server()
-            .and_then(|s| s.pulsar_token.clone())
-            .filter(|t| !t.trim().is_empty());
+        let token = {
+            let app = cx.global::<DfcGlobalStore>().read(cx);
+            let server = app.server(&server_id);
+            server
+                .and_then(|s| s.pulsar_token.clone())
+                .filter(|t| !t.trim().is_empty())
+        };
 
         if let Some(topic_path) = selected_topic_path
             .clone()
@@ -2787,12 +2940,14 @@ impl ConfigView {
                     .await;
 
                 let mut rows: Vec<PropRow> = Vec::new();
+                let mut ready = false;
                 let mut error: Option<String> = None;
                 let mut stream_disconnected = false;
 
                 loop {
                     match rx.try_recv() {
                         Ok(PropStreamEvent::Rows(mut batch)) => rows.append(&mut batch),
+                        Ok(PropStreamEvent::Ready) => ready = true,
                         Ok(PropStreamEvent::Error(msg)) => error = Some(msg),
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
                         Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -2815,6 +2970,33 @@ impl ConfigView {
                             .and_then(|runtime| runtime.prop_topics.get_mut(topic_path.as_str()))
                         {
                             topic_runtime.state.set_error(msg);
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
+                            }
+                        }
+
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_prop_state(snapshot, cx);
+                        }
+                    });
+                }
+
+                if ready {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.prop_topics.get_mut(topic_path.as_str()))
+                        {
+                            topic_runtime.state.mark_ready();
                             if is_visible {
                                 snapshot = Some(topic_runtime.state.clone());
                             }
@@ -2928,12 +3110,14 @@ impl ConfigView {
                     .await;
 
                 let mut rows: Vec<EventRow> = Vec::new();
+                let mut ready = false;
                 let mut error: Option<String> = None;
                 let mut stream_disconnected = false;
 
                 loop {
                     match rx.try_recv() {
                         Ok(EventStreamEvent::Rows(mut batch)) => rows.append(&mut batch),
+                        Ok(EventStreamEvent::Ready) => ready = true,
                         Ok(EventStreamEvent::Error(msg)) => error = Some(msg),
                         Err(crossbeam_channel::TryRecvError::Empty) => break,
                         Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -2956,6 +3140,33 @@ impl ConfigView {
                             .and_then(|runtime| runtime.event_topics.get_mut(topic_path.as_str()))
                         {
                             topic_runtime.state.set_error(msg);
+                            if is_visible {
+                                snapshot = Some(topic_runtime.state.clone());
+                            }
+                        }
+
+                        if is_visible {
+                            let Some(snapshot) = snapshot else {
+                                return;
+                            };
+                            this.replace_visible_event_state(snapshot, cx);
+                        }
+                    });
+                }
+
+                if ready {
+                    let _ = handle.update(cx, |this, cx| {
+                        let is_visible = this.current_server_id(cx).as_deref()
+                            == Some(runtime_server_id.as_str())
+                            && this.current_selected_topic_path_raw(cx).as_deref()
+                                == Some(topic_path.as_str());
+                        let mut snapshot = None;
+                        if let Some(topic_runtime) = this
+                            .server_topic_runtimes
+                            .get_mut(&runtime_server_id)
+                            .and_then(|runtime| runtime.event_topics.get_mut(topic_path.as_str()))
+                        {
+                            topic_runtime.state.mark_ready();
                             if is_visible {
                                 snapshot = Some(topic_runtime.state.clone());
                             }
@@ -6483,6 +6694,19 @@ fn extract_cfgid_from_source(source: &str) -> Option<String> {
     None
 }
 
+fn normalized_device_filter_values(value: Option<&str>) -> Vec<String> {
+    split_filter_values(value.unwrap_or_default())
+        .into_iter()
+        .map(|device| device.trim().to_string())
+        .filter(|device| !device.is_empty())
+        .collect()
+}
+
+fn normalized_device_filter_value(value: Option<&str>) -> Option<String> {
+    let values = normalized_device_filter_values(value);
+    (!values.is_empty()).then(|| values.join("\n"))
+}
+
 pub(super) fn decode_framed_iothub_message<T>(payload: &[u8]) -> Option<(String, T)>
 where
     T: prost::Message + Default,
@@ -6932,6 +7156,8 @@ async fn run_prop_topic_stream(
                             if !rows.is_empty() {
                                 emitted_rows += rows.len() as u64;
                                 let _ = tx.send(PropStreamEvent::Rows(rows));
+                            } else if decoded {
+                                let _ = tx.send(PropStreamEvent::Ready);
                             }
 
                             // Ack to avoid redelivery / memory build-up.
@@ -7151,6 +7377,8 @@ async fn run_event_topic_stream(
                             if !rows.is_empty() {
                                 emitted_rows += rows.len() as u64;
                                 let _ = tx.send(EventStreamEvent::Rows(rows));
+                            } else if decoded {
+                                let _ = tx.send(EventStreamEvent::Ready);
                             }
 
                             let _ = consumer.ack(&message).await;
@@ -7187,15 +7415,17 @@ async fn run_event_topic_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        TABLE_COLUMN_MIN_WIDTH, TableColumnWidths, find_topic_service_url,
-        normalize_pulsar_service_url, parse_event_rows_from_payload, parse_prop_rows_from_payload,
-        topic_display_name, topic_paths_by_kind,
+        ConfigView, DeviceFilterPrefill, TABLE_COLUMN_MIN_WIDTH, TableColumnWidths,
+        find_topic_service_url, normalize_pulsar_service_url, normalized_device_filter_value,
+        parse_event_rows_from_payload, parse_prop_rows_from_payload, topic_display_name,
+        topic_paths_by_kind,
     };
     use crate::connection::{ConfigItem, TopicAgentItem, TopicDetail};
     use crate::proto::iothub::{
         AnyValue, ClockTime, DataFrame, DataHeader, DataRecord, DataRecordSet, EnumValue,
         EventRecord, EventRecordList, HiClockTime, any_value, data_record, enum_value,
     };
+    use crate::states::{PropSortColumn, PropTableState};
     use prost::Message as _;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
@@ -7330,6 +7560,70 @@ mod tests {
         assert_eq!(prop_topics.len(), 1);
         assert_eq!(event_topics.len(), 1);
         assert_eq!(service_topics.len(), 1);
+    }
+
+    #[test]
+    fn normalized_device_filter_value_uses_one_device_per_line() {
+        assert_eq!(
+            normalized_device_filter_value(Some(" 100758379,100758377；100852277\n ")),
+            Some("100758379\n100758377\n100852277".to_string())
+        );
+    }
+
+    #[test]
+    fn prop_device_filter_prefill_respects_manual_clear_until_config_changes() {
+        let mut state = PropTableState::new();
+        let mut prefill = DeviceFilterPrefill::default();
+
+        assert!(ConfigView::apply_prop_device_filter_prefill(
+            "server-a",
+            "persistent://topic",
+            &mut state,
+            &mut prefill,
+            Some("100758379".to_string()),
+        ));
+        assert_eq!(state.filters().device, "100758379");
+
+        state.set_filter(PropSortColumn::Device, String::new());
+        assert!(!ConfigView::apply_prop_device_filter_prefill(
+            "server-a",
+            "persistent://topic",
+            &mut state,
+            &mut prefill,
+            Some("100758379".to_string()),
+        ));
+        assert_eq!(state.filters().device, "");
+
+        assert!(ConfigView::apply_prop_device_filter_prefill(
+            "server-a",
+            "persistent://topic",
+            &mut state,
+            &mut prefill,
+            Some("100758377".to_string()),
+        ));
+        assert_eq!(state.filters().device, "100758377");
+    }
+
+    #[test]
+    fn prop_device_filter_prefill_clears_removed_default_filter() {
+        let mut state = PropTableState::new();
+        let mut prefill = DeviceFilterPrefill::default();
+
+        assert!(ConfigView::apply_prop_device_filter_prefill(
+            "server-a",
+            "persistent://topic",
+            &mut state,
+            &mut prefill,
+            Some("100758379".to_string()),
+        ));
+        assert!(ConfigView::apply_prop_device_filter_prefill(
+            "server-a",
+            "persistent://topic",
+            &mut state,
+            &mut prefill,
+            None,
+        ));
+        assert_eq!(state.filters().device, "");
     }
 
     #[test]
