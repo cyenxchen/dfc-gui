@@ -62,7 +62,7 @@ rust-embed = { version = "8.9", default-features = false }
 fred = "10"
 
 # Pulsar client
-pulsar = "6"
+pulsar = "6.8.0"
 
 # Protobuf (for decoding iothub payloads)
 prost = "0.13"

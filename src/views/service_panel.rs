@@ -86,12 +86,26 @@ fn pulsar_service_url_candidates_with_scheme(raw: &str, scheme: &str) -> Vec<Str
         return Vec::new();
     }
 
-    authority_list
+    let mut candidates = Vec::new();
+    let mut fallback_candidates = Vec::new();
+    for authority in authority_list
         .split(',')
         .map(str::trim)
         .filter(|authority| !authority.is_empty())
-        .filter_map(|authority| normalize_pulsar_authority(authority, scheme))
-        .collect()
+    {
+        let Some(normalized) = normalize_pulsar_authority(authority, scheme) else {
+            continue;
+        };
+
+        push_unique_pulsar_candidate(&mut candidates, normalized);
+        append_host_orb_internal_fallbacks(authority, scheme, &mut fallback_candidates);
+    }
+
+    for candidate in fallback_candidates {
+        push_unique_pulsar_candidate(&mut candidates, candidate);
+    }
+
+    candidates
 }
 
 fn normalize_pulsar_authority(authority: &str, scheme: &str) -> Option<String> {
@@ -107,6 +121,45 @@ fn normalize_pulsar_authority(authority: &str, scheme: &str) -> Option<String> {
     }
 
     Some(format!("{scheme}{authority}"))
+}
+
+fn append_host_orb_internal_fallbacks(authority: &str, scheme: &str, candidates: &mut Vec<String>) {
+    let Some(port_suffix) = host_orb_internal_port_suffix(authority) else {
+        return;
+    };
+
+    let mut fallbacks = Vec::new();
+    for host in ["127.0.0.1", "localhost"] {
+        let fallback_authority = format!("{host}{port_suffix}");
+        let Some(candidate) = normalize_pulsar_authority(&fallback_authority, scheme) else {
+            continue;
+        };
+        push_unique_pulsar_candidate(candidates, candidate.clone());
+        fallbacks.push(candidate);
+    }
+
+    tracing::debug!(
+        authority = %authority,
+        fallbacks = ?fallbacks,
+        "expanded OrbStack Pulsar host fallback candidates"
+    );
+}
+
+fn host_orb_internal_port_suffix(authority: &str) -> Option<String> {
+    let trimmed = authority.trim();
+    let (host, port_suffix) = match trimmed.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() => (host, format!(":{port}")),
+        _ => (trimmed, String::new()),
+    };
+
+    host.eq_ignore_ascii_case("host.orb.internal")
+        .then_some(port_suffix)
+}
+
+fn push_unique_pulsar_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 pub(super) async fn build_pulsar_client_with_fallbacks(
@@ -495,6 +548,33 @@ mod tests {
                 "pulsar://10.10.4.101:6650".to_string(),
                 "pulsar://10.10.4.102:6650".to_string(),
                 "pulsar://10.10.4.103:6650".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pulsar_service_url_candidates_expand_orbstack_host_fallbacks() {
+        assert_eq!(
+            pulsar_service_url_candidates("pulsar://host.orb.internal:6650"),
+            vec![
+                "pulsar://host.orb.internal:6650".to_string(),
+                "pulsar://127.0.0.1:6650".to_string(),
+                "pulsar://localhost:6650".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pulsar_service_url_candidates_keep_explicit_brokers_before_orbstack_fallbacks() {
+        assert_eq!(
+            pulsar_service_url_candidates(
+                "pulsar://host.orb.internal:6650,10.10.4.101:6650,127.0.0.1:6650"
+            ),
+            vec![
+                "pulsar://host.orb.internal:6650".to_string(),
+                "pulsar://10.10.4.101:6650".to_string(),
+                "pulsar://127.0.0.1:6650".to_string(),
+                "pulsar://localhost:6650".to_string(),
             ]
         );
     }
