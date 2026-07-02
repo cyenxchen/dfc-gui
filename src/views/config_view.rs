@@ -11,7 +11,7 @@ use super::service_panel::{
 };
 use crate::assets::CustomIconName;
 use crate::connection::{ConfigItem, ConfigLoadState, ConnectedServerInfo, TopicAgentItem};
-use crate::helpers::split_filter_values;
+use crate::helpers::{count_filter_values, split_filter_values};
 use crate::services::spawn_named_in_tokio;
 use crate::states::{
     AgentQueryMode, AgentSearchSession, ConfigState, DfcAppState, DfcGlobalStore, EventRow,
@@ -29,6 +29,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Colorize, Disableable, Icon, IconName, Sizable,
+    badge::Badge,
     button::{Button, ButtonVariants, DropdownButton},
     calendar::{Calendar, CalendarEvent, CalendarState, Date},
     checkbox::Checkbox,
@@ -5753,7 +5754,7 @@ impl ConfigView {
             cx.theme().secondary.darken(0.02)
         };
 
-        let (sort_icon, filter_active) = {
+        let (sort_icon, filter_count) = {
             let state = self.prop_table_state.read(cx);
             let icon = match state
                 .sort()
@@ -5764,13 +5765,15 @@ impl ConfigView {
                 Some(SortDirection::Desc) => IconName::ChevronDown,
                 None => IconName::ChevronsUpDown,
             };
-            let active = !state.filters().get(column).is_empty();
-            (icon, active)
+            // Exact for every column: single-value date columns store separator-free
+            // `%Y-%m-%d` strings, so counting collapses to 0/1 just like the value filter.
+            let count = count_filter_values(state.filters().get(column));
+            (icon, count)
         };
 
         let sort_active = !matches!(sort_icon, IconName::ChevronsUpDown);
         let sort_icon_color = if sort_active { fg } else { muted };
-        let filter_icon_color = if filter_active { primary } else { muted };
+        let filter_icon_color = if filter_count > 0 { primary } else { muted };
 
         let column_id = column as usize;
 
@@ -5914,7 +5917,7 @@ impl ConfigView {
                                 });
                             })),
                     )
-                    .child(popover),
+                    .child(Badge::new().count(filter_count).child(popover)),
             )
             .child(self.render_column_resize_handle(ResizableTableKind::Prop, column_id, cx))
     }
@@ -5936,7 +5939,7 @@ impl ConfigView {
             cx.theme().secondary.darken(0.02)
         };
 
-        let (sort_icon, filter_active) = {
+        let (sort_icon, filter_count) = {
             let state = self.event_table_state.read(cx);
             let icon = match state
                 .sort()
@@ -5947,13 +5950,15 @@ impl ConfigView {
                 Some(SortDirection::Desc) => IconName::ChevronDown,
                 None => IconName::ChevronsUpDown,
             };
-            let active = !state.filters().get(column).is_empty();
-            (icon, active)
+            // Exact for every column: single-value date columns store separator-free
+            // `%Y-%m-%d` strings, so counting collapses to 0/1 just like the value filter.
+            let count = count_filter_values(state.filters().get(column));
+            (icon, count)
         };
 
         let sort_active = !matches!(sort_icon, IconName::ChevronsUpDown);
         let sort_icon_color = if sort_active { fg } else { muted };
-        let filter_icon_color = if filter_active { primary } else { muted };
+        let filter_icon_color = if filter_count > 0 { primary } else { muted };
 
         let column_id = column as usize;
 
@@ -6097,7 +6102,7 @@ impl ConfigView {
                                 });
                             })),
                     )
-                    .child(popover),
+                    .child(Badge::new().count(filter_count).child(popover)),
             )
             .child(self.render_column_resize_handle(ResizableTableKind::Event, column_id, cx))
     }
